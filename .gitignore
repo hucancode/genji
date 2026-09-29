@@ -1,0 +1,6 @@
+/target
+.genji/
+*.db
+*.db-journal
+*.db-wal
+blur/target
