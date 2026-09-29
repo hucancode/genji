@@ -128,6 +128,7 @@ fn handle(mut stream: UnixStream, c: &Control) -> Result<()> {
     } else {
         let mut q = c.queue.lock().unwrap();
         q.push_back(line.to_string());
+        eprintln!("[control] received user instruction ({} pending)", q.len());
         format!("queued ({} pending)", q.len())
     };
     let _ = stream.write_all(format!("{resp}\n").as_bytes());
