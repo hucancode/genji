@@ -394,28 +394,24 @@ CREATE TABLE IF NOT EXISTS compactions (
     }
 
     // ------------------------------------------------------------ requirements
+    //
+    // Requirements are persisted as markdown files under
+    // `.genji/requirements/` (see `reqmd`). The `requirements` table below is
+    // legacy: it is retained only so existing workspaces can be migrated into
+    // the file store once, on startup.
 
-    pub fn requirement_create(
-        &self,
-        level: &str,
-        title: &str,
-        body: &str,
-        parent_id: Option<i64>,
-        source: &str,
-        source_path: Option<&str>,
-    ) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO requirements(level,title,body,parent_id,source,source_path,status) VALUES(?,?,?,?,?,?,'active')",
-            params![level, title, body, parent_id, source, source_path],
+    /// Whether `table` exists in the database (used for the legacy migration).
+    pub fn has_table(&self, table: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            params![table],
+            |r| r.get(0),
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(n > 0)
     }
 
-    pub fn requirement_get(&self, id: i64) -> Result<Option<Requirement>> {
-        let sql = format!("SELECT {REQ_COLS} FROM requirements WHERE id=?");
-        Ok(self.conn.query_row(&sql, params![id], r_row).optional()?)
-    }
-
+    /// List legacy DB requirements, ordered stakeholder-first. Used only by the
+    /// one-time migration to markdown files.
     pub fn requirement_list(
         &self,
         level: Option<&str>,
@@ -436,99 +432,6 @@ CREATE TABLE IF NOT EXISTS compactions (
         let refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|b| b.as_ref()).collect();
         let rows = stmt.query_map(refs.as_slice(), r_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub fn requirement_active_count(&self) -> Result<i64> {
-        let n: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM requirements WHERE status='active'", [], |r| {
-                    r.get(0)
-                })?;
-        Ok(n)
-    }
-
-    pub fn requirement_update(
-        &self,
-        id: i64,
-        title: Option<&str>,
-        body: Option<&str>,
-        status: Option<&str>,
-        level: Option<&str>,
-        parent_id: Option<Option<i64>>,
-    ) -> Result<bool> {
-        let n = self.conn.execute(
-            &format!(
-                "UPDATE requirements SET
-                   title=COALESCE(?,title),
-                   body=COALESCE(?,body),
-                   status=COALESCE(?,status),
-                   level=COALESCE(?,level),
-                   updated_at={NOW}
-                 WHERE id=?"
-            ),
-            params![title, body, status, level, id],
-        )?;
-        if let Some(p) = parent_id {
-            self.conn.execute(
-                &format!("UPDATE requirements SET parent_id=?, updated_at={NOW} WHERE id=?"),
-                params![p, id],
-            )?;
-        }
-        Ok(n > 0)
-    }
-
-    pub fn requirement_remove(&self, id: i64, hard: bool) -> Result<bool> {
-        let n = if hard {
-            self.conn
-                .execute("DELETE FROM requirements WHERE id=?", params![id])?
-        } else {
-            self.conn.execute(
-                &format!("UPDATE requirements SET status='removed', updated_at={NOW} WHERE id=?"),
-                params![id],
-            )?
-        };
-        Ok(n > 0)
-    }
-
-    /// Upsert a user-authored requirement keyed by its markdown path.
-    /// Returns (id, body_changed).
-    pub fn requirement_upsert_source(
-        &self,
-        level: &str,
-        title: &str,
-        body: &str,
-        source_path: &str,
-    ) -> Result<(i64, bool)> {
-        let existing: Option<(i64, String)> = self
-            .conn
-            .query_row(
-                "SELECT id, body FROM requirements WHERE source_path=?",
-                params![source_path],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        match existing {
-            Some((id, old_body)) => {
-                let changed = old_body != body;
-                if changed {
-                    // Body changed: re-activate so it gets re-evaluated.
-                    self.conn.execute(
-                        &format!("UPDATE requirements SET level=?,title=?,body=?,source='user_md',status='active',updated_at={NOW} WHERE id=?"),
-                        params![level, title, body, id],
-                    )?;
-                } else {
-                    self.conn.execute(
-                        &format!("UPDATE requirements SET level=?,title=?,source='user_md',updated_at={NOW} WHERE id=?"),
-                        params![level, title, id],
-                    )?;
-                }
-                Ok((id, changed))
-            }
-            None => {
-                let id = self.requirement_create(level, title, body, None, "user_md", Some(source_path))?;
-                Ok((id, true))
-            }
-        }
     }
 
     pub fn question_ask(&self, requirement_id: Option<i64>, session_id: &str, question: &str) -> Result<i64> {

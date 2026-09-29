@@ -3,20 +3,15 @@ use serde_json::Value;
 
 use super::{opt_i64, opt_str, req_str};
 use crate::agent::Agent;
-use crate::db::Requirement;
+use crate::reqmd::{self, Requirement};
 
 fn fmt_req(r: &Requirement, full: bool) -> String {
-    let mut s = format!(
-        "#{} [{}:{}] {}\n",
-        r.id, r.level, r.status, r.title
-    );
+    let mut s = format!("#{} [{}:{}] {}\n", r.id, r.level, r.status, r.title);
     if let Some(p) = r.parent_id {
         s.push_str(&format!("parent: #{p}\n"));
     }
     s.push_str(&format!("source: {}\n", r.source));
-    if let Some(sp) = &r.source_path {
-        s.push_str(&format!("source_path: {sp}\n"));
-    }
+    s.push_str(&format!("source_path: {}\n", r.source_path));
     let body = r.body.trim();
     if !body.is_empty() {
         s.push('\n');
@@ -42,22 +37,35 @@ pub fn create(agent: &mut Agent, args: &Value) -> Result<String> {
     let title = req_str(args, "title")?;
     let body = req_str(args, "body")?;
     let parent_id = opt_i64(args, "parent_id");
-    let id = agent
-        .db
-        .requirement_create(&level, &title, &body, parent_id, "agent", None)?;
-    Ok(format!("created {level} requirement #{id}: {title}"))
+    let r = reqmd::create(
+        &agent.cfg,
+        &agent.workspace,
+        &level,
+        &title,
+        &body,
+        parent_id,
+        "agent",
+    )?;
+    Ok(format!(
+        "created {level} requirement #{}: {} ({})",
+        r.id, r.title, r.source_path
+    ))
 }
 
 pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
     if let Some(id) = opt_i64(args, "id") {
-        return match agent.db.requirement_get(id)? {
+        return match reqmd::load_by_id(&agent.cfg, &agent.workspace, id)? {
             Some(r) => Ok(fmt_req(&r, true)),
             None => bail!("requirement #{id} not found"),
         };
     }
     let level = opt_str(args, "level");
     let status = opt_str(args, "status");
-    let reqs = agent.db.requirement_list(level.as_deref(), status.as_deref())?;
+    let reqs: Vec<Requirement> = reqmd::load_all(&agent.cfg, &agent.workspace)?
+        .into_iter()
+        .filter(|r| level.as_deref().map_or(true, |l| r.level == l))
+        .filter(|r| status.as_deref().map_or(true, |s| r.status == s))
+        .collect();
     if reqs.is_empty() {
         return Ok("(no requirements)".into());
     }
@@ -72,7 +80,7 @@ pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
 
 pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
     let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
-    if agent.db.requirement_get(id)?.is_none() {
+    if reqmd::load_by_id(&agent.cfg, &agent.workspace, id)?.is_none() {
         bail!("requirement #{id} not found");
     }
     let status = opt_str(args, "status");
@@ -87,10 +95,10 @@ pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
             bail!("level must be stakeholder|system");
         }
     }
-    let parent_id = args
-        .get("parent_id")
-        .map(|v| v.as_i64());
-    agent.db.requirement_update(
+    let parent_id = args.get("parent_id").map(|v| v.as_i64());
+    reqmd::update(
+        &agent.cfg,
+        &agent.workspace,
         id,
         opt_str(args, "title").as_deref(),
         opt_str(args, "body").as_deref(),
@@ -104,7 +112,7 @@ pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
 pub fn remove(agent: &mut Agent, args: &Value) -> Result<String> {
     let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
     let hard = args.get("hard").and_then(|v| v.as_bool()).unwrap_or(false);
-    if !agent.db.requirement_remove(id, hard)? {
+    if !reqmd::remove(&agent.cfg, &agent.workspace, id, hard)? {
         bail!("requirement #{id} not found");
     }
     Ok(format!(

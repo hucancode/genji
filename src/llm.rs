@@ -110,7 +110,7 @@ impl LlmClient {
         Ok(Self {
             provider,
             model: model.to_string(),
-            max_tokens: cfg.max_output_tokens,
+            max_tokens: cfg.limits_for_model(model).max_output_tokens,
             agent,
         })
     }

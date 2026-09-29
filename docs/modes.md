@@ -1,8 +1,8 @@
 # Modes
 
 A mode is the pair of `(core system prompt, extended system prompt, tool set)`.
-The **core** prompt is compiled in and minimal; the **extended** prompt is a
-markdown file and is versioned in the database. `retro` is the one exception:
+The **core** prompt is compiled in and minimal; the **extended** prompt is
+stored in the database and versioned there. `retro` is the one exception:
 it has no extended prompt (see [Retro mode](retro.md)), so it cannot rewrite its
 own instructions.
 
@@ -23,9 +23,9 @@ The effective system prompt is:
 ```
 
 The `## Extended guidance` section is omitted for `retro`, which has no extended
-prompt. Edit `prompts/plan.md`, `prompts/build.md` or `prompts/explore.md` by
-hand, or let retro mode call `prompt_edit`. Both are recorded as versions and can
-be rolled back (`prompt_history` / `prompt_rollback`). `prompt_edit` rejects
+prompt. Extended prompts start empty and are edited in the database by letting
+retro mode call `prompt_edit`. Every change is recorded as a version and can be
+rolled back (`prompt_history` / `prompt_rollback`). `prompt_edit` rejects
 `mode: "retro"`.
 
 ---
@@ -55,17 +55,23 @@ be rolled back (`prompt_history` / `prompt_rollback`). `prompt_edit` rejects
 
 ## Automatic mode cycling
 
-With no mode subcommand, genji runs:
+With no mode subcommand **and a task**, genji starts in **build** mode and runs:
 
 ```
-plan → build → plan → build → …   until active requirements == 0 (or max_cycles)
+build → plan → build → plan → …   until active requirements == 0 (or max_cycles)
 ```
 
 State (requirements, tickets, conversation) persists across cycles in one
 session. Plan mode decides whether requirements are truly met; when none remain
-active, the loop stops. A mode subcommand (`genji plan`, `genji build`,
-`genji explore`, `genji retro`) runs a single mode instead. Subagents always
-run a single mode.
+active, the loop stops. The `--cycle` flag applies the same cycling to an
+explicit mode subcommand, starting from that mode (`genji build --cycle` starts
+at build, `genji plan --cycle` starts at plan). A mode subcommand without
+`--cycle` (`genji plan`, `genji build`, `genji explore`, `genji retro`) runs a
+single mode instead. Subagents always run a single mode.
+
+Running bare `genji` with **no task at all** does not start a cycle: it opens
+the control socket and waits for an instruction to be sent (see
+[Mid-run instructions](control-socket.md#running-with-no-instruction)).
 
 ---
 

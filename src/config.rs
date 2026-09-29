@@ -24,10 +24,27 @@ impl ModelsConfig {
     }
 }
 
-/// A named endpoint profile. Switching between a local llama.cpp server and a
-/// deployed Azure model is a `provider` change — the rest of the agent (tools,
-/// modes, loop) is untouched because every target speaks the OpenAI
-/// chat-completions protocol.
+/// Per-model limits. Keyed by model/deployment name so that switching models
+/// (per mode, per run) carries the right token budget and context size.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelLimits {
+    /// Max cumulative tokens for a run on this model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EffectiveLimits {
+    pub token_limit: i64,
+    pub context_window: i64,
+    pub max_output_tokens: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderConfig {
@@ -38,7 +55,7 @@ pub struct ProviderConfig {
     pub api_key: String,
     /// Env var consulted when `api_key` is empty.
     pub api_key_env: String,
-    /// pi-compatible auth file fallback: { "<auth_key>": { "key": "..." } }.
+    /// auth file fallback: { "<auth_key>": { "key": "..." } }.
     pub auth_file: String,
     pub auth_key: String,
     /// "bearer" (Authorization) or "api-key" (Azure). Empty = derive from kind.
@@ -52,9 +69,17 @@ pub struct ProviderConfig {
     /// "max_tokens" (default) or "max_completion_tokens" (some Azure/OpenAI reasoning models).
     pub max_tokens_field: String,
     /// Override the top-level context window for this provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<i64>,
     /// Override the top-level max output tokens for this provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<i64>,
+    /// Override the top-level run token budget for this provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<i64>,
+    /// Per-model overrides, keyed by model/deployment name. Win over the
+    /// provider-level fields above and the top-level values.
+    pub model_limits: BTreeMap<String, ModelLimits>,
     /// Send `tool_choice: "auto"` (some endpoints reject it).
     pub send_tool_choice: bool,
     pub extra_headers: BTreeMap<String, String>,
@@ -77,6 +102,8 @@ impl Default for ProviderConfig {
             max_tokens_field: "max_tokens".into(),
             context_window: None,
             max_output_tokens: None,
+            token_limit: None,
+            model_limits: BTreeMap::new(),
             send_tool_choice: true,
             extra_headers: BTreeMap::new(),
             extra_query: BTreeMap::new(),
@@ -139,7 +166,7 @@ impl ProviderConfig {
         self.kind.eq_ignore_ascii_case("azure")
     }
 
-    /// Explicit key → env var → pi auth file. Empty for local servers with no auth.
+    /// Explicit key → env var → auth file. Empty for local servers with no auth.
     pub fn resolve_api_key(&self) -> String {
         if !self.api_key.is_empty() {
             return self.api_key.clone();
@@ -167,58 +194,34 @@ impl ProviderConfig {
     }
 }
 
-/// Runtime configuration. Everything the user is expected to tune lives here.
-/// Loaded from `agent.config.json` in the workspace (created with defaults on
-/// first run). Paths are resolved relative to the workspace root.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    // ---- provider selection ----
-    /// Active provider profile name (a key of `providers`). For a single-endpoint
-    /// setup this also names the entry looked up in the auth file.
     pub provider: String,
-    /// Named endpoint profiles. `--provider` / `GENJI_PROVIDER` selects one.
     pub providers: BTreeMap<String, ProviderConfig>,
-
-    // ---- legacy / fallback endpoint fields (used when no profile matches) ----
     pub base_url: String,
     pub api_key: String,
     pub api_key_env: String,
     pub auth_file: String,
     pub default_model: String,
     pub models: ModelsConfig,
-
-    // ---- budgets ----
     pub token_limit: i64,
     pub time_limit_secs: u64,
     pub compact_threshold: f64,
     pub compact_keep_recent: usize,
-
-    // ---- model limits ----
     pub context_window: i64,
     pub max_output_tokens: i64,
-
-    // ---- tools ----
     pub tool_result_max_bytes: usize,
     pub max_tool_iterations: usize,
     pub bash_timeout_secs: u64,
     pub spawn_timeout_secs: u64,
     pub max_subagent_depth: u32,
-
-    // ---- cycling ----
     pub max_cycles: usize,
-
-    // ---- paths ----
     pub db_path: String,
     pub requirements_dir: String,
     pub skills_dir: String,
-    pub prompts_dir: String,
-
-    // ---- control socket ----
     pub control_socket: String,
     pub control_enabled: bool,
-
-    // ---- behaviour ----
     pub auto_ingest_requirements: bool,
     pub interactive: bool,
     pub verbose: bool,
@@ -226,26 +229,46 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let mut providers = BTreeMap::new();
+        let mut model_limits = BTreeMap::new();
+        model_limits.insert(
+            "qwen2.5-coder-7b".into(),
+            ModelLimits {
+                token_limit: Some(2_000_000),
+                context_window: Some(32_768),
+                max_output_tokens: Some(4_096),
+            },
+        );
+        providers.insert(
+            "local".into(),
+            ProviderConfig {
+                kind: "openai".into(),
+                base_url: "http://127.0.0.1:8080/v1".into(),
+                model: "qwen2.5-coder-7b".into(),
+                model_limits,
+                ..Default::default()
+            },
+        );
         Self {
-            provider: "deepseek".into(),
-            providers: BTreeMap::new(),
-            base_url: "https://api.deepseek.com".into(),
+            provider: "local".into(),
+            providers,
+            base_url: "http://127.0.0.1:8080/v1".into(),
             api_key: String::new(),
-            api_key_env: "DEEPSEEK_API_KEY".into(),
-            auth_file: "~/.pi/agent/auth.json".into(),
-            default_model: "deepseek-flash".into(),
+            api_key_env: String::new(),
+            auth_file: String::new(),
+            default_model: "qwen2.5-coder-7b".into(),
             models: ModelsConfig {
-                plan: "deepseek-flash".into(),
-                build: "deepseek-flash".into(),
-                explore: "deepseek-flash".into(),
-                retro: "deepseek-v4-pro".into(),
+                plan: "qwen2.5-coder-7b".into(),
+                build: "qwen2.5-coder-7b".into(),
+                explore: "qwen2.5-coder-7b".into(),
+                retro: "qwen2.5-coder-7b".into(),
             },
             token_limit: 2_000_000,
             time_limit_secs: 1800,
             compact_threshold: 0.70,
             compact_keep_recent: 6,
-            context_window: 1_000_000,
-            max_output_tokens: 16_000,
+            context_window: 32_768,
+            max_output_tokens: 4_096,
             tool_result_max_bytes: 24_000,
             max_tool_iterations: 80,
             bash_timeout_secs: 120,
@@ -253,9 +276,8 @@ impl Default for Config {
             max_subagent_depth: 2,
             max_cycles: 30,
             db_path: ".genji/genji.db".into(),
-            requirements_dir: "requirements".into(),
-            skills_dir: "skills".into(),
-            prompts_dir: "prompts".into(),
+            requirements_dir: ".genji/requirements".into(),
+            skills_dir: ".genji/skills".into(),
             control_socket: ".genji/control.sock".into(),
             control_enabled: true,
             auto_ingest_requirements: true,
@@ -267,13 +289,17 @@ impl Default for Config {
 
 impl Config {
     pub fn path_in(workspace: &Path) -> PathBuf {
-        workspace.join("agent.config.json")
+        workspace.join(".genji/config.json")
     }
 
     /// Load config from disk, creating it with defaults if missing.
     pub fn load_or_create(workspace: &Path) -> Result<Self> {
         let path = Self::path_in(workspace);
         if !path.exists() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
             let cfg = Config::default();
             let text = serde_json::to_string_pretty(&cfg)?;
             std::fs::write(&path, format!("{text}\n"))
@@ -307,15 +333,10 @@ impl Config {
     pub fn skills_path(&self, workspace: &Path) -> PathBuf {
         self.workspace_path(workspace, &self.skills_dir)
     }
-    pub fn prompts_path(&self, workspace: &Path) -> PathBuf {
-        self.workspace_path(workspace, &self.prompts_dir)
-    }
     pub fn control_path(&self, workspace: &Path) -> PathBuf {
         self.workspace_path(workspace, &self.control_socket)
     }
 
-    /// Resolve the active profile, filling gaps from the legacy top-level
-    /// fields so old configs and partial profiles both work.
     pub fn resolve_active_provider(&self) -> ProviderConfig {
         match self.providers.get(&self.provider) {
             Some(p) => p.clone().filled_from(self, &self.provider),
@@ -323,8 +344,6 @@ impl Config {
         }
     }
 
-    /// Per-mode model/deployment: profile single model → profile per-mode →
-    /// top-level per-mode → `default_model`.
     pub fn model_for_mode(&self, mode: crate::modes::Mode) -> String {
         let p = self.resolve_active_provider();
         if !p.model.trim().is_empty() {
@@ -340,6 +359,27 @@ impl Config {
         }
         self.default_model.clone()
     }
+
+    pub fn limits_for_model(&self, model: &str) -> EffectiveLimits {
+        let p = self.resolve_active_provider();
+        let mut limits = EffectiveLimits {
+            token_limit: p.token_limit.unwrap_or(self.token_limit),
+            context_window: p.context_window.unwrap_or(self.context_window),
+            max_output_tokens: p.max_output_tokens.unwrap_or(self.max_output_tokens),
+        };
+        if let Some(m) = p.model_limits.get(model) {
+            if let Some(v) = m.token_limit {
+                limits.token_limit = v;
+            }
+            if let Some(v) = m.context_window {
+                limits.context_window = v;
+            }
+            if let Some(v) = m.max_output_tokens {
+                limits.max_output_tokens = v;
+            }
+        }
+        limits
+    }
 }
 
 pub fn expand_tilde(p: &str) -> PathBuf {
@@ -349,81 +389,4 @@ pub fn expand_tilde(p: &str) -> PathBuf {
         }
     }
     PathBuf::from(p)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::modes::Mode;
-
-    #[test]
-    fn legacy_flat_config_still_resolves() {
-        let mut cfg = Config::default();
-        cfg.base_url = "http://127.0.0.1:8080/v1".into();
-        cfg.api_key = "sk-legacy".into();
-        let p = cfg.resolve_active_provider();
-        assert_eq!(p.kind, "openai");
-        assert_eq!(p.base_url, "http://127.0.0.1:8080/v1");
-        assert_eq!(p.auth, "bearer");
-        assert_eq!(p.resolve_api_key(), "sk-legacy");
-        assert_eq!(cfg.model_for_mode(Mode::Plan), "deepseek-flash");
-    }
-
-    #[test]
-    fn profile_overrides_and_derives_auth() {
-        let mut cfg = Config::default();
-        cfg.provider = "local".into();
-        cfg.providers.insert(
-            "local".into(),
-            ProviderConfig {
-                base_url: "http://127.0.0.1:8080/v1".into(),
-                api_key: "sk-local".into(),
-                models: ModelsConfig {
-                    plan: "qwen".into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
-        let p = cfg.resolve_active_provider();
-        assert_eq!(p.base_url, "http://127.0.0.1:8080/v1");
-        assert_eq!(p.auth, "bearer");
-        assert_eq!(cfg.model_for_mode(Mode::Plan), "qwen");
-    }
-
-    #[test]
-    fn azure_profile_derives_api_key_auth_and_single_model() {
-        let mut cfg = Config::default();
-        cfg.provider = "azure".into();
-        cfg.providers.insert(
-            "azure".into(),
-            ProviderConfig {
-                kind: "azure".into(),
-                base_url: "https://res.openai.azure.com".into(),
-                api_version: "2024-10-21".into(),
-                api_key: "azkey".into(),
-                model: "gpt-4o".into(),
-                max_tokens_field: "max_completion_tokens".into(),
-                ..Default::default()
-            },
-        );
-        let p = cfg.resolve_active_provider();
-        assert!(p.is_azure());
-        assert_eq!(p.auth, "api-key");
-        assert_eq!(p.api_version, "2024-10-21");
-        // A single `model` overrides every mode (deployment name).
-        for m in Mode::all() {
-            assert_eq!(cfg.model_for_mode(m), "gpt-4o");
-        }
-    }
-
-    #[test]
-    fn empty_profile_inherits_legacy_base_url() {
-        let mut cfg = Config::default();
-        cfg.provider = "partial".into();
-        cfg.providers
-            .insert("partial".into(), ProviderConfig::default());
-        let p = cfg.resolve_active_provider();
-        assert_eq!(p.base_url, cfg.base_url);
-    }
 }

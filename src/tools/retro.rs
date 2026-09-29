@@ -257,7 +257,6 @@ pub fn prompt_edit(agent: &mut Agent, args: &Value) -> Result<String> {
     let version = agent
         .db
         .prompt_add_version(mode.as_str(), &content, "retro", &reason)?;
-    crate::prompts::write_prompt_file(&agent.cfg, &agent.workspace, mode, &content)?;
     // Keep the in-memory system prompt fresh if we edited our own mode.
     agent.refresh_system_prompt()?;
     Ok(format!(
@@ -291,15 +290,12 @@ pub fn prompt_rollback(agent: &mut Agent, args: &Value) -> Result<String> {
     let mode = parse_mode(&req_str(args, "mode")?)?;
     let version = opt_i64(args, "version").ok_or_else(|| anyhow::anyhow!("missing version"))?;
     let versions = agent.db.prompt_versions(mode.as_str())?;
-    let target = versions
-        .iter()
-        .find(|v| v.version == version)
-        .ok_or_else(|| anyhow::anyhow!("mode {} has no version {}", mode.as_str(), version))?;
-    let content = target.content.clone();
+    if !versions.iter().any(|v| v.version == version) {
+        bail!("mode {} has no version {}", mode.as_str(), version);
+    }
     if !agent.db.prompt_activate(mode.as_str(), version)? {
         bail!("could not activate version {version}");
     }
-    crate::prompts::write_prompt_file(&agent.cfg, &agent.workspace, mode, &content)?;
     agent.refresh_system_prompt()?;
     Ok(format!(
         "activated v{version} for `{}` extended prompt",

@@ -1,6 +1,6 @@
 # Skills
 
-Skills are markdown files in `skills/` with simple frontmatter:
+Skills are markdown files in `.genji/skills/` with simple frontmatter:
 
 ```markdown
 ---

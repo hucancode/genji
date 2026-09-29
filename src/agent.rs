@@ -27,6 +27,8 @@ pub struct Agent {
     pub tools: Vec<ToolSpec>,
     pub tokens_used: i64,
     pub last_prompt_tokens: i64,
+    pub token_limit: i64,
+    pub context_window: i64,
     pub started: Instant,
     pub deadline: Instant,
     pub depth: u32,
@@ -51,9 +53,10 @@ impl Agent {
         interactive: bool,
         control: Option<Arc<Control>>,
     ) -> Result<Self> {
+        let limits = cfg.limits_for_model(&model);
         let llm = LlmClient::new(&cfg, &model)?;
         let tools = tools::specs_for(mode);
-        let system = build_system(&db, &cfg, &workspace, mode)?;
+        let system = build_system(&db, mode)?;
         db.session_start(
             &session_id,
             mode.as_str(),
@@ -77,6 +80,8 @@ impl Agent {
             tools,
             tokens_used: 0,
             last_prompt_tokens: 0,
+            token_limit: limits.token_limit,
+            context_window: limits.context_window,
             started: Instant::now(),
             deadline,
             depth,
@@ -104,7 +109,7 @@ impl Agent {
     }
 
     pub fn refresh_system_prompt(&mut self) -> Result<()> {
-        let system = build_system(&self.db, &self.cfg, &self.workspace, self.mode)?;
+        let system = build_system(&self.db, self.mode)?;
         if let Some(first) = self.messages.first_mut() {
             first.content = system;
         } else {
@@ -116,6 +121,9 @@ impl Agent {
     pub fn set_mode(&mut self, mode: Mode) -> Result<()> {
         self.mode = mode;
         self.model = self.cfg.model_for_mode(mode);
+        let limits = self.cfg.limits_for_model(&self.model);
+        self.token_limit = limits.token_limit;
+        self.context_window = limits.context_window;
         self.llm = LlmClient::new(&self.cfg, &self.model)?;
         self.tools = tools::specs_for(mode);
         self.db.conn.execute(
@@ -157,10 +165,10 @@ impl Agent {
     }
 
     fn budget_exceeded(&self) -> Option<String> {
-        if self.tokens_used >= self.cfg.token_limit {
+        if self.tokens_used >= self.token_limit {
             return Some(format!(
                 "token limit reached ({} >= {})",
-                self.tokens_used, self.cfg.token_limit
+                self.tokens_used, self.token_limit
             ));
         }
         if Instant::now() >= self.deadline {
@@ -192,10 +200,13 @@ impl Agent {
             }
             if let Some(c) = &self.control {
                 c.set_status(format!(
-                    "mode={} tokens={} messages={}",
+                    "mode={} model={} tokens={} messages={} session={} elapsed={}s",
                     self.mode.as_str(),
+                    self.model,
                     self.tokens_used,
-                    self.messages.len()
+                    self.messages.len(),
+                    self.session_id,
+                    self.started.elapsed().as_secs()
                 ));
             }
             self.maybe_compact()?;
@@ -299,7 +310,7 @@ impl Agent {
     }
 
     fn maybe_compact(&mut self) -> Result<()> {
-        let threshold = (self.cfg.context_window as f64 * self.cfg.compact_threshold) as i64;
+        let threshold = (self.context_window as f64 * self.cfg.compact_threshold) as i64;
         let est = if self.last_prompt_tokens > 0 {
             self.last_prompt_tokens
         } else {
@@ -361,11 +372,11 @@ impl Agent {
     }
 }
 
-pub fn build_system(db: &Db, cfg: &Config, workspace: &Path, mode: Mode) -> Result<String> {
+pub fn build_system(db: &Db, mode: Mode) -> Result<String> {
     if !mode.allows_extended() {
         return Ok(format!("{}\n{}", shared_preamble(), mode.core_prompt()));
     }
-    let extended = prompts::load_extended(db, cfg, workspace, mode)?;
+    let extended = prompts::load_extended(db, mode)?;
     Ok(format!(
         "{}\n{}\n\n## Extended guidance\n{}",
         shared_preamble(),

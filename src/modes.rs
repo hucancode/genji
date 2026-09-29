@@ -105,8 +105,10 @@ impl Mode {
         !matches!(self, Mode::Retro)
     }
 
-    /// Starter text for the user-editable extended prompt file. Empty for modes
-    /// that do not support an extended prompt (see [`Mode::allows_extended`]).
+    /// Starter text for the user-editable extended prompt. Empty for every
+    /// mode: extended prompts are stored in the database, not seeded with
+    /// default content, and modes that do not support one
+    /// (see [`Mode::allows_extended`]) are also empty.
     pub fn default_extended(&self) -> &'static str {
         match self {
             Mode::Plan => DEFAULT_EXT_PLAN,
@@ -186,16 +188,11 @@ Workflow:
 Every change is versioned in the database and can be rolled back.
 "#;
 
-const DEFAULT_EXT_PLAN: &str = r#"## Project notes (plan)
-Add project-specific planning guidance here. This file is the editable
-extended system prompt for PLAN mode and is versioned in the database.
-"#;
-const DEFAULT_EXT_BUILD: &str = r#"## Project notes (build)
-Add project-specific build guidance here (style, test commands, conventions).
-"#;
-const DEFAULT_EXT_EXPLORE: &str = r#"## Project notes (explore)
-Add guidance for investigations here.
-"#;
+// Extended prompts start empty and live only in the database. Retro mode
+// populates them via `prompt_edit`; nothing is written to disk.
+const DEFAULT_EXT_PLAN: &str = "";
+const DEFAULT_EXT_BUILD: &str = "";
+const DEFAULT_EXT_EXPLORE: &str = "";
 
 pub fn shared_preamble() -> &'static str {
     SHARED
@@ -215,7 +212,7 @@ mod tests {
     fn other_modes_are_extensible() {
         for mode in [Mode::Plan, Mode::Build, Mode::Explore] {
             assert!(mode.allows_extended());
-            assert!(!mode.default_extended().is_empty());
+            assert!(mode.default_extended().is_empty());
         }
     }
 }
