@@ -145,17 +145,45 @@ pub fn list_live() -> Vec<Instance> {
     out
 }
 
+/// Resolve an instance id against the live pool, leniently.
+///
+/// An exact id always wins. Otherwise a unique id prefix is accepted, so
+/// `genji instruct abc` resolves `abc123` when it is the only live instance
+/// starting with `abc`. An ambiguous prefix reports the candidates instead of
+/// guessing, and a prefix that matches nothing is treated as unknown.
 pub fn find(id: &str) -> Result<Instance> {
+    let id = id.trim();
+
+    // Prune stale records while we gather live instances.
+    let mut live = Vec::new();
     for inst in load_all() {
-        if inst.id == id {
-            if inst.is_live() {
-                return Ok(inst);
-            }
+        if inst.is_live() {
+            live.push(inst);
+        } else {
             remove(&inst.id);
-            bail!("genji instance `{id}` is no longer running");
         }
     }
-    bail!("no running genji instance with id `{id}` (see `genji list`)")
+
+    if let Some(inst) = live.iter().find(|i| i.id == id) {
+        return Ok(inst.clone());
+    }
+
+    if id.is_empty() {
+        bail!("missing instance id (see `genji list`)");
+    }
+
+    let matches: Vec<&Instance> = live.iter().filter(|i| i.id.starts_with(id)).collect();
+    match matches.as_slice() {
+        [inst] => Ok((*inst).clone()),
+        [] => bail!("no running genji instance with id `{id}` (see `genji list`)"),
+        many => {
+            let ids: Vec<&str> = many.iter().map(|i| i.id.as_str()).collect();
+            bail!(
+                "instance id `{id}` is ambiguous; matches: {} (use a longer prefix)",
+                ids.join(", ")
+            )
+        }
+    }
 }
 
 pub fn remove(id: &str) {
