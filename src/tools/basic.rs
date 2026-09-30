@@ -87,7 +87,7 @@ fn apply_edits(content: &str, edits: &[(String, String)], replace_all: bool) -> 
         let start = find_unique(content, old)?;
         ranges.push((start, start + old.len(), new.clone()));
     }
-    let mut sorted = ranges.clone();
+    let mut sorted = ranges;
     sorted.sort_by_key(|r| r.0);
     for w in sorted.windows(2) {
         if w[0].1 > w[1].0 {

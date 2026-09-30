@@ -60,7 +60,6 @@ pub fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
         &cmd_args,
         &agent.workspace,
         Duration::from_secs(agent.cfg.spawn_timeout_secs),
-        None,
         cap,
     )?;
     let _ = std::fs::remove_file(&inst_path);

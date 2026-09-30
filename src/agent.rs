@@ -12,17 +12,16 @@ use crate::events::EventEmitter;
 use crate::llm::{self, ChatMessage, LlmClient};
 use crate::modes::{shared_preamble, Mode};
 use crate::prompts;
+use crate::registry;
 use crate::tools::{self, ToolSpec};
 
 const MAX_LLM_RETRIES: u32 = 3;
 
-#[allow(dead_code)]
 pub struct Agent {
     pub cfg: Config,
     pub workspace: PathBuf,
     pub db: Db,
     pub instance_id: String,
-    pub parent_instance: Option<String>,
     pub mode: Mode,
     pub model: String,
     pub llm: LlmClient,
@@ -37,29 +36,44 @@ pub struct Agent {
     pub depth: u32,
     pub seq: i64,
     pub interactive: bool,
-    pub verbose: bool,
     pub control: Option<Arc<Control>>,
     pub events: Arc<EventEmitter>,
     /// Set when a fatal LLM failure ends the run (see [`Agent::status`]).
     pub failed: bool,
 }
 
+/// Everything needed to start an agent run. Kept as a struct so construction
+/// stays a single, readable call and the model is resolved in one place.
+pub struct AgentParams {
+    pub cfg: Config,
+    pub workspace: PathBuf,
+    pub db: Db,
+    pub instance_id: String,
+    pub parent_instance: Option<String>,
+    pub mode: Mode,
+    pub depth: u32,
+    pub task: String,
+    pub interactive: bool,
+    pub control: Option<Arc<Control>>,
+}
+
 impl Agent {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        cfg: Config,
-        workspace: PathBuf,
-        db: Db,
-        instance_id: String,
-        parent_instance: Option<String>,
-        mode: Mode,
-        model: String,
-        depth: u32,
-        task: &str,
-        interactive: bool,
-        control: Option<Arc<Control>>,
-        events: Arc<EventEmitter>,
-    ) -> Result<Self> {
+    pub fn new(params: AgentParams) -> Result<Self> {
+        let AgentParams {
+            cfg,
+            workspace,
+            db,
+            instance_id,
+            parent_instance,
+            mode,
+            depth,
+            task,
+            interactive,
+            control,
+        } = params;
+        // The model is derived here, not passed in, so `Agent` and `set_mode`
+        // share one source of truth for model selection.
+        let model = cfg.model_for_mode(mode);
         let limits = cfg.limits_for_model(&model);
         let llm = LlmClient::new(&cfg, &model)?;
         let tools = tools::specs_for(mode);
@@ -68,18 +82,31 @@ impl Agent {
             &instance_id,
             mode.as_str(),
             parent_instance.as_deref(),
-            task,
+            &task,
             &model,
             depth,
         )?;
+        // stdout is the machine event stream; the same events are appended to a
+        // per-instance trace file for `genji inspect`. Owning the emitter here
+        // keeps the trace path written in exactly one place.
+        let events = Arc::new(EventEmitter::new(
+            instance_id.clone(),
+            Some(registry::events_path(&instance_id)),
+        ));
+        events.instance_start(
+            &workspace.display().to_string(),
+            mode.as_str(),
+            &model,
+            parent_instance.as_deref(),
+            depth,
+            &task,
+        );
         let deadline = Instant::now() + Duration::from_secs(cfg.time_limit_secs.max(1));
-        let verbose = cfg.verbose;
         Ok(Agent {
             cfg,
             workspace,
             db,
             instance_id,
-            parent_instance,
             mode,
             model,
             llm,
@@ -94,7 +121,6 @@ impl Agent {
             depth,
             seq: 0,
             interactive,
-            verbose,
             control,
             events,
             failed: false,
@@ -305,7 +331,7 @@ impl Agent {
                 )?;
                 self.events
                     .tool_result(&tc.id, &tc.name, is_error, dur, &result);
-                if self.verbose || is_error {
+                if self.cfg.verbose || is_error {
                     eprintln!(
                         "[tool] {}({}) -> {} ({}ms)",
                         tc.name,
@@ -434,16 +460,14 @@ impl Agent {
 }
 
 pub fn build_system(db: &Db, mode: Mode) -> Result<String> {
-    if !mode.allows_extended() {
-        return Ok(format!("{}\n{}", shared_preamble(), mode.core_prompt()));
-    }
+    let base = format!("{}\n{}", shared_preamble(), mode.core_prompt());
+    // `load_extended` is the single gate for which modes have an extended
+    // prompt; it returns empty for RETRO and for an unedited (empty) prompt.
     let extended = prompts::load_extended(db, mode)?;
-    Ok(format!(
-        "{}\n{}\n\n## Extended guidance\n{}",
-        shared_preamble(),
-        mode.core_prompt(),
-        extended
-    ))
+    if extended.trim().is_empty() {
+        return Ok(base);
+    }
+    Ok(format!("{base}\n\n## Extended guidance\n{extended}"))
 }
 
 fn render_messages(msgs: &[ChatMessage]) -> String {

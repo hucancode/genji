@@ -8,7 +8,7 @@ pub fn seed_prompts(db: &Db) -> Result<()> {
         if db.prompt_active(mode.as_str())?.is_none() {
             db.prompt_add_version(
                 mode.as_str(),
-                mode.default_extended(),
+                "",
                 "default",
                 "initial seed",
             )?;

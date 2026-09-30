@@ -1,12 +1,8 @@
 [package]
 name = "genji"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "A minimal coding agent"
-
-[[bin]]
-name = "genji"
-path = "src/main.rs"
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }

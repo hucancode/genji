@@ -93,7 +93,6 @@ impl ChatMessage {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub message: ChatMessage,
@@ -237,17 +236,43 @@ impl LlmClient {
             Ok(r) => r.into_json::<Value>().context("decoding llm json")?,
             Err(ureq::Error::Status(code, r)) => {
                 let txt = r.into_string().unwrap_or_default();
-                return Err(anyhow!(
+                let msg = format!(
                     "HTTP {}: {}",
                     code,
                     txt.chars().take(600).collect::<String>()
-                ));
+                );
+                // Retryability is decided where the status code is known, not
+                // re-parsed from the message later.
+                return Err(if code == 429 || code >= 500 {
+                    anyhow::Error::new(Retryable { msg })
+                } else {
+                    anyhow!(msg)
+                });
             }
-            Err(e) => return Err(anyhow!("transport error: {e}")),
+            Err(e) => {
+                return Err(anyhow::Error::new(Retryable {
+                    msg: format!("transport error: {e}"),
+                }))
+            }
         };
         parse_response(&value)
     }
 }
+
+/// Wraps an error the client may retry. `chat` detects it via downcast instead
+/// of matching on the rendered message.
+#[derive(Debug)]
+struct Retryable {
+    msg: String,
+}
+
+impl std::fmt::Display for Retryable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for Retryable {}
 
 /// Minimal percent-encoding for query-string keys/values.
 fn url_encode(s: &str) -> String {
@@ -264,18 +289,7 @@ fn url_encode(s: &str) -> String {
 }
 
 fn is_retryable(e: &anyhow::Error) -> bool {
-    let s = e.to_string();
-    if s.contains("transport error") {
-        return true;
-    }
-    if let Some(code) = s.strip_prefix("HTTP ") {
-        if let Some(c) = code.split_whitespace().next() {
-            if let Ok(n) = c.parse::<u16>() {
-                return n == 429 || n >= 500;
-            }
-        }
-    }
-    false
+    e.downcast_ref::<Retryable>().is_some()
 }
 
 fn parse_response(value: &Value) -> Result<LlmResponse> {

@@ -77,6 +77,12 @@ pub fn events_dir() -> PathBuf {
     dir().join("events")
 }
 
+/// Trace file for one instance. The id → path mapping lives here so every
+/// caller (run setup, `inspect`, subagent relay) agrees on it.
+pub fn events_path(id: &str) -> PathBuf {
+    events_dir().join(format!("{id}.jsonl"))
+}
+
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -163,15 +169,9 @@ pub fn list_live() -> Vec<Instance> {
 pub fn find(id: &str) -> Result<Instance> {
     let id = id.trim();
 
-    // Prune stale records while we gather live instances.
-    let mut live = Vec::new();
-    for inst in load_all() {
-        if inst.is_live() {
-            live.push(inst);
-        } else {
-            remove(&inst.id);
-        }
-    }
+    // `list_live` prunes stale records as a side effect; it is the single
+    // source of liveness, so reuse it rather than probing again here.
+    let live = list_live();
 
     if let Some(inst) = live.iter().find(|i| i.id == id) {
         return Ok(inst.clone());

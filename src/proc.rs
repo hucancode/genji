@@ -38,7 +38,6 @@ pub fn run_capture(
     args: &[String],
     cwd: &Path,
     timeout: Duration,
-    stdin_data: Option<&str>,
     max_read_bytes: usize,
 ) -> Result<ProcResult> {
     let tmpdir = cwd.join(".genji").join("tmp");
@@ -48,20 +47,11 @@ pub fn run_capture(
     let out_file = File::create(&out_path).context("creating stdout temp")?;
     let err_file = File::create(&err_path).context("creating stderr temp")?;
 
-    let stdin = match stdin_data {
-        Some(data) => {
-            let sp = tmp_path(&tmpdir, "in");
-            std::fs::write(&sp, data)?;
-            Stdio::from(File::open(&sp)?)
-        }
-        None => Stdio::null(),
-    };
-
     let start = Instant::now();
     let mut child = Command::new(program)
         .args(args)
         .current_dir(cwd)
-        .stdin(stdin)
+        .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(err_file))
         .spawn()
@@ -108,7 +98,6 @@ pub fn run_bash(
         &["-c".to_string(), command.to_string()],
         cwd,
         timeout,
-        None,
         max_read_bytes,
     )
 }

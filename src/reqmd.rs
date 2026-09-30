@@ -29,12 +29,19 @@ pub struct Requirement {
     pub status: String,
     pub parent_id: Option<i64>,
     pub source: String,
-    /// Absolute path of the backing markdown file.
+    /// Absolute path of the backing markdown file. The single source of truth
+    /// for where the requirement lives; the display form is [`Self::display_path`].
     pub path: PathBuf,
-    /// Path relative to the workspace (shown to the model).
-    pub source_path: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl Requirement {
+    /// Display path relative to the workspace (falls back to the absolute path
+    /// when it is outside).
+    pub fn display_path(&self, workspace: &Path) -> String {
+        rel_to(workspace, &self.path)
+    }
 }
 
 fn now_secs() -> String {
@@ -290,7 +297,6 @@ pub fn load_all(cfg: &Config, workspace: &Path) -> Result<Vec<Requirement>> {
             parent_id,
             source,
             path: raw.path.clone(),
-            source_path: raw.rel,
             created_at,
             updated_at,
         };
@@ -347,12 +353,10 @@ pub fn create(
         parent_id,
         source: source.to_string(),
         path: PathBuf::new(),
-        source_path: String::new(),
         created_at: now.clone(),
         updated_at: now,
     };
     let path = path_for(cfg, workspace, &req);
-    req.source_path = rel_to(workspace, &path);
     req.path = path.clone();
     write_at(&path, &req)?;
     Ok(req)
@@ -395,7 +399,6 @@ pub fn update(
 
     let old_path = req.path.clone();
     let new_path = path_for(cfg, workspace, &req);
-    req.source_path = rel_to(workspace, &new_path);
     req.path = new_path.clone();
     write_at(&new_path, &req)?;
     if new_path != old_path && old_path.exists() {
@@ -437,12 +440,10 @@ fn migrate_from_db(db: &Db, cfg: &Config, workspace: &Path) -> Result<usize> {
             parent_id: r.parent_id,
             source: r.source,
             path: PathBuf::new(),
-            source_path: String::new(),
             created_at: r.created_at,
             updated_at: r.updated_at,
         };
         let path = path_for(cfg, workspace, &req);
-        req.source_path = rel_to(workspace, &path);
         req.path = path.clone();
         write_at(&path, &req)?;
         n += 1;
@@ -561,7 +562,9 @@ mod tests {
         assert_eq!(r2b.title, "Accept Files and URLs");
         assert_eq!(r2b.status, "met");
         assert_eq!(r2b.parent_id, Some(1));
-        assert!(r2b.source_path.ends_with("2-accept-files-and-urls.md"));
+        assert!(r2b
+            .display_path(&ws)
+            .ends_with("2-accept-files-and-urls.md"));
         assert_eq!(active_count(&cfg, &ws).unwrap(), 1);
 
         // Changing level moves the file into the other directory.
@@ -569,7 +572,7 @@ mod tests {
         let r2c = load_by_id(&cfg, &ws, 2).unwrap().unwrap();
         assert_eq!(r2c.level, "stakeholder");
         assert!(r2c
-            .source_path
+            .display_path(&ws)
             .starts_with(".genji/requirements/stakeholder/"));
 
         assert!(remove(&cfg, &ws, 2, false).unwrap());

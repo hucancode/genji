@@ -269,13 +269,6 @@ CREATE TABLE IF NOT EXISTS compactions (
     /// `instances`/`instance_id` schema. SQLite performs these renames in place,
     /// so recorded history survives the upgrade. A fresh database is untouched.
     fn migrate_session_to_instance(&self) -> Result<()> {
-        let has_table = |name: &str| -> Result<bool> {
-            Ok(self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
-                params![name],
-                |r| r.get::<_, i64>(0),
-            )? != 0)
-        };
         let has_column = |table: &str, col: &str| -> Result<bool> {
             let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
             let mut rows = stmt.query([])?;
@@ -287,7 +280,7 @@ CREATE TABLE IF NOT EXISTS compactions (
             Ok(false)
         };
 
-        if has_table("sessions")? && !has_table("instances")? {
+        if self.has_table("sessions")? && !self.has_table("instances")? {
             self.conn
                 .execute_batch("ALTER TABLE sessions RENAME TO instances;")?;
         }
@@ -299,7 +292,7 @@ CREATE TABLE IF NOT EXISTS compactions (
             ("skill_loads", "session_id", "instance_id"),
             ("compactions", "session_id", "instance_id"),
         ] {
-            if has_table(table)? && has_column(table, old_col)? && !has_column(table, new_col)? {
+            if self.has_table(table)? && has_column(table, old_col)? && !has_column(table, new_col)? {
                 self.conn.execute_batch(&format!(
                     "ALTER TABLE {table} RENAME COLUMN {old_col} TO {new_col};"
                 ))?;

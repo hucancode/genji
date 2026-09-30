@@ -69,24 +69,21 @@ pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
 
 pub fn resolve(agent: &mut Agent, args: &Value) -> Result<String> {
     let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
-    if agent.db.ticket_get(id)?.is_none() {
+    let resolution = opt_str(args, "resolution");
+    if !agent
+        .db
+        .ticket_set_status(id, "resolved", resolution.as_deref())?
+    {
         bail!("ticket #{id} not found");
     }
-    let resolution = opt_str(args, "resolution");
-    agent
-        .db
-        .ticket_set_status(id, "resolved", resolution.as_deref())?;
     Ok(format!("ticket #{id} resolved"))
 }
 
 pub fn close(agent: &mut Agent, args: &Value) -> Result<String> {
     let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
-    if agent.db.ticket_get(id)?.is_none() {
+    let reason = opt_str(args, "reason");
+    if !agent.db.ticket_set_status(id, "closed", reason.as_deref())? {
         bail!("ticket #{id} not found");
     }
-    let reason = opt_str(args, "reason");
-    agent
-        .db
-        .ticket_set_status(id, "closed", reason.as_deref())?;
     Ok(format!("ticket #{id} closed"))
 }

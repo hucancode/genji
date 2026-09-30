@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 
 use crate::agent::Agent;
 use crate::modes::Mode;
@@ -31,288 +32,297 @@ impl ToolSpec {
     }
 }
 
-fn t(name: &'static str, description: &'static str, parameters: Value) -> ToolSpec {
-    ToolSpec {
-        name,
-        description,
-        parameters,
+/// A tool is defined exactly once: its name, description, JSON schema, the
+/// modes it is available in, and its handler. The model-facing spec and the
+/// dispatch table are both derived from this, so they cannot drift apart.
+struct Tool {
+    name: &'static str,
+    description: &'static str,
+    parameters: Value,
+    modes: &'static [Mode],
+    handler: fn(&mut Agent, &Value) -> Result<String>,
+}
+
+impl Tool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name,
+            description: self.description,
+            parameters: self.parameters.clone(),
+        }
     }
 }
 
-pub fn all_specs() -> Vec<ToolSpec> {
-    vec![
-        t("read", "Read a text file with line numbers. offset is 1-indexed.", json!({
-            "type":"object",
-            "properties":{
-                "path":{"type":"string","description":"File path"},
-                "offset":{"type":"integer","description":"First line (1-indexed)"},
-                "limit":{"type":"integer","description":"Max lines to read (default 2000)"}
-            },
-            "required":["path"]
-        })),
-        t("write", "Create or overwrite a file, creating parent directories.", json!({
-            "type":"object",
-            "properties":{"path":{"type":"string"},"content":{"type":"string"}},
-            "required":["path","content"]
-        })),
-        t("edit", "Apply precise text replacements to a file. Each oldText must match uniquely.", json!({
-            "type":"object",
-            "properties":{
-                "path":{"type":"string"},
-                "edits":{"type":"array","items":{"type":"object","properties":{
-                    "oldText":{"type":"string"},"newText":{"type":"string"}
-                },"required":["oldText","newText"]}},
-                "oldText":{"type":"string","description":"Single-edit shorthand"},
-                "newText":{"type":"string","description":"Single-edit shorthand"},
-                "replace_all":{"type":"boolean","description":"Allow replacing a non-unique oldText (single-edit form)"}
-            },
-            "required":["path"]
-        })),
-        t("ls", "List files/directories respecting .gitignore. Non-recursive unless recursive=true.", json!({
-            "type":"object",
-            "properties":{
-                "path":{"type":"string","description":"Directory (default .)"},
-                "recursive":{"type":"boolean"},
-                "max_depth":{"type":"integer"},
-                "show_hidden":{"type":"boolean"}
-            }
-        })),
-        t("bash", "Run a shell command via bash -c in the workspace. Returns exit code, stdout, stderr.", json!({
-            "type":"object",
-            "properties":{
-                "command":{"type":"string"},
-                "cwd":{"type":"string","description":"Working directory (default workspace)"},
-                "timeout_secs":{"type":"integer"}
-            },
-            "required":["command"]
-        })),
-        // ---- tickets ----
-        t("ticket_create", "Create a work ticket.", json!({
-            "type":"object",
-            "properties":{
-                "title":{"type":"string"},
-                "description":{"type":"string"},
-                "priority":{"type":"integer","description":"1=high, 2=normal, 3=low"},
-                "parent_id":{"type":"integer"},
-                "requirement_id":{"type":"integer","description":"Requirement this ticket addresses"}
-            },
-            "required":["title"]
-        })),
-        t("ticket_read", "Read one ticket by id, or list tickets.", json!({
-            "type":"object",
-            "properties":{
-                "id":{"type":"integer"},
-                "status":{"type":"string","enum":["open","in_progress","resolved","closed"]},
-                "requirement_id":{"type":"integer"}
-            }
-        })),
-        t("ticket_resolve", "Mark a ticket resolved after the work is done and verified.", json!({
-            "type":"object",
-            "properties":{"id":{"type":"integer"},"resolution":{"type":"string"}},
-            "required":["id"]
-        })),
-        t("ticket_close", "Close a ticket as obsolete/duplicate/won't-fix.", json!({
-            "type":"object",
-            "properties":{"id":{"type":"integer"},"reason":{"type":"string"}},
-            "required":["id"]
-        })),
-        // ---- requirements ----
-        t("requirement_create", "Create a stakeholder or system requirement.", json!({
-            "type":"object",
-            "properties":{
-                "level":{"type":"string","enum":["stakeholder","system"]},
-                "title":{"type":"string"},
-                "body":{"type":"string"},
-                "parent_id":{"type":"integer","description":"Parent requirement id"}
-            },
-            "required":["level","title","body"]
-        })),
-        t("requirement_read", "Read a requirement by id, or list requirements.", json!({
-            "type":"object",
-            "properties":{
-                "id":{"type":"integer"},
-                "level":{"type":"string","enum":["stakeholder","system"]},
-                "status":{"type":"string","enum":["active","met","removed"]}
-            }
-        })),
-        t("requirement_update", "Update a requirement's title/body/status/level/parent.", json!({
-            "type":"object",
-            "properties":{
-                "id":{"type":"integer"},
-                "title":{"type":"string"},
-                "body":{"type":"string"},
-                "status":{"type":"string","enum":["active","met","removed"]},
-                "level":{"type":"string","enum":["stakeholder","system"]},
-                "parent_id":{"type":"integer"}
-            },
-            "required":["id"]
-        })),
-        t("requirement_remove", "Remove a requirement (soft by default).", json!({
-            "type":"object",
-            "properties":{"id":{"type":"integer"},"hard":{"type":"boolean"}},
-            "required":["id"]
-        })),
-        t("requirement_ask", "Ask the user a clarifying question about a requirement. Recorded in the DB.", json!({
-            "type":"object",
-            "properties":{
-                "question":{"type":"string"},
-                "requirement_id":{"type":"integer"}
-            },
-            "required":["question"]
-        })),
-        // ---- skills ----
-        t("skill_load", "Load a skill's instructions by name.", json!({
-            "type":"object",
-            "properties":{"name":{"type":"string"}},
-            "required":["name"]
-        })),
-        // ---- spawn ----
-        t("spawn", "Spawn a subagent in a given mode that only reports back.", json!({
-            "type":"object",
-            "properties":{
-                "mode":{"type":"string","enum":["plan","build","explore"]},
-                "instructions":{"type":"string","description":"What the subagent should do"},
-                "task":{"type":"string","description":"Optional task label"}
-            },
-            "required":["mode","instructions"]
-        })),
-        // ---- retro ----
-        t("query_instances", "List past agent instances.", json!({
-            "type":"object",
-            "properties":{
-                "mode":{"type":"string"},
-                "limit":{"type":"integer","description":"Default 20"}
-            }
-        })),
-        t("query_instance", "Get all messages of one instance.", json!({
-            "type":"object",
-            "properties":{"instance_id":{"type":"string"},"limit":{"type":"integer"}},
-            "required":["instance_id"]
-        })),
-        t("query_messages", "Search recorded messages by text/role/instance.", json!({
-            "type":"object",
-            "properties":{
-                "instance_id":{"type":"string"},
-                "role":{"type":"string"},
-                "search":{"type":"string"},
-                "limit":{"type":"integer","description":"Default 50"}
-            }
-        })),
-        t("query_tool_call", "Query recorded tool calls (filter by name/errors/instance).", json!({
-            "type":"object",
-            "properties":{
-                "instance_id":{"type":"string"},
-                "name":{"type":"string"},
-                "errors_only":{"type":"boolean"},
-                "limit":{"type":"integer","description":"Default 50"}
-            }
-        })),
-        t("query_stats", "Aggregate stats: tool usage, error rates, skill loads, token usage.", json!({
-            "type":"object","properties":{}
-        })),
-        t("list_skills", "List all skills with descriptions and use counts.", json!({
-            "type":"object","properties":{}
-        })),
-        t("read_skill", "Read a skill, optionally a specific version.", json!({
-            "type":"object",
-            "properties":{"name":{"type":"string"},"version":{"type":"integer"}},
-            "required":["name"]
-        })),
-        t("write_skill", "Create or overwrite a skill (versioned).", json!({
-            "type":"object",
-            "properties":{
-                "name":{"type":"string"},
-                "description":{"type":"string"},
-                "content":{"type":"string"},
-                "reason":{"type":"string"}
-            },
-            "required":["name","content"]
-        })),
-        t("edit_skill", "Edit a skill by text replacement (versioned).", json!({
-            "type":"object",
-            "properties":{
-                "name":{"type":"string"},
-                "oldText":{"type":"string"},
-                "newText":{"type":"string"},
-                "reason":{"type":"string"}
-            },
-            "required":["name","oldText","newText"]
-        })),
-        t("skill_history", "List versions of a skill.", json!({
-            "type":"object","properties":{"name":{"type":"string"}},"required":["name"]
-        })),
-        t("skill_rollback", "Activate an older version of a skill.", json!({
-            "type":"object",
-            "properties":{"name":{"type":"string"},"version":{"type":"integer"}},
-            "required":["name","version"]
-        })),
-        t("prompt_read", "Read the active extended system prompt for a mode. RETRO has no extended prompt.", json!({
-            "type":"object","properties":{"mode":{"type":"string","enum":["plan","build","explore"]}},"required":["mode"]
-        })),
-        t("prompt_edit", "Replace the extended system prompt for a mode (versioned). Core prompt is not editable; RETRO has no extended prompt.", json!({
-            "type":"object",
-            "properties":{
-                "mode":{"type":"string","enum":["plan","build","explore"]},
-                "content":{"type":"string"},
-                "reason":{"type":"string"}
-            },
-            "required":["mode","content"]
-        })),
-        t("prompt_history", "List versions of a mode's extended prompt. RETRO has no extended prompt.", json!({
-            "type":"object","properties":{"mode":{"type":"string","enum":["plan","build","explore"]}},"required":["mode"]
-        })),
-        t("prompt_rollback", "Activate an older version of a mode's extended prompt. RETRO has no extended prompt.", json!({
-            "type":"object",
-            "properties":{"mode":{"type":"string","enum":["plan","build","explore"]},"version":{"type":"integer"}},
-            "required":["mode","version"]
-        })),
-    ]
+const ALL_MODES: &[Mode] = &[Mode::Plan, Mode::Build, Mode::Explore, Mode::Retro];
+const PLAN: &[Mode] = &[Mode::Plan];
+const PLAN_BUILD: &[Mode] = &[Mode::Plan, Mode::Build];
+const PLAN_BUILD_EXPLORE: &[Mode] = &[Mode::Plan, Mode::Build, Mode::Explore];
+const RETRO: &[Mode] = &[Mode::Retro];
+
+fn tool(
+    name: &'static str,
+    modes: &'static [Mode],
+    description: &'static str,
+    parameters: Value,
+    handler: fn(&mut Agent, &Value) -> Result<String>,
+) -> Tool {
+    Tool {
+        name,
+        description,
+        parameters,
+        modes,
+        handler,
+    }
+}
+
+/// The full registry. Built once, then shared by `specs_for` and `dispatch`.
+fn registry() -> &'static [Tool] {
+    static TOOLS: OnceLock<Vec<Tool>> = OnceLock::new();
+    TOOLS.get_or_init(|| {
+        vec![
+            tool("read", ALL_MODES, "Read a text file with line numbers. offset is 1-indexed.", json!({
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string","description":"File path"},
+                    "offset":{"type":"integer","description":"First line (1-indexed)"},
+                    "limit":{"type":"integer","description":"Max lines to read (default 2000)"}
+                },
+                "required":["path"]
+            }), basic::read),
+            tool("write", ALL_MODES, "Create or overwrite a file, creating parent directories.", json!({
+                "type":"object",
+                "properties":{"path":{"type":"string"},"content":{"type":"string"}},
+                "required":["path","content"]
+            }), basic::write),
+            tool("edit", ALL_MODES, "Apply precise text replacements to a file. Each oldText must match uniquely.", json!({
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string"},
+                    "edits":{"type":"array","items":{"type":"object","properties":{
+                        "oldText":{"type":"string"},"newText":{"type":"string"}
+                    },"required":["oldText","newText"]}},
+                    "oldText":{"type":"string","description":"Single-edit shorthand"},
+                    "newText":{"type":"string","description":"Single-edit shorthand"},
+                    "replace_all":{"type":"boolean","description":"Allow replacing a non-unique oldText (single-edit form)"}
+                },
+                "required":["path"]
+            }), basic::edit),
+            tool("ls", ALL_MODES, "List files/directories respecting .gitignore. Non-recursive unless recursive=true.", json!({
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string","description":"Directory (default .)"},
+                    "recursive":{"type":"boolean"},
+                    "max_depth":{"type":"integer"},
+                    "show_hidden":{"type":"boolean"}
+                }
+            }), basic::ls),
+            tool("bash", ALL_MODES, "Run a shell command via bash -c in the workspace. Returns exit code, stdout, stderr.", json!({
+                "type":"object",
+                "properties":{
+                    "command":{"type":"string"},
+                    "cwd":{"type":"string","description":"Working directory (default workspace)"},
+                    "timeout_secs":{"type":"integer"}
+                },
+                "required":["command"]
+            }), basic::bash),
+            // ---- tickets ----
+            tool("ticket_create", PLAN, "Create a work ticket.", json!({
+                "type":"object",
+                "properties":{
+                    "title":{"type":"string"},
+                    "description":{"type":"string"},
+                    "priority":{"type":"integer","description":"1=high, 2=normal, 3=low"},
+                    "parent_id":{"type":"integer"},
+                    "requirement_id":{"type":"integer","description":"Requirement this ticket addresses"}
+                },
+                "required":["title"]
+            }), tickets::create),
+            tool("ticket_read", PLAN_BUILD, "Read one ticket by id, or list tickets.", json!({
+                "type":"object",
+                "properties":{
+                    "id":{"type":"integer"},
+                    "status":{"type":"string","enum":["open","in_progress","resolved","closed"]},
+                    "requirement_id":{"type":"integer"}
+                }
+            }), tickets::read),
+            tool("ticket_resolve", PLAN_BUILD, "Mark a ticket resolved after the work is done and verified.", json!({
+                "type":"object",
+                "properties":{"id":{"type":"integer"},"resolution":{"type":"string"}},
+                "required":["id"]
+            }), tickets::resolve),
+            tool("ticket_close", PLAN_BUILD, "Close a ticket as obsolete/duplicate/won't-fix.", json!({
+                "type":"object",
+                "properties":{"id":{"type":"integer"},"reason":{"type":"string"}},
+                "required":["id"]
+            }), tickets::close),
+            // ---- requirements ----
+            tool("requirement_create", PLAN, "Create a stakeholder or system requirement.", json!({
+                "type":"object",
+                "properties":{
+                    "level":{"type":"string","enum":["stakeholder","system"]},
+                    "title":{"type":"string"},
+                    "body":{"type":"string"},
+                    "parent_id":{"type":"integer","description":"Parent requirement id"}
+                },
+                "required":["level","title","body"]
+            }), requirements::create),
+            tool("requirement_read", PLAN_BUILD, "Read a requirement by id, or list requirements.", json!({
+                "type":"object",
+                "properties":{
+                    "id":{"type":"integer"},
+                    "level":{"type":"string","enum":["stakeholder","system"]},
+                    "status":{"type":"string","enum":["active","met","removed"]}
+                }
+            }), requirements::read),
+            tool("requirement_update", PLAN, "Update a requirement's title/body/status/level/parent.", json!({
+                "type":"object",
+                "properties":{
+                    "id":{"type":"integer"},
+                    "title":{"type":"string"},
+                    "body":{"type":"string"},
+                    "status":{"type":"string","enum":["active","met","removed"]},
+                    "level":{"type":"string","enum":["stakeholder","system"]},
+                    "parent_id":{"type":"integer"}
+                },
+                "required":["id"]
+            }), requirements::update),
+            tool("requirement_remove", PLAN, "Remove a requirement (soft by default).", json!({
+                "type":"object",
+                "properties":{"id":{"type":"integer"},"hard":{"type":"boolean"}},
+                "required":["id"]
+            }), requirements::remove),
+            tool("requirement_ask", PLAN_BUILD, "Ask the user a clarifying question about a requirement. Recorded in the DB.", json!({
+                "type":"object",
+                "properties":{
+                    "question":{"type":"string"},
+                    "requirement_id":{"type":"integer"}
+                },
+                "required":["question"]
+            }), requirements::ask),
+            // ---- skills ----
+            tool("skill_load", ALL_MODES, "Load a skill's instructions by name.", json!({
+                "type":"object",
+                "properties":{"name":{"type":"string"}},
+                "required":["name"]
+            }), skills::load),
+            // ---- spawn ----
+            tool("spawn", PLAN_BUILD_EXPLORE, "Spawn a subagent in a given mode that only reports back.", json!({
+                "type":"object",
+                "properties":{
+                    "mode":{"type":"string","enum":["plan","build","explore"]},
+                    "instructions":{"type":"string","description":"What the subagent should do"},
+                    "task":{"type":"string","description":"Optional task label"}
+                },
+                "required":["mode","instructions"]
+            }), spawn::spawn),
+            // ---- retro ----
+            tool("query_instances", RETRO, "List past agent instances.", json!({
+                "type":"object",
+                "properties":{
+                    "mode":{"type":"string"},
+                    "limit":{"type":"integer","description":"Default 20"}
+                }
+            }), retro::instances),
+            tool("query_instance", RETRO, "Get all messages of one instance.", json!({
+                "type":"object",
+                "properties":{"instance_id":{"type":"string"},"limit":{"type":"integer"}},
+                "required":["instance_id"]
+            }), retro::instance),
+            tool("query_messages", RETRO, "Search recorded messages by text/role/instance.", json!({
+                "type":"object",
+                "properties":{
+                    "instance_id":{"type":"string"},
+                    "role":{"type":"string"},
+                    "search":{"type":"string"},
+                    "limit":{"type":"integer","description":"Default 50"}
+                }
+            }), retro::messages),
+            tool("query_tool_call", RETRO, "Query recorded tool calls (filter by name/errors/instance).", json!({
+                "type":"object",
+                "properties":{
+                    "instance_id":{"type":"string"},
+                    "name":{"type":"string"},
+                    "errors_only":{"type":"boolean"},
+                    "limit":{"type":"integer","description":"Default 50"}
+                }
+            }), retro::tool_calls),
+            tool("query_stats", RETRO, "Aggregate stats: tool usage, error rates, skill loads, token usage.", json!({
+                "type":"object","properties":{}
+            }), retro::stats),
+            tool("list_skills", RETRO, "List all skills with descriptions and use counts.", json!({
+                "type":"object","properties":{}
+            }), skills::list),
+            tool("read_skill", RETRO, "Read a skill, optionally a specific version.", json!({
+                "type":"object",
+                "properties":{"name":{"type":"string"},"version":{"type":"integer"}},
+                "required":["name"]
+            }), skills::read),
+            tool("write_skill", RETRO, "Create or overwrite a skill (versioned).", json!({
+                "type":"object",
+                "properties":{
+                    "name":{"type":"string"},
+                    "description":{"type":"string"},
+                    "content":{"type":"string"},
+                    "reason":{"type":"string"}
+                },
+                "required":["name","content"]
+            }), skills::write),
+            tool("edit_skill", RETRO, "Edit a skill by text replacement (versioned).", json!({
+                "type":"object",
+                "properties":{
+                    "name":{"type":"string"},
+                    "oldText":{"type":"string"},
+                    "newText":{"type":"string"},
+                    "reason":{"type":"string"}
+                },
+                "required":["name","oldText","newText"]
+            }), skills::edit),
+            tool("skill_history", RETRO, "List versions of a skill.", json!({
+                "type":"object","properties":{"name":{"type":"string"}},"required":["name"]
+            }), skills::history),
+            tool("skill_rollback", RETRO, "Activate an older version of a skill.", json!({
+                "type":"object",
+                "properties":{"name":{"type":"string"},"version":{"type":"integer"}},
+                "required":["name","version"]
+            }), skills::rollback),
+            tool("prompt_read", RETRO, "Read the active extended system prompt for a mode. RETRO has no extended prompt.", json!({
+                "type":"object","properties":{"mode":{"type":"string","enum":["plan","build","explore"]}},"required":["mode"]
+            }), retro::prompt_read),
+            tool("prompt_edit", RETRO, "Replace the extended system prompt for a mode (versioned). Core prompt is not editable; RETRO has no extended prompt.", json!({
+                "type":"object",
+                "properties":{
+                    "mode":{"type":"string","enum":["plan","build","explore"]},
+                    "content":{"type":"string"},
+                    "reason":{"type":"string"}
+                },
+                "required":["mode","content"]
+            }), retro::prompt_edit),
+            tool("prompt_history", RETRO, "List versions of a mode's extended prompt. RETRO has no extended prompt.", json!({
+                "type":"object","properties":{"mode":{"type":"string","enum":["plan","build","explore"]}},"required":["mode"]
+            }), retro::prompt_history),
+            tool("prompt_rollback", RETRO, "Activate an older version of a mode's extended prompt. RETRO has no extended prompt.", json!({
+                "type":"object",
+                "properties":{"mode":{"type":"string","enum":["plan","build","explore"]},"version":{"type":"integer"}},
+                "required":["mode","version"]
+            }), retro::prompt_rollback),
+        ]
+    })
 }
 
 pub fn specs_for(mode: Mode) -> Vec<ToolSpec> {
-    let all = all_specs();
-    mode.tool_names()
+    registry()
         .iter()
-        .filter_map(|n| all.iter().find(|s| s.name == *n).cloned())
+        .filter(|t| t.modes.contains(&mode))
+        .map(|t| t.spec())
         .collect()
 }
 
 /// Execute a tool. Returns (result_text, is_error). Result is truncated here so
 /// every caller gets bounded content.
 pub fn dispatch(agent: &mut Agent, name: &str, args: &Value) -> (String, bool) {
-    let res: Result<String> = match name {
-        "read" => basic::read(agent, args),
-        "write" => basic::write(agent, args),
-        "edit" => basic::edit(agent, args),
-        "ls" => basic::ls(agent, args),
-        "bash" => basic::bash(agent, args),
-        "ticket_create" => tickets::create(agent, args),
-        "ticket_read" => tickets::read(agent, args),
-        "ticket_resolve" => tickets::resolve(agent, args),
-        "ticket_close" => tickets::close(agent, args),
-        "requirement_create" => requirements::create(agent, args),
-        "requirement_read" => requirements::read(agent, args),
-        "requirement_update" => requirements::update(agent, args),
-        "requirement_remove" => requirements::remove(agent, args),
-        "requirement_ask" => requirements::ask(agent, args),
-        "skill_load" => skills::load(agent, args),
-        "spawn" => spawn::spawn(agent, args),
-        "query_instances" => retro::instances(agent, args),
-        "query_instance" => retro::instance(agent, args),
-        "query_messages" => retro::messages(agent, args),
-        "query_tool_call" => retro::tool_calls(agent, args),
-        "query_stats" => retro::stats(agent, args),
-        "list_skills" => skills::list(agent, args),
-        "read_skill" => skills::read(agent, args),
-        "write_skill" => skills::write(agent, args),
-        "edit_skill" => skills::edit(agent, args),
-        "skill_history" => skills::history(agent, args),
-        "skill_rollback" => skills::rollback(agent, args),
-        "prompt_read" => retro::prompt_read(agent, args),
-        "prompt_edit" => retro::prompt_edit(agent, args),
-        "prompt_history" => retro::prompt_history(agent, args),
-        "prompt_rollback" => retro::prompt_rollback(agent, args),
-        other => Err(anyhow!("unknown or unavailable tool `{other}`")),
+    let res: Result<String> = match registry().iter().find(|t| t.name == name) {
+        Some(t) => (t.handler)(agent, args),
+        None => Err(anyhow!("unknown or unavailable tool `{name}`")),
     };
     match res {
         Ok(s) => (

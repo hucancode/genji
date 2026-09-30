@@ -1,17 +1,18 @@
 use anyhow::{bail, Result};
 use serde_json::Value;
+use std::path::Path;
 
 use super::{opt_i64, opt_str, req_str};
 use crate::agent::Agent;
 use crate::reqmd::{self, Requirement};
 
-fn fmt_req(r: &Requirement, full: bool) -> String {
+fn fmt_req(r: &Requirement, workspace: &Path, full: bool) -> String {
     let mut s = format!("#{} [{}:{}] {}\n", r.id, r.level, r.status, r.title);
     if let Some(p) = r.parent_id {
         s.push_str(&format!("parent: #{p}\n"));
     }
     s.push_str(&format!("source: {}\n", r.source));
-    s.push_str(&format!("source_path: {}\n", r.source_path));
+    s.push_str(&format!("source_path: {}\n", r.display_path(workspace)));
     let body = r.body.trim();
     if !body.is_empty() {
         s.push('\n');
@@ -48,14 +49,14 @@ pub fn create(agent: &mut Agent, args: &Value) -> Result<String> {
     )?;
     Ok(format!(
         "created {level} requirement #{}: {} ({})",
-        r.id, r.title, r.source_path
+        r.id, r.title, r.display_path(&agent.workspace)
     ))
 }
 
 pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
     if let Some(id) = opt_i64(args, "id") {
         return match reqmd::load_by_id(&agent.cfg, &agent.workspace, id)? {
-            Some(r) => Ok(fmt_req(&r, true)),
+            Some(r) => Ok(fmt_req(&r, &agent.workspace, true)),
             None => bail!("requirement #{id} not found"),
         };
     }
@@ -72,7 +73,7 @@ pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
     let full = reqs.len() == 1;
     let mut out = String::new();
     for r in &reqs {
-        out.push_str(&fmt_req(r, full));
+        out.push_str(&fmt_req(r, &agent.workspace, full));
         out.push_str("---\n");
     }
     Ok(out)
@@ -80,9 +81,6 @@ pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
 
 pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
     let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
-    if reqmd::load_by_id(&agent.cfg, &agent.workspace, id)?.is_none() {
-        bail!("requirement #{id} not found");
-    }
     let status = opt_str(args, "status");
     if let Some(s) = &status {
         if !["active", "met", "removed"].contains(&s.as_str()) {
@@ -96,7 +94,7 @@ pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
         }
     }
     let parent_id = args.get("parent_id").map(|v| v.as_i64());
-    reqmd::update(
+    if !reqmd::update(
         &agent.cfg,
         &agent.workspace,
         id,
@@ -105,7 +103,9 @@ pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
         status.as_deref(),
         level.as_deref(),
         parent_id,
-    )?;
+    )? {
+        bail!("requirement #{id} not found");
+    }
     Ok(format!("updated requirement #{id}"))
 }
 

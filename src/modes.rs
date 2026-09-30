@@ -28,66 +28,6 @@ impl Mode {
         }
     }
 
-    /// Tools available in this mode. Basic tools are shared; ticket/requirement
-    /// tools are progressively restricted, explore has none at all.
-    pub fn tool_names(&self) -> Vec<&'static str> {
-        let mut t: Vec<&'static str> = vec!["read", "write", "edit", "ls", "bash"];
-        match self {
-            Mode::Plan => {
-                t.extend([
-                    "ticket_create",
-                    "ticket_read",
-                    "ticket_resolve",
-                    "ticket_close",
-                    "requirement_create",
-                    "requirement_read",
-                    "requirement_update",
-                    "requirement_remove",
-                    "requirement_ask",
-                    "skill_load",
-                    "spawn",
-                ]);
-            }
-            Mode::Build => {
-                // Reduced ticket/requirement surface for implementation work.
-                t.extend([
-                    "ticket_read",
-                    "ticket_resolve",
-                    "ticket_close",
-                    "requirement_read",
-                    "requirement_ask",
-                    "skill_load",
-                    "spawn",
-                ]);
-            }
-            Mode::Explore => {
-                // No ticket or requirement tools. Read/inspect and report.
-                t.extend(["skill_load", "spawn"]);
-            }
-            Mode::Retro => {
-                t.extend([
-                    "skill_load",
-                    "query_instances",
-                    "query_instance",
-                    "query_messages",
-                    "query_tool_call",
-                    "query_stats",
-                    "list_skills",
-                    "read_skill",
-                    "write_skill",
-                    "edit_skill",
-                    "skill_history",
-                    "skill_rollback",
-                    "prompt_read",
-                    "prompt_edit",
-                    "prompt_history",
-                    "prompt_rollback",
-                ]);
-            }
-        }
-        t
-    }
-
     /// Minimal, non-editable core system prompt for the mode.
     pub fn core_prompt(&self) -> &'static str {
         match self {
@@ -103,19 +43,6 @@ impl Mode {
     /// instructions, directly or via a spawned agent.
     pub fn allows_extended(&self) -> bool {
         !matches!(self, Mode::Retro)
-    }
-
-    /// Starter text for the user-editable extended prompt. Empty for every
-    /// mode: extended prompts are stored in the database, not seeded with
-    /// default content, and modes that do not support one
-    /// (see [`Mode::allows_extended`]) are also empty.
-    pub fn default_extended(&self) -> &'static str {
-        match self {
-            Mode::Plan => DEFAULT_EXT_PLAN,
-            Mode::Build => DEFAULT_EXT_BUILD,
-            Mode::Explore => DEFAULT_EXT_EXPLORE,
-            Mode::Retro => "",
-        }
     }
 
     pub fn all() -> [Mode; 4] {
@@ -190,9 +117,6 @@ Every change is versioned in the database and can be rolled back.
 
 // Extended prompts start empty and live only in the database. Retro mode
 // populates them via `prompt_edit`; nothing is written to disk.
-const DEFAULT_EXT_PLAN: &str = "";
-const DEFAULT_EXT_BUILD: &str = "";
-const DEFAULT_EXT_EXPLORE: &str = "";
 
 pub fn shared_preamble() -> &'static str {
     SHARED
@@ -205,14 +129,12 @@ mod tests {
     #[test]
     fn retro_has_no_extended_prompt() {
         assert!(!Mode::Retro.allows_extended());
-        assert!(Mode::Retro.default_extended().is_empty());
     }
 
     #[test]
     fn other_modes_are_extensible() {
         for mode in [Mode::Plan, Mode::Build, Mode::Explore] {
             assert!(mode.allows_extended());
-            assert!(mode.default_extended().is_empty());
         }
     }
 }

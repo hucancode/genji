@@ -17,10 +17,9 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent::Agent;
+use agent::{Agent, AgentParams};
 use config::Config;
 use db::Db;
-use events::EventEmitter;
 use modes::Mode;
 use serde_json::json;
 
@@ -57,8 +56,6 @@ struct Cli {
     workspace: Option<String>,
     #[arg(long, global = true)]
     provider: Option<String>,
-    #[arg(long, global = true)]
-    init: bool,
     #[arg(long, hide = true, global = true)]
     no_control: bool,
 }
@@ -205,22 +202,34 @@ fn mode_switch_instruction(mode: Mode) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_single(
+/// Inputs shared by every top-level run. One definition for how a run is
+/// described, whether it runs a single mode or cycles.
+struct RunRequest {
     cfg: Config,
     workspace: PathBuf,
     db: Db,
     instance_id: String,
     mode: Mode,
     task: String,
-    parent: Option<String>,
-    depth: u32,
     interactive: bool,
     quiet: bool,
     control: Option<Arc<control::Control>>,
-) -> Result<String> {
-    let model = cfg.model_for_mode(mode);
+}
+
+fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<String> {
+    let RunRequest {
+        cfg,
+        workspace,
+        db,
+        instance_id,
+        mode,
+        task,
+        interactive,
+        quiet,
+        control,
+    } = req;
     if !quiet {
+        let model = cfg.model_for_mode(mode);
         eprintln!(
             "[genji] mode={} model={} instance={} task={}",
             mode.as_str(),
@@ -229,35 +238,18 @@ fn run_single(
             llm::truncate(task.clone(), 120)
         );
     }
-    let workspace_str = workspace.display().to_string();
-    // stdout is always the machine event stream; stderr carries human logs. The
-    // same events are appended to a per-instance trace file for `genji inspect`.
-    let events = Arc::new(EventEmitter::new(
-        instance_id.clone(),
-        Some(registry::events_dir().join(format!("{instance_id}.jsonl"))),
-    ));
-    events.instance_start(
-        &workspace_str,
-        mode.as_str(),
-        &model,
-        parent.as_deref(),
-        depth,
-        &task,
-    );
-    let mut agent = Agent::new(
+    let mut agent = Agent::new(AgentParams {
         cfg,
         workspace,
         db,
         instance_id,
-        parent,
+        parent_instance: parent,
         mode,
-        model,
         depth,
-        &task,
+        task: task.clone(),
         interactive,
         control,
-        events.clone(),
-    )?;
+    })?;
     agent.add_user(&task)?;
     let report = agent.run_loop()?;
     let status = agent.status();
@@ -265,19 +257,18 @@ fn run_single(
     Ok(report)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_cycle(
-    cfg: Config,
-    workspace: PathBuf,
-    db: Db,
-    instance_id: String,
-    start_mode: Mode,
-    task: String,
-    interactive: bool,
-    quiet: bool,
-    control: Option<Arc<control::Control>>,
-) -> Result<String> {
-    let model = cfg.model_for_mode(start_mode);
+fn run_cycle(req: RunRequest) -> Result<String> {
+    let RunRequest {
+        cfg,
+        workspace,
+        db,
+        instance_id,
+        mode: start_mode,
+        task,
+        interactive,
+        quiet,
+        control,
+    } = req;
     if !quiet {
         eprintln!(
             "[genji] auto-cycle instance={} start={} max_cycles={}",
@@ -287,33 +278,27 @@ fn run_cycle(
         );
     }
     let max_cycles = cfg.max_cycles;
-    let workspace_str = workspace.display().to_string();
-    let events = Arc::new(EventEmitter::new(
-        instance_id.clone(),
-        Some(registry::events_dir().join(format!("{instance_id}.jsonl"))),
-    ));
-    events.instance_start(&workspace_str, start_mode.as_str(), &model, None, 0, &task);
-    let mut agent = Agent::new(
+    let mut agent = Agent::new(AgentParams {
         cfg,
         workspace,
         db,
         instance_id,
-        None,
-        start_mode,
-        model,
-        0,
-        &task,
+        parent_instance: None,
+        mode: start_mode,
+        depth: 0,
+        task: task.clone(),
         interactive,
         control,
-        events.clone(),
-    )?;
+    })?;
     agent.add_user(&task)?;
 
     let mut current = start_mode;
     let mut last_report = String::new();
     for cycle in 0..max_cycles {
         let active = reqmd::active_count(&agent.cfg, &agent.workspace)?;
-        events.cycle(cycle + 1, max_cycles, current.as_str(), active);
+        agent
+            .events
+            .cycle(cycle + 1, max_cycles, current.as_str(), active);
         if cycle > 0 && active == 0 {
             last_report =
                 format!("All requirements are met (0 active). Stopped after {cycle} cycle(s).");
@@ -650,7 +635,7 @@ fn cmd_instruct(id: &str, instruction: &str) -> Result<()> {
 /// Resolve an instance id (exact, else a unique prefix) to its trace file.
 fn find_trace(instance: &str) -> Result<std::path::PathBuf> {
     let dir = registry::events_dir();
-    let exact = dir.join(format!("{instance}.jsonl"));
+    let exact = registry::events_path(instance);
     if exact.exists() {
         return Ok(exact);
     }
@@ -699,7 +684,7 @@ fn resolve_target(id: &str) -> Result<TraceTarget> {
         bail!("missing instance id");
     }
     if let Ok(inst) = registry::find(id) {
-        let trace_path = registry::events_dir().join(format!("{}.jsonl", inst.id));
+        let trace_path = registry::events_path(&inst.id);
         return Ok(TraceTarget {
             instance_id: inst.id.clone(),
             trace_path,
@@ -876,19 +861,8 @@ fn main() -> Result<()> {
         eprintln!("[skills] synced {synced} skill file(s)");
     }
 
-    if cli.init {
-        eprintln!("[genji] initialized workspace at {}", workspace.display());
-        eprintln!("  config:       {}", Config::path_in(&workspace).display());
-        eprintln!("  skills:       {}", cfg.skills_path(&workspace).display());
-        eprintln!(
-            "  requirements: {}",
-            cfg.requirements_path(&workspace).display()
-        );
-        eprintln!("  db:           {}", cfg.db_file(&workspace).display());
-        return Ok(());
-    }
-
     let interactive = cli.interactive
+        || cfg.interactive
         || (!cli.subagent && std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
     // With no mode subcommand we default to build mode. Auto-cycling is implied
     // in that case, and `--cycle` enables it for any explicit starting mode.
@@ -910,7 +884,7 @@ fn main() -> Result<()> {
     // Materialise the trace up front so `genji inspect` works even before the
     // first event (for example while an instance waits for an instruction).
     {
-        let trace = registry::events_dir().join(format!("{instance_id}.jsonl"));
+        let trace = registry::events_path(&instance_id);
         if let Some(parent) = trace.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -986,33 +960,22 @@ fn main() -> Result<()> {
         },
     };
 
+    let request = RunRequest {
+        cfg,
+        workspace,
+        db,
+        instance_id,
+        mode: start_mode,
+        task,
+        interactive,
+        quiet,
+        control: control.clone(),
+    };
     let report = if cycle {
-        run_cycle(
-            cfg,
-            workspace,
-            db,
-            instance_id,
-            start_mode,
-            task,
-            interactive,
-            quiet,
-            control.clone(),
-        )?
+        run_cycle(request)?
     } else {
         let parent = cli.parent_instance.clone();
-        run_single(
-            cfg,
-            workspace,
-            db,
-            instance_id,
-            start_mode,
-            task,
-            parent,
-            cli.depth,
-            interactive,
-            quiet,
-            control.clone(),
-        )?
+        run_single(request, parent, cli.depth)?
     };
 
     if let Some(c) = &control {
