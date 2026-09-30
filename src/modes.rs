@@ -67,8 +67,8 @@ impl Mode {
             Mode::Retro => {
                 t.extend([
                     "skill_load",
-                    "query_sessions",
-                    "query_session",
+                    "query_instances",
+                    "query_instance",
                     "query_messages",
                     "query_tool_call",
                     "query_stats",
@@ -170,8 +170,8 @@ Do not make changes. Avoid destructive commands.
 const CORE_RETRO: &str = r#"
 You improve the agent itself by studying its recorded history.
 
-You have read/write/edit/ls/bash plus tools to query the session database:
-query_sessions, query_session, query_messages, query_tool_call, query_stats,
+You have read/write/edit/ls/bash plus tools to query the instance database:
+query_instances, query_instance, query_messages, query_tool_call, query_stats,
 list_skills, read_skill, write_skill, edit_skill, skill_history, skill_rollback,
 prompt_read, prompt_edit, prompt_history, prompt_rollback.
 

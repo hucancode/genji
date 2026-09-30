@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crate::config::{expand_tilde, Config};
 use crate::control::{Control, ControlPoll};
 use crate::db::Db;
+use crate::events::EventEmitter;
 use crate::llm::{self, ChatMessage, LlmClient};
 use crate::modes::{shared_preamble, Mode};
 use crate::prompts;
@@ -18,8 +19,8 @@ pub struct Agent {
     pub cfg: Config,
     pub workspace: PathBuf,
     pub db: Db,
-    pub session_id: String,
-    pub parent_session: Option<String>,
+    pub instance_id: String,
+    pub parent_instance: Option<String>,
     pub mode: Mode,
     pub model: String,
     pub llm: LlmClient,
@@ -36,6 +37,7 @@ pub struct Agent {
     pub interactive: bool,
     pub verbose: bool,
     pub control: Option<Arc<Control>>,
+    pub events: Arc<EventEmitter>,
 }
 
 impl Agent {
@@ -44,23 +46,24 @@ impl Agent {
         cfg: Config,
         workspace: PathBuf,
         db: Db,
-        session_id: String,
-        parent_session: Option<String>,
+        instance_id: String,
+        parent_instance: Option<String>,
         mode: Mode,
         model: String,
         depth: u32,
         task: &str,
         interactive: bool,
         control: Option<Arc<Control>>,
+        events: Arc<EventEmitter>,
     ) -> Result<Self> {
         let limits = cfg.limits_for_model(&model);
         let llm = LlmClient::new(&cfg, &model)?;
         let tools = tools::specs_for(mode);
         let system = build_system(&db, mode)?;
-        db.session_start(
-            &session_id,
+        db.instance_start(
+            &instance_id,
             mode.as_str(),
-            parent_session.as_deref(),
+            parent_instance.as_deref(),
             task,
             &model,
             depth,
@@ -71,8 +74,8 @@ impl Agent {
             cfg,
             workspace,
             db,
-            session_id,
-            parent_session,
+            instance_id,
+            parent_instance,
             mode,
             model,
             llm,
@@ -89,6 +92,7 @@ impl Agent {
             interactive,
             verbose,
             control,
+            events,
         })
     }
 
@@ -127,15 +131,27 @@ impl Agent {
         self.llm = LlmClient::new(&self.cfg, &self.model)?;
         self.tools = tools::specs_for(mode);
         self.db.conn.execute(
-            "UPDATE sessions SET mode=? WHERE id=?",
-            params![mode.as_str(), self.session_id],
+            "UPDATE instances SET mode=? WHERE id=?",
+            params![mode.as_str(), self.instance_id],
         )?;
         self.refresh_system_prompt()?;
+        self.events.mode(mode.as_str(), &self.model);
         Ok(())
     }
 
     /// Append a message to the in-memory conversation and the persistent log.
     pub fn log(&mut self, msg: ChatMessage) -> Result<()> {
+        match msg.role.as_str() {
+            "user" => self.events.user(&msg.content),
+            "assistant" => {
+                self.events
+                    .assistant(&msg.content, msg.reasoning_content.as_deref());
+                for c in &msg.tool_calls {
+                    self.events.tool_call(&c.id, &c.name, &c.arguments);
+                }
+            }
+            _ => {}
+        }
         let tool_calls_json = if msg.tool_calls.is_empty() {
             None
         } else {
@@ -147,7 +163,7 @@ impl Agent {
             Some(serde_json::to_string(&arr)?)
         };
         self.db.message_add(
-            &self.session_id,
+            &self.instance_id,
             self.seq,
             &msg.role,
             &msg.content,
@@ -187,6 +203,7 @@ impl Agent {
         loop {
             if let Some(reason) = self.budget_exceeded() {
                 eprintln!("[budget] {reason}");
+                self.events.error(&format!("stopped: {reason}"));
                 return Ok(format!("(stopped: {reason})"));
             }
 
@@ -196,18 +213,18 @@ impl Agent {
             if poll.stop {
                 let m = "(stopped by user via control socket)".to_string();
                 eprintln!("[control] {m}");
+                self.events.status(&m);
                 return Ok(m);
             }
             if let Some(c) = &self.control {
-                c.set_status(format!(
-                    "mode={} model={} tokens={} messages={} session={} elapsed={}s",
+                let status = format!(
+                    "working mode={} tokens={} elapsed={}s",
                     self.mode.as_str(),
-                    self.model,
                     self.tokens_used,
-                    self.messages.len(),
-                    self.session_id,
                     self.started.elapsed().as_secs()
-                ));
+                );
+                c.set_status(status.clone());
+                self.events.status(&status);
             }
             self.maybe_compact()?;
 
@@ -217,15 +234,18 @@ impl Agent {
                 Err(e) => {
                     let msg = format!("LLM error: {e:#}");
                     eprintln!("[llm] {msg}");
+                    self.events.error(&msg);
                     let _ = self.log(ChatMessage::assistant(&msg));
                     return Ok(msg);
                 }
             };
             self.tokens_used += resp.prompt_tokens + resp.completion_tokens;
             self.last_prompt_tokens = resp.prompt_tokens;
+            self.events
+                .tokens(self.tokens_used, resp.prompt_tokens, resp.completion_tokens);
             let _ = self
                 .db
-                .session_set_tokens(&self.session_id, self.tokens_used);
+                .instance_set_tokens(&self.instance_id, self.tokens_used);
 
             let assistant = resp.message.clone();
             if assistant.tool_calls.is_empty() {
@@ -258,7 +278,7 @@ impl Agent {
                 let (result, is_error) = tools::dispatch(self, &tc.name, &args);
                 let dur = start.elapsed().as_millis() as i64;
                 self.db.tool_call_add(
-                    &self.session_id,
+                    &self.instance_id,
                     msg_seq,
                     &tc.name,
                     &tc.arguments,
@@ -266,6 +286,8 @@ impl Agent {
                     is_error,
                     dur,
                 )?;
+                self.events
+                    .tool_result(&tc.id, &tc.name, is_error, dur, &result);
                 if self.verbose || is_error {
                     eprintln!(
                         "[tool] {}({}) -> {} ({}ms)",
@@ -285,6 +307,7 @@ impl Agent {
                     self.cfg.max_tool_iterations
                 );
                 eprintln!("[loop] {msg}");
+                self.events.error(&msg);
                 return Ok(msg);
             }
         }
@@ -361,14 +384,16 @@ impl Agent {
         let after = llm::estimate_messages(&self.messages);
         self.last_prompt_tokens = 0;
         self.db
-            .compaction_add(&self.session_id, removed, before, after, &summary)?;
+            .compaction_add(&self.instance_id, removed, before, after, &summary)?;
         eprintln!("[compact] removed {removed} messages ({before} -> {after} est tokens)");
+        self.events.compaction(removed, before, after, &summary);
         Ok(())
     }
 
     pub fn finish(&self, status: &str, report: &str) -> Result<()> {
+        self.events.instance_end(status, self.tokens_used, report);
         self.db
-            .session_end(&self.session_id, status, self.tokens_used, report)
+            .instance_end(&self.instance_id, status, self.tokens_used, report)
     }
 }
 

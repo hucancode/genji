@@ -2,6 +2,7 @@ mod agent;
 mod config;
 mod control;
 mod db;
+mod events;
 mod llm;
 mod modes;
 mod proc;
@@ -14,15 +15,14 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use agent::Agent;
 use config::Config;
 use db::Db;
+use events::EventEmitter;
 use modes::Mode;
-
-static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+use serde_json::json;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -40,7 +40,7 @@ struct Cli {
     #[arg(long, hide = true, global = true)]
     subagent: bool,
     #[arg(long, hide = true, global = true)]
-    parent_session: Option<String>,
+    parent_instance: Option<String>,
     #[arg(long, hide = true, global = true)]
     instructions_file: Option<String>,
     #[arg(long, default_value = "", global = true)]
@@ -100,20 +100,10 @@ enum Command {
         #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
         instruction: Vec<String>,
     },
-    /// Show brief stats for a running genji instance.
     Inspect {
         /// Instance id (see `genji list`).
         id: String,
     },
-}
-
-fn new_session_id() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let c = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{:x}-{:x}-{:x}", nanos, std::process::id(), c)
 }
 
 fn ensure_layout(cfg: &Config, workspace: &std::path::Path) -> Result<()> {
@@ -175,7 +165,7 @@ fn startup_action(explicit_task: Option<String>, active_requirements: i64) -> St
 /// Block until the user injects an instruction over the control socket (or asks
 /// to stop). Returns `None` if a stop was requested before any instruction.
 fn wait_for_instruction(control: &control::Control, id: &str, quiet: bool) -> Result<Option<String>> {
-    control.set_status("idle (waiting for instruction)");
+    control.set_status("idle");
     if !quiet {
         eprintln!(
             "[genji] no instruction provided; waiting for one on {}",
@@ -212,6 +202,7 @@ fn run_single(
     cfg: Config,
     workspace: PathBuf,
     db: Db,
+    instance_id: String,
     mode: Mode,
     task: String,
     parent: Option<String>,
@@ -221,21 +212,35 @@ fn run_single(
     control: Option<Arc<control::Control>>,
 ) -> Result<String> {
     let model = cfg.model_for_mode(mode);
-    let session_id = new_session_id();
     if !quiet {
         eprintln!(
-            "[genji] mode={} model={} session={} task={}",
+            "[genji] mode={} model={} instance={} task={}",
             mode.as_str(),
             model,
-            session_id,
+            instance_id,
             llm::truncate(task.clone(), 120)
         );
     }
+    let workspace_str = workspace.display().to_string();
+    // stdout is always the machine event stream; stderr carries human logs. The
+    // same events are appended to a per-instance trace file for `genji inspect`.
+    let events = Arc::new(EventEmitter::new(
+        instance_id.clone(),
+        Some(registry::events_dir().join(format!("{instance_id}.jsonl"))),
+    ));
+    events.instance_start(
+        &workspace_str,
+        mode.as_str(),
+        &model,
+        parent.as_deref(),
+        depth,
+        &task,
+    );
     let mut agent = Agent::new(
         cfg,
         workspace,
         db,
-        session_id,
+        instance_id,
         parent,
         mode,
         model,
@@ -243,6 +248,7 @@ fn run_single(
         &task,
         interactive,
         control,
+        events.clone(),
     )?;
     agent.add_user(&task)?;
     let report = agent.run_loop()?;
@@ -250,32 +256,39 @@ fn run_single(
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_cycle(
     cfg: Config,
     workspace: PathBuf,
     db: Db,
+    instance_id: String,
     start_mode: Mode,
     task: String,
     interactive: bool,
     quiet: bool,
     control: Option<Arc<control::Control>>,
 ) -> Result<String> {
-    let session_id = new_session_id();
     let model = cfg.model_for_mode(start_mode);
     if !quiet {
         eprintln!(
-            "[genji] auto-cycle session={} start={} max_cycles={}",
-            session_id,
+            "[genji] auto-cycle instance={} start={} max_cycles={}",
+            instance_id,
             start_mode.as_str(),
             cfg.max_cycles
         );
     }
     let max_cycles = cfg.max_cycles;
+    let workspace_str = workspace.display().to_string();
+    let events = Arc::new(EventEmitter::new(
+        instance_id.clone(),
+        Some(registry::events_dir().join(format!("{instance_id}.jsonl"))),
+    ));
+    events.instance_start(&workspace_str, start_mode.as_str(), &model, None, 0, &task);
     let mut agent = Agent::new(
         cfg,
         workspace,
         db,
-        session_id,
+        instance_id,
         None,
         start_mode,
         model,
@@ -283,6 +296,7 @@ fn run_cycle(
         &task,
         interactive,
         control,
+        events.clone(),
     )?;
     agent.add_user(&task)?;
 
@@ -290,6 +304,7 @@ fn run_cycle(
     let mut last_report = String::new();
     for cycle in 0..max_cycles {
         let active = reqmd::active_count(&agent.cfg, &agent.workspace)?;
+        events.cycle(cycle + 1, max_cycles, current.as_str(), active);
         if cycle > 0 && active == 0 {
             last_report = format!(
                 "All requirements are met (0 active). Stopped after {cycle} cycle(s)."
@@ -378,25 +393,50 @@ fn query_status(socket: &str) -> String {
     }
 }
 
-/// `genji list` — running instances with their live status.
+/// `genji list` — running instances with their live status. stdout is machine
+/// output (JSON); the human table is written to stderr.
 fn cmd_list() -> Result<()> {
-    let instances = registry::list_live();
-    if instances.is_empty() {
-        println!("no running genji instances");
+    // Probe each control socket once and reuse the status for both the machine
+    // output and the human table.
+    let rows: Vec<(registry::Instance, String)> = registry::list_live()
+        .into_iter()
+        .map(|inst| {
+            let status = query_status(&inst.control_socket);
+            (inst, status)
+        })
+        .collect();
+    let arr: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(inst, status)| {
+            json!({
+                "id": inst.id,
+                "pid": inst.pid,
+                "uptime_secs": inst.uptime_secs(),
+                "workspace": inst.workspace,
+                "label": inst.label,
+                "control_socket": inst.control_socket,
+                "status": status,
+            })
+        })
+        .collect();
+    // Terse machine output: just the instances, no `type`/wrapper boilerplate.
+    println!("{}", serde_json::to_string(&arr)?);
+    if rows.is_empty() {
+        eprintln!("no running genji instances");
         return Ok(());
     }
-    println!(
+    eprintln!(
         "{:<8} {:<7} {:<8} {:<38} STATUS",
         "ID", "PID", "UPTIME", "WORKSPACE"
     );
-    for inst in &instances {
-        println!(
+    for (inst, status) in &rows {
+        eprintln!(
             "{:<8} {:<7} {:<8} {:<38} {}",
             inst.id,
             inst.pid,
             format_uptime(inst.uptime_secs()),
             inst.workspace,
-            query_status(&inst.control_socket)
+            status
         );
     }
     Ok(())
@@ -453,24 +493,34 @@ fn cmd_stop(ids: &[String]) -> Result<()> {
         found
     };
 
-    if instances.is_empty() {
-        if !failed {
-            println!("no running genji instances");
-        }
-        if failed {
-            std::process::exit(1);
-        }
-        return Ok(());
+    if instances.is_empty() && !failed {
+        eprintln!("no running genji instances");
     }
+    let mut results: Vec<serde_json::Value> = Vec::new();
     for inst in &instances {
         match control::send(Path::new(&inst.control_socket), "/stop") {
-            Ok(r) => println!("stopping {} (pid {}): {}", inst.id, inst.pid, r),
+            Ok(r) => {
+                eprintln!("stopping {} (pid {}): {}", inst.id, inst.pid, r);
+                results.push(json!({
+                    "id": inst.id,
+                    "pid": inst.pid,
+                    "ok": true,
+                    "message": r,
+                }));
+            }
             Err(e) => {
                 eprintln!("failed to stop {}: {e:#}", inst.id);
+                results.push(json!({
+                    "id": inst.id,
+                    "pid": inst.pid,
+                    "ok": false,
+                    "message": format!("{e:#}"),
+                }));
                 failed = true;
             }
         }
     }
+    println!("{}", serde_json::to_string(&results)?);
     if failed {
         std::process::exit(1);
     }
@@ -478,28 +528,189 @@ fn cmd_stop(ids: &[String]) -> Result<()> {
 }
 
 /// `genji instruct <id> <instruction>` — queue text for a running instance.
+/// stdout is machine output (JSON); the human message goes to stderr.
 fn cmd_instruct(id: &str, instruction: &str) -> Result<()> {
     if instruction.trim().is_empty() {
         bail!("missing instruction (usage: genji instruct <id> <instruction>)");
     }
     let inst = registry::find(id)?;
     let resp = control::send(Path::new(&inst.control_socket), instruction)?;
-    println!("{}", status_text(&resp));
+    let message = status_text(&resp);
+    println!(
+        "{}",
+        serde_json::to_string(&json!({ "id": inst.id, "message": message }))?
+    );
+    eprintln!("{message}");
     Ok(())
 }
 
-/// `genji inspect <id>` — metadata plus live status for one instance.
-fn cmd_inspect(id: &str) -> Result<()> {
-    let inst = registry::find(id)?;
-    println!("id:        {}", inst.id);
-    println!("pid:       {}", inst.pid);
-    if !inst.label.is_empty() {
-        println!("label:     {}", inst.label);
+/// Resolve an instance id (exact, else a unique prefix) to its trace file.
+fn find_trace(instance: &str) -> Result<std::path::PathBuf> {
+    let dir = registry::events_dir();
+    let exact = dir.join(format!("{instance}.jsonl"));
+    if exact.exists() {
+        return Ok(exact);
     }
-    println!("workspace: {}", inst.workspace);
-    println!("socket:    {}", inst.control_socket);
-    println!("uptime:    {}", format_uptime(inst.uptime_secs()));
-    println!("status:    {}", query_status(&inst.control_socket));
+    let mut matches: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if stem.starts_with(instance) {
+                matches.push(p);
+            }
+        }
+    }
+    match matches.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => bail!("no event trace for instance `{instance}`"),
+        many => {
+            let names: Vec<&str> = many
+                .iter()
+                .filter_map(|p| p.file_stem().and_then(|s| s.to_str()))
+                .collect();
+            bail!(
+                "instance id `{instance}` is ambiguous; matches: {} (use a longer prefix)",
+                names.join(", ")
+            )
+        }
+    }
+}
+
+/// A resolved `inspect`/`follow` target: an instance id and its trace, plus the
+/// live instance record when the id named one.
+struct TraceTarget {
+    instance_id: String,
+    trace_path: std::path::PathBuf,
+    instance: Option<registry::Instance>,
+}
+
+/// Resolve `<id>` as a live instance id, else as a recorded (finished) instance
+/// id whose trace still exists.
+fn resolve_target(id: &str) -> Result<TraceTarget> {
+    let id = id.trim();
+    if id.is_empty() {
+        bail!("missing instance id");
+    }
+    if let Ok(inst) = registry::find(id) {
+        let trace_path = registry::events_dir().join(format!("{}.jsonl", inst.id));
+        return Ok(TraceTarget {
+            instance_id: inst.id.clone(),
+            trace_path,
+            instance: Some(inst),
+        });
+    }
+    Ok(TraceTarget {
+        instance_id: id.to_string(),
+        trace_path: find_trace(id)?,
+        instance: None,
+    })
+}
+
+/// Read a target's trace. A missing file is empty for a live instance.
+fn read_trace(target: &TraceTarget) -> Result<Option<String>> {
+    if target.trace_path.exists() {
+        Ok(Some(std::fs::read_to_string(&target.trace_path).with_context(
+            || format!("reading event trace {}", target.trace_path.display()),
+        )?))
+    } else if target.instance.is_some() {
+        Ok(None)
+    } else {
+        bail!("no event trace for instance `{}`", target.instance_id)
+    }
+}
+
+/// The `instance_start` event of a trace, if present.
+fn trace_instance_start(text: &str) -> Option<serde_json::Value> {
+    text.lines().find_map(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).ok()?;
+        (v.get("type").and_then(|t| t.as_str()) == Some("instance_start")).then_some(v)
+    })
+}
+
+/// True when a trace line is an `instance_end` event.
+fn is_instance_end(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(|t| t == "instance_end")
+        })
+        .unwrap_or(false)
+}
+
+/// `genji inspect <id>` — a brief summary of an instance.
+///
+/// stdout is a single JSON object; the human-readable view goes to stderr. Use
+/// `genji follow <id>` to stream the event trace itself.
+fn cmd_inspect(id: &str) -> Result<()> {
+    let target = resolve_target(id)?;
+    let text = read_trace(&target)?.unwrap_or_default();
+    let count = text.lines().filter(|l| !l.trim().is_empty()).count();
+    let ended = text.lines().any(is_instance_end);
+    let start = trace_instance_start(&text);
+    let status = target
+        .instance
+        .as_ref()
+        .map(|i| query_status(&i.control_socket));
+
+    let mut obj = json!({
+        "type": "instance",
+        "id": id.trim(),
+        "trace": target.trace_path.display().to_string(),
+        "events": count,
+        "ended": ended,
+    });
+    let map = obj.as_object_mut().expect("object");
+    if let Some(s) = &start {
+        for key in ["workspace", "mode", "model", "parent", "depth", "task"] {
+            if let Some(v) = s.get(key) {
+                map.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+    if let Some(inst) = &target.instance {
+        map.insert("pid".into(), json!(inst.pid));
+        map.insert("label".into(), json!(inst.label));
+        map.entry("workspace".to_string())
+            .or_insert_with(|| json!(inst.workspace));
+        map.insert("control_socket".into(), json!(inst.control_socket));
+        map.insert("uptime_secs".into(), json!(inst.uptime_secs()));
+        if let Some(st) = &status {
+            map.insert("status".into(), json!(st));
+        }
+    }
+    println!("{}", serde_json::to_string(&obj)?);
+
+    // Human summary.
+    eprintln!("id:      {}", id.trim());
+    eprintln!("trace:   {}", target.trace_path.display());
+    eprintln!("events:  {count}{}", if ended { " (ended)" } else { "" });
+    if let Some(s) = &start {
+        let mode = s.get("mode").and_then(|v| v.as_str()).unwrap_or("?");
+        let model = s.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+        let task = s.get("task").and_then(|v| v.as_str()).unwrap_or("");
+        eprintln!("mode:    {mode}  model: {model}");
+        if let Some(parent) = s.get("parent").and_then(|v| v.as_str()) {
+            eprintln!("parent:  {parent}");
+        }
+        if !task.is_empty() {
+            eprintln!("task:    {task}");
+        }
+    }
+    if let Some(inst) = &target.instance {
+        eprintln!(
+            "instance: {}  pid: {}  workspace: {}",
+            inst.id, inst.pid, inst.workspace
+        );
+    }
+    if let Some(st) = &status {
+        eprintln!("status:  {st}");
+    }
     Ok(())
 }
 
@@ -578,6 +789,22 @@ fn main() -> Result<()> {
     let cycle = cli.command.is_none() || cli.cycle;
     let explicit_task = read_task(cli.instructions_file.as_deref(), task_arg)?;
     let quiet = cli.quiet_startup || cli.subagent;
+    // One id per run: the instance id. It names the registry record, the event
+    // trace that `genji inspect` reads, and the DB record, and every event is
+    // tagged with it. Subagents get one too even though they do not register.
+    let instance_id = registry::new_id();
+    // Materialise the trace up front so `genji inspect` works even before the
+    // first event (for example while an instance waits for an instruction).
+    {
+        let trace = registry::events_dir().join(format!("{instance_id}.jsonl"));
+        if let Some(parent) = trace.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&trace);
+    }
 
     if !quiet {
         let p = cfg.resolve_active_provider();
@@ -597,7 +824,6 @@ fn main() -> Result<()> {
     // mid-run; subagents never do. Controllable runs also register themselves so
     // `genji list`/`stop`/`instruct`/`inspect` can find them from anywhere.
     let mut _instance_guard: Option<InstanceGuard> = None;
-    let mut instance_id: Option<String> = None;
     let control = if cli.no_control || !cfg.control_enabled {
         None
     } else {
@@ -605,9 +831,8 @@ fn main() -> Result<()> {
         if !quiet {
             eprintln!("[control] listening on {}", c.path.display());
         }
-        let id = registry::new_id();
         let inst = registry::Instance {
-            id: id.clone(),
+            id: instance_id.clone(),
             pid: std::process::id(),
             workspace: workspace.display().to_string(),
             control_socket: c.path.display().to_string(),
@@ -617,7 +842,6 @@ fn main() -> Result<()> {
         if let Err(e) = inst.save() {
             eprintln!("[registry] warning: could not register instance: {e:#}");
         }
-        instance_id = Some(id);
         _instance_guard = Some(InstanceGuard(inst));
         Some(c)
     };
@@ -627,7 +851,7 @@ fn main() -> Result<()> {
     let task = match startup_action(explicit_task, reqmd::active_count(&cfg, &workspace)?) {
         Startup::Run(t) => t,
         Startup::Wait => match &control {
-            Some(c) => match wait_for_instruction(c, instance_id.as_deref().unwrap_or(""), quiet)? {
+            Some(c) => match wait_for_instruction(c, &instance_id, quiet)? {
                 Some(t) => t,
                 None => {
                     c.shutdown();
@@ -653,6 +877,7 @@ fn main() -> Result<()> {
             cfg,
             workspace,
             db,
+            instance_id,
             start_mode,
             task,
             interactive,
@@ -660,11 +885,12 @@ fn main() -> Result<()> {
             control.clone(),
         )?
     } else {
-        let parent = cli.parent_session.clone();
+        let parent = cli.parent_instance.clone();
         run_single(
             cfg,
             workspace,
             db,
+            instance_id,
             start_mode,
             task,
             parent,
@@ -678,6 +904,9 @@ fn main() -> Result<()> {
     if let Some(c) = &control {
         c.shutdown();
     }
-    println!("{report}");
+    // stdout carries the machine event stream; the final report is delivered in
+    // the `instance_end` event. Mirror it to stderr so humans still see the
+    // answer without having to parse the events.
+    eprintln!("[report] {report}");
     Ok(())
 }

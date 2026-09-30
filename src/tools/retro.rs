@@ -7,11 +7,11 @@ use crate::agent::Agent;
 use crate::db::PromptVersionRow;
 use crate::modes::Mode;
 
-pub fn sessions(agent: &mut Agent, args: &Value) -> Result<String> {
+pub fn instances(agent: &mut Agent, args: &Value) -> Result<String> {
     let limit = opt_i64(args, "limit").unwrap_or(20).clamp(1, 500);
     let mode = opt_str(args, "mode");
     let mut sql = String::from(
-        "SELECT id,mode,parent_session,depth,status,tokens_used,started_at,substr(COALESCE(task,''),1,80) FROM sessions WHERE 1=1",
+        "SELECT id,mode,parent_instance,depth,status,tokens_used,started_at,substr(COALESCE(task,''),1,80) FROM instances WHERE 1=1",
     );
     let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(m) = mode {
@@ -39,16 +39,16 @@ pub fn sessions(agent: &mut Agent, args: &Value) -> Result<String> {
         out.push_str(&row?);
     }
     if out.is_empty() {
-        out = "(no sessions)".into();
+        out = "(no instances)".into();
     }
     Ok(out)
 }
 
-pub fn session(agent: &mut Agent, args: &Value) -> Result<String> {
-    let sid = req_str(args, "session_id")?;
+pub fn instance(agent: &mut Agent, args: &Value) -> Result<String> {
+    let sid = req_str(args, "instance_id")?;
     let limit = opt_i64(args, "limit").unwrap_or(200).clamp(1, 2000);
     let mut stmt = agent.db.conn.prepare(
-        "SELECT seq,role,content,tool_calls FROM messages WHERE session_id=? ORDER BY seq LIMIT ?",
+        "SELECT seq,role,content,tool_calls FROM messages WHERE instance_id=? ORDER BY seq LIMIT ?",
     )?;
     let rows = stmt.query_map(params![sid, limit], |r| {
         Ok((
@@ -70,17 +70,17 @@ pub fn session(agent: &mut Agent, args: &Value) -> Result<String> {
         }
     }
     if out.is_empty() {
-        out = format!("(session {sid} has no messages)");
+        out = format!("(instance {sid} has no messages)");
     }
     Ok(out)
 }
 
 pub fn messages(agent: &mut Agent, args: &Value) -> Result<String> {
     let limit = opt_i64(args, "limit").unwrap_or(50).clamp(1, 500);
-    let mut sql = String::from("SELECT session_id,seq,role,substr(content,1,400),created_at FROM messages WHERE 1=1");
+    let mut sql = String::from("SELECT instance_id,seq,role,substr(content,1,400),created_at FROM messages WHERE 1=1");
     let mut p: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    if let Some(s) = opt_str(args, "session_id") {
-        sql.push_str(" AND session_id=?");
+    if let Some(s) = opt_str(args, "instance_id") {
+        sql.push_str(" AND instance_id=?");
         p.push(Box::new(s));
     }
     if let Some(r) = opt_str(args, "role") {
@@ -118,11 +118,11 @@ pub fn messages(agent: &mut Agent, args: &Value) -> Result<String> {
 pub fn tool_calls(agent: &mut Agent, args: &Value) -> Result<String> {
     let limit = opt_i64(args, "limit").unwrap_or(50).clamp(1, 500);
     let mut sql = String::from(
-        "SELECT session_id,name,is_error,duration_ms,substr(args,1,160),substr(result,1,300),created_at FROM tool_calls WHERE 1=1",
+        "SELECT instance_id,name,is_error,duration_ms,substr(args,1,160),substr(result,1,300),created_at FROM tool_calls WHERE 1=1",
     );
     let mut p: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    if let Some(s) = opt_str(args, "session_id") {
-        sql.push_str(" AND session_id=?");
+    if let Some(s) = opt_str(args, "instance_id") {
+        sql.push_str(" AND instance_id=?");
         p.push(Box::new(s));
     }
     if let Some(n) = opt_str(args, "name") {
@@ -160,18 +160,18 @@ pub fn tool_calls(agent: &mut Agent, args: &Value) -> Result<String> {
 
 pub fn stats(agent: &mut Agent, _args: &Value) -> Result<String> {
     let mut out = String::new();
-    let (sessions, tokens): (i64, i64) = agent.db.conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(tokens_used),0) FROM sessions",
+    let (instances, tokens): (i64, i64) = agent.db.conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(tokens_used),0) FROM instances",
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    out.push_str(&format!("sessions: {sessions}, total tokens: {tokens}\n"));
-    out.push_str("sessions by mode:\n");
+    out.push_str(&format!("instances: {instances}, total tokens: {tokens}\n"));
+    out.push_str("instances by mode:\n");
     {
         let mut stmt = agent
             .db
             .conn
-            .prepare("SELECT mode,COUNT(*) FROM sessions GROUP BY mode ORDER BY 2 DESC")?;
+            .prepare("SELECT mode,COUNT(*) FROM instances GROUP BY mode ORDER BY 2 DESC")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         for row in rows {
             let (m, c) = row?;

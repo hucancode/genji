@@ -62,7 +62,7 @@ build → plan → build → plan → …   until active requirements == 0 (or m
 ```
 
 State (requirements, tickets, conversation) persists across cycles in one
-session. Plan mode decides whether requirements are truly met; when none remain
+run. Plan mode decides whether requirements are truly met; when none remain
 active, the loop stops. The `--cycle` flag applies the same cycling to an
 explicit mode subcommand, starting from that mode (`genji build --cycle` starts
 at build, `genji plan --cycle` starts at plan). A mode subcommand without
@@ -85,5 +85,5 @@ spawn {mode: "explore"|"plan"|"build", instructions: "...", task?: "..."}
 
 - The subagent runs a **single** mode and never cycles. It reports back by
   printing its final message to stdout, which the parent captures.
-- Its session is recorded with `parent_session` and `depth`.
+- Its run is recorded with `parent_instance` and `depth`.
 - Nesting is bounded by `max_subagent_depth`.

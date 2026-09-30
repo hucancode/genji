@@ -7,7 +7,7 @@ While a top-level run is active, genji listens on a Unix-domain socket
 # in another terminal, any workspace
 genji list           # find the instance id
 genji instruct <id> "focus on the parser first; ignore the docs for now"
-genji inspect <id>   # status: mode=build tokens=64328 messages=57
+genji inspect <id>   # brief summary
 genji stop <id>      # ask for a graceful stop
 genji stop id1,id2   # several ids (comma-separated or spaced)
 genji stop all       # every registered instance
@@ -26,7 +26,7 @@ left by a crash is detected and replaced automatically.
    # liveness
    printf '/ping\n'   | nc -U "$SOCK"        # -> pong
    # current status
-   printf '/status\n' | nc -U "$SOCK"        # -> status: idle (waiting for instruction)
+   printf '/status\n' | nc -U "$SOCK"        # -> status: idle
    # inject an instruction (any line not starting with "/")
    printf 'focus on the parser first\n' | nc -U "$SOCK"
    # -> queued (1 pending)

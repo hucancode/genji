@@ -5,9 +5,9 @@ improve itself:
 
 | Tool | Purpose |
 |------|---------|
-| `query_sessions` | list sessions (mode, depth, tokens, status) |
-| `query_session` | dump a session's messages |
-| `query_messages` | search messages by role/text/session |
+| `query_instances` | list instances (mode, depth, tokens, status) |
+| `query_instance` | dump an instance's messages |
+| `query_messages` | search messages by role/text/instance |
 | `query_tool_call` | inspect tool calls (name, errors, duration, args/result) |
 | `query_stats` | aggregated tool usage, error rate, skill loads, tokens |
 | `list_skills` / `read_skill` | inspect skills and their version history |

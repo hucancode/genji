@@ -126,7 +126,7 @@ pub fn ask(agent: &mut Agent, args: &Value) -> Result<String> {
     let requirement_id = opt_i64(args, "requirement_id");
     let qid = agent
         .db
-        .question_ask(requirement_id, &agent.session_id.clone(), &question)?;
+        .question_ask(requirement_id, &agent.instance_id.clone(), &question)?;
 
     if agent.interactive {
         eprintln!("\n[requirement_ask] {question}\n> answer (blank to skip):");

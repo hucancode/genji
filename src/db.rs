@@ -117,6 +117,7 @@ impl Db {
     }
 
     pub fn init_schema(&self) -> Result<()> {
+        self.migrate_session_to_instance()?;
         self.conn.execute_batch(&format!(
             r#"
 CREATE TABLE IF NOT EXISTS tickets (
@@ -157,7 +158,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_req_source_path ON requirements(source_pat
 CREATE TABLE IF NOT EXISTS requirement_questions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   requirement_id INTEGER,
-  session_id TEXT,
+  instance_id TEXT,
   question TEXT NOT NULL,
   answer TEXT,
   status TEXT NOT NULL DEFAULT 'open',
@@ -165,10 +166,10 @@ CREATE TABLE IF NOT EXISTS requirement_questions (
   answered_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS sessions (
+CREATE TABLE IF NOT EXISTS instances (
   id TEXT PRIMARY KEY,
   mode TEXT NOT NULL,
-  parent_session TEXT,
+  parent_instance TEXT,
   task TEXT,
   model TEXT,
   depth INTEGER NOT NULL DEFAULT 0,
@@ -181,7 +182,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id TEXT NOT NULL,
+  instance_id TEXT NOT NULL,
   seq INTEGER NOT NULL,
   role TEXT NOT NULL,
   content TEXT NOT NULL DEFAULT '',
@@ -190,12 +191,12 @@ CREATE TABLE IF NOT EXISTS messages (
   reasoning TEXT,
   created_at TEXT NOT NULL DEFAULT ({NOW})
 );
-CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_messages_instance ON messages(instance_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(role);
 
 CREATE TABLE IF NOT EXISTS tool_calls (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id TEXT NOT NULL,
+  instance_id TEXT NOT NULL,
   message_seq INTEGER NOT NULL DEFAULT 0,
   name TEXT NOT NULL,
   args TEXT NOT NULL DEFAULT '',
@@ -204,7 +205,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   duration_ms INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT ({NOW})
 );
-CREATE INDEX IF NOT EXISTS idx_toolcalls_session ON tool_calls(session_id);
+CREATE INDEX IF NOT EXISTS idx_toolcalls_instance ON tool_calls(instance_id);
 CREATE INDEX IF NOT EXISTS idx_toolcalls_name ON tool_calls(name);
 
 CREATE TABLE IF NOT EXISTS skills (
@@ -231,7 +232,7 @@ CREATE TABLE IF NOT EXISTS skill_versions (
 
 CREATE TABLE IF NOT EXISTS skill_loads (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id TEXT,
+  instance_id TEXT,
   skill_name TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT ({NOW})
 );
@@ -251,7 +252,7 @@ CREATE INDEX IF NOT EXISTS idx_prompt_mode ON prompt_versions(mode, version);
 
 CREATE TABLE IF NOT EXISTS compactions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id TEXT,
+  instance_id TEXT,
   removed_messages INTEGER NOT NULL DEFAULT 0,
   before_tokens INTEGER NOT NULL DEFAULT 0,
   after_tokens INTEGER NOT NULL DEFAULT 0,
@@ -263,9 +264,58 @@ CREATE TABLE IF NOT EXISTS compactions (
         Ok(())
     }
 
-    // ---------------------------------------------------------------- sessions
+    /// Rename the legacy `sessions`/`session_id` schema to the unified
+    /// `instances`/`instance_id` schema. SQLite performs these renames in place,
+    /// so recorded history survives the upgrade. A fresh database is untouched.
+    fn migrate_session_to_instance(&self) -> Result<()> {
+        let has_table = |name: &str| -> Result<bool> {
+            Ok(self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+                params![name],
+                |r| r.get::<_, i64>(0),
+            )? != 0)
+        };
+        let has_column = |table: &str, col: &str| -> Result<bool> {
+            let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                if row.get::<_, String>(1)? == col {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
 
-    pub fn session_start(
+        if has_table("sessions")? && !has_table("instances")? {
+            self.conn
+                .execute_batch("ALTER TABLE sessions RENAME TO instances;")?;
+        }
+        for (table, old_col, new_col) in [
+            ("instances", "parent_session", "parent_instance"),
+            ("messages", "session_id", "instance_id"),
+            ("tool_calls", "session_id", "instance_id"),
+            ("requirement_questions", "session_id", "instance_id"),
+            ("skill_loads", "session_id", "instance_id"),
+            ("compactions", "session_id", "instance_id"),
+        ] {
+            if has_table(table)? && has_column(table, old_col)? && !has_column(table, new_col)? {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE {table} RENAME COLUMN {old_col} TO {new_col};"
+                ))?;
+            }
+        }
+        // The renamed indexes (SQLite keeps their names when a column is
+        // renamed) are superseded by the ones `init_schema` creates.
+        self.conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_messages_session;\n\
+             DROP INDEX IF EXISTS idx_toolcalls_session;",
+        )?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------- instances
+
+    pub fn instance_start(
         &self,
         id: &str,
         mode: &str,
@@ -275,25 +325,25 @@ CREATE TABLE IF NOT EXISTS compactions (
         depth: u32,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sessions(id,mode,parent_session,task,model,depth,status) VALUES(?,?,?,?,?,?,'running')",
+            "INSERT INTO instances(id,mode,parent_instance,task,model,depth,status) VALUES(?,?,?,?,?,?,'running')",
             params![id, mode, parent, task, model, depth as i64],
         )?;
         Ok(())
     }
 
-    pub fn session_end(&self, id: &str, status: &str, tokens: i64, report: &str) -> Result<()> {
+    pub fn instance_end(&self, id: &str, status: &str, tokens: i64, report: &str) -> Result<()> {
         self.conn.execute(
             &format!(
-                "UPDATE sessions SET status=?, tokens_used=?, report=?, ended_at={NOW} WHERE id=?"
+                "UPDATE instances SET status=?, tokens_used=?, report=?, ended_at={NOW} WHERE id=?"
             ),
             params![status, tokens, report, id],
         )?;
         Ok(())
     }
 
-    pub fn session_set_tokens(&self, id: &str, tokens: i64) -> Result<()> {
+    pub fn instance_set_tokens(&self, id: &str, tokens: i64) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET tokens_used=? WHERE id=?",
+            "UPDATE instances SET tokens_used=? WHERE id=?",
             params![tokens, id],
         )?;
         Ok(())
@@ -302,7 +352,7 @@ CREATE TABLE IF NOT EXISTS compactions (
     #[allow(clippy::too_many_arguments)]
     pub fn message_add(
         &self,
-        session_id: &str,
+        instance_id: &str,
         seq: i64,
         role: &str,
         content: &str,
@@ -311,8 +361,8 @@ CREATE TABLE IF NOT EXISTS compactions (
         reasoning: Option<&str>,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO messages(session_id,seq,role,content,tool_calls,tool_call_id,reasoning) VALUES(?,?,?,?,?,?,?)",
-            params![session_id, seq, role, content, tool_calls, tool_call_id, reasoning],
+            "INSERT INTO messages(instance_id,seq,role,content,tool_calls,tool_call_id,reasoning) VALUES(?,?,?,?,?,?,?)",
+            params![instance_id, seq, role, content, tool_calls, tool_call_id, reasoning],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -320,7 +370,7 @@ CREATE TABLE IF NOT EXISTS compactions (
     #[allow(clippy::too_many_arguments)]
     pub fn tool_call_add(
         &self,
-        session_id: &str,
+        instance_id: &str,
         message_seq: i64,
         name: &str,
         args: &str,
@@ -329,8 +379,8 @@ CREATE TABLE IF NOT EXISTS compactions (
         duration_ms: i64,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO tool_calls(session_id,message_seq,name,args,result,is_error,duration_ms) VALUES(?,?,?,?,?,?,?)",
-            params![session_id, message_seq, name, args, result, is_error as i64, duration_ms],
+            "INSERT INTO tool_calls(instance_id,message_seq,name,args,result,is_error,duration_ms) VALUES(?,?,?,?,?,?,?)",
+            params![instance_id, message_seq, name, args, result, is_error as i64, duration_ms],
         )?;
         Ok(())
     }
@@ -434,10 +484,10 @@ CREATE TABLE IF NOT EXISTS compactions (
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn question_ask(&self, requirement_id: Option<i64>, session_id: &str, question: &str) -> Result<i64> {
+    pub fn question_ask(&self, requirement_id: Option<i64>, instance_id: &str, question: &str) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO requirement_questions(requirement_id,session_id,question) VALUES(?,?,?)",
-            params![requirement_id, session_id, question],
+            "INSERT INTO requirement_questions(requirement_id,instance_id,question) VALUES(?,?,?)",
+            params![requirement_id, instance_id, question],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -504,10 +554,10 @@ CREATE TABLE IF NOT EXISTS compactions (
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn skill_record_load(&self, session_id: &str, name: &str) -> Result<()> {
+    pub fn skill_record_load(&self, instance_id: &str, name: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO skill_loads(session_id,skill_name) VALUES(?,?)",
-            params![session_id, name],
+            "INSERT INTO skill_loads(instance_id,skill_name) VALUES(?,?)",
+            params![instance_id, name],
         )?;
         self.conn.execute(
             "UPDATE skills SET uses=uses+1 WHERE name=?",
@@ -638,15 +688,15 @@ CREATE TABLE IF NOT EXISTS compactions (
 
     pub fn compaction_add(
         &self,
-        session_id: &str,
+        instance_id: &str,
         removed: i64,
         before: i64,
         after: i64,
         summary: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO compactions(session_id,removed_messages,before_tokens,after_tokens,summary) VALUES(?,?,?,?,?)",
-            params![session_id, removed, before, after, summary],
+            "INSERT INTO compactions(instance_id,removed_messages,before_tokens,after_tokens,summary) VALUES(?,?,?,?,?)",
+            params![instance_id, removed, before, after, summary],
         )?;
         Ok(())
     }

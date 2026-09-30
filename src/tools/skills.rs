@@ -97,10 +97,10 @@ fn save_skill(
 pub fn load(agent: &mut Agent, args: &Value) -> Result<String> {
     let name = req_str(args, "name")?;
     let skill = agent.db.skill_get(&name)?;
-    let session_id = agent.session_id.clone();
+    let instance_id = agent.instance_id.clone();
     match skill {
         Some(s) => {
-            agent.db.skill_record_load(&session_id, &name)?;
+            agent.db.skill_record_load(&instance_id, &name)?;
             Ok(format!(
                 "# Skill: {}\n{}\n\n{}",
                 s.name, s.description, s.content

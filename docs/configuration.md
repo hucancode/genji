@@ -48,7 +48,7 @@ requirements/
   system/*.md
 .genji/
   config.json              # runtime configuration (created on first run)
-  genji.db                 # SQLite: sessions, tickets, requirements, prompts, history
+  genji.db                 # SQLite: instances, tickets, requirements, prompts, history
   skills/
     *.md                   # skills (frontmatter + body)
   control.sock             # Unix socket for mid-run steering (while running)

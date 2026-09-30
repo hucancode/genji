@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
+    /// The single id for this run. It names the registry record, the event trace
+    /// in [`events_dir`], the DB record and every event's `instance` field.
     pub id: String,
     pub pid: u32,
     pub workspace: String,
@@ -66,6 +68,13 @@ pub fn dir() -> PathBuf {
         }
     }
     std::env::temp_dir().join("genji-instances")
+}
+
+/// Directory holding per-instance event traces (`<instance>.jsonl`). These live
+/// alongside the instance records so any run — including a finished subagent
+/// whose events were never relayed — can be inspected from anywhere.
+pub fn events_dir() -> PathBuf {
+    dir().join("events")
 }
 
 pub fn now_secs() -> u64 {

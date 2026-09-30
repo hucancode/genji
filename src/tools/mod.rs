@@ -163,7 +163,7 @@ pub fn all_specs() -> Vec<ToolSpec> {
             "required":["name"]
         })),
         // ---- spawn ----
-        t("spawn", "Spawn a subagent (same executable) in a given mode that only reports back. Returns its report.", json!({
+        t("spawn", "Spawn a subagent in a given mode that only reports back.", json!({
             "type":"object",
             "properties":{
                 "mode":{"type":"string","enum":["plan","build","explore"]},
@@ -173,31 +173,31 @@ pub fn all_specs() -> Vec<ToolSpec> {
             "required":["mode","instructions"]
         })),
         // ---- retro ----
-        t("query_sessions", "List past agent sessions.", json!({
+        t("query_instances", "List past agent instances.", json!({
             "type":"object",
             "properties":{
                 "mode":{"type":"string"},
                 "limit":{"type":"integer","description":"Default 20"}
             }
         })),
-        t("query_session", "Get all messages of one session.", json!({
+        t("query_instance", "Get all messages of one instance.", json!({
             "type":"object",
-            "properties":{"session_id":{"type":"string"},"limit":{"type":"integer"}},
-            "required":["session_id"]
+            "properties":{"instance_id":{"type":"string"},"limit":{"type":"integer"}},
+            "required":["instance_id"]
         })),
-        t("query_messages", "Search recorded messages by text/role/session.", json!({
+        t("query_messages", "Search recorded messages by text/role/instance.", json!({
             "type":"object",
             "properties":{
-                "session_id":{"type":"string"},
+                "instance_id":{"type":"string"},
                 "role":{"type":"string"},
                 "search":{"type":"string"},
                 "limit":{"type":"integer","description":"Default 50"}
             }
         })),
-        t("query_tool_call", "Query recorded tool calls (filter by name/errors/session).", json!({
+        t("query_tool_call", "Query recorded tool calls (filter by name/errors/instance).", json!({
             "type":"object",
             "properties":{
-                "session_id":{"type":"string"},
+                "instance_id":{"type":"string"},
                 "name":{"type":"string"},
                 "errors_only":{"type":"boolean"},
                 "limit":{"type":"integer","description":"Default 50"}
@@ -293,8 +293,8 @@ pub fn dispatch(agent: &mut Agent, name: &str, args: &Value) -> (String, bool) {
         "requirement_ask" => requirements::ask(agent, args),
         "skill_load" => skills::load(agent, args),
         "spawn" => spawn::spawn(agent, args),
-        "query_sessions" => retro::sessions(agent, args),
-        "query_session" => retro::session(agent, args),
+        "query_instances" => retro::instances(agent, args),
+        "query_instance" => retro::instance(agent, args),
         "query_messages" => retro::messages(agent, args),
         "query_tool_call" => retro::tool_calls(agent, args),
         "query_stats" => retro::stats(agent, args),
