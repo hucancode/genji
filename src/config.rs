@@ -220,12 +220,12 @@ pub struct Config {
     pub db_path: String,
     pub requirements_dir: String,
     pub plans_dir: String,
+    pub tickets_dir: String,
     pub skills_dir: String,
+    pub tmp_dir: String,
     pub control_socket: String,
     pub control_enabled: bool,
     pub auto_ingest_requirements: bool,
-    pub interactive: bool,
-    pub verbose: bool,
 }
 
 impl Default for Config {
@@ -279,12 +279,12 @@ impl Default for Config {
             db_path: ".genji/genji.db".into(),
             requirements_dir: ".genji/requirements".into(),
             plans_dir: ".genji/plans".into(),
+            tickets_dir: ".genji/tickets".into(),
             skills_dir: ".genji/skills".into(),
+            tmp_dir: ".genji/tmp".into(),
             control_socket: ".genji/control.sock".into(),
             control_enabled: true,
             auto_ingest_requirements: true,
-            interactive: false,
-            verbose: false,
         }
     }
 }
@@ -335,8 +335,14 @@ impl Config {
     pub fn plans_path(&self, workspace: &Path) -> PathBuf {
         self.workspace_path(workspace, &self.plans_dir)
     }
+    pub fn tickets_path(&self, workspace: &Path) -> PathBuf {
+        self.workspace_path(workspace, &self.tickets_dir)
+    }
     pub fn skills_path(&self, workspace: &Path) -> PathBuf {
         self.workspace_path(workspace, &self.skills_dir)
+    }
+    pub fn tmp_path(&self, workspace: &Path) -> PathBuf {
+        self.workspace_path(workspace, &self.tmp_dir)
     }
     pub fn control_path(&self, workspace: &Path) -> PathBuf {
         self.workspace_path(workspace, &self.control_socket)

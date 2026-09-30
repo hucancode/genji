@@ -5,6 +5,7 @@ use std::path::Path;
 
 use super::{opt_i64, opt_str, req_str};
 use crate::agent::Agent;
+use crate::config::Config;
 use crate::reqmd::{self, Requirement};
 
 fn fmt_req(r: &Requirement, workspace: &Path, full: bool) -> String {
@@ -54,30 +55,48 @@ pub fn create(agent: &mut Agent, args: &Value) -> Result<String> {
     ))
 }
 
-pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
-    if let Some(id) = opt_i64(args, "id") {
-        return match reqmd::load_by_id(&agent.cfg, &agent.workspace, id)? {
-            Some(r) => Ok(fmt_req(&r, &agent.workspace, true)),
+/// Render a `requirement_read`: an exact requirement when `id` is set,
+/// otherwise the requirements filtered by `level` and/or `status`.
+fn read_requirements(
+    cfg: &Config,
+    workspace: &Path,
+    id: Option<i64>,
+    level: Option<&str>,
+    status: Option<&str>,
+) -> Result<String> {
+    if let Some(id) = id {
+        return match reqmd::load_by_id(cfg, workspace, id)? {
+            Some(r) => Ok(fmt_req(&r, workspace, true)),
             None => bail!("requirement #{id} not found"),
         };
     }
-    let level = opt_str(args, "level");
-    let status = opt_str(args, "status");
-    let reqs: Vec<Requirement> = reqmd::load_all(&agent.cfg, &agent.workspace)?
+    let reqs: Vec<Requirement> = reqmd::load_all(cfg, workspace)?
         .into_iter()
-        .filter(|r| level.as_deref().is_none_or(|l| r.level == l))
-        .filter(|r| status.as_deref().is_none_or(|s| r.status == s))
+        .filter(|r| level.is_none_or(|l| r.level == l))
+        .filter(|r| status.is_none_or(|s| r.status == s))
         .collect();
     if reqs.is_empty() {
         return Ok("(no requirements)".into());
     }
+    // A single hit is shown in full; a list is truncated per requirement so it
+    // stays scannable.
     let full = reqs.len() == 1;
     let mut out = String::new();
     for r in &reqs {
-        out.push_str(&fmt_req(r, &agent.workspace, full));
+        out.push_str(&fmt_req(r, workspace, full));
         out.push_str("---\n");
     }
     Ok(out)
+}
+
+pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
+    read_requirements(
+        &agent.cfg,
+        &agent.workspace,
+        opt_i64(args, "id"),
+        opt_str(args, "level").as_deref(),
+        opt_str(args, "status").as_deref(),
+    )
 }
 
 pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
@@ -132,8 +151,8 @@ pub fn tree(agent: &mut Agent, args: &Value) -> Result<String> {
         return Ok("(no requirements)".into());
     }
 
-    // Ticket coverage per requirement id.
-    let tickets = agent.db.ticket_list(None, None)?;
+    // Ticket coverage per requirement id, across open files and archived rows.
+    let tickets = super::tickets::list_all(agent)?;
     let mut open: BTreeMap<i64, i64> = BTreeMap::new();
     let mut done: BTreeMap<i64, i64> = BTreeMap::new();
     for t in &tickets {
@@ -220,18 +239,82 @@ pub fn ask(agent: &mut Agent, args: &Value) -> Result<String> {
         .db
         .question_ask(requirement_id, &agent.instance_id.clone(), &question)?;
 
-    if agent.interactive {
-        eprintln!("\n[requirement_ask] {question}\n> answer (blank to skip):");
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_ok() {
-            let answer = line.trim().to_string();
-            if !answer.is_empty() {
-                agent.db.question_answer(qid, &answer)?;
-                return Ok(format!("answer: {answer}"));
-            }
-        }
-    }
     Ok(format!(
         "recorded question #{qid}: {question}\n(no interactive user available; relay this question to the user)"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_requirements;
+    use crate::config::Config;
+    use crate::reqmd;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_workspace(tag: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("genji-reqtools-{tag}-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn reads_one_by_id_and_lists_with_filters() {
+        let ws = temp_workspace("read");
+        let cfg = Config::default();
+        let parent = reqmd::create(
+            &cfg,
+            &ws,
+            "stakeholder",
+            "Cat Classifier",
+            "Must classify cats.",
+            None,
+            "agent",
+        )
+        .unwrap();
+        let child = reqmd::create(
+            &cfg,
+            &ws,
+            "system",
+            "Accept URLs",
+            "Accept image URLs.",
+            Some(parent.id),
+            "agent",
+        )
+        .unwrap();
+        reqmd::update(&cfg, &ws, child.id, None, None, Some("met"), None, None).unwrap();
+
+        // By id: the full requirement body, with no filtering applied.
+        let one = read_requirements(&cfg, &ws, Some(parent.id), None, None).unwrap();
+        assert!(one.contains("#1 [stakeholder:active] Cat Classifier"), "{one}");
+        assert!(one.contains("Must classify cats."), "{one}");
+
+        // No id: list everything.
+        let all = read_requirements(&cfg, &ws, None, None, None).unwrap();
+        assert!(all.contains("#1 [stakeholder:active] Cat Classifier"), "{all}");
+        assert!(all.contains("#2 [system:met] Accept URLs"), "{all}");
+
+        // Filter by level.
+        let sys = read_requirements(&cfg, &ws, None, Some("system"), None).unwrap();
+        assert!(sys.contains("#2 "), "{sys}");
+        assert!(!sys.contains("#1 "), "{sys}");
+
+        // Filter by status.
+        let met = read_requirements(&cfg, &ws, None, None, Some("met")).unwrap();
+        assert!(met.contains("#2 "), "{met}");
+        assert!(!met.contains("#1 "), "{met}");
+
+        // A filter with no matches is an empty list, not an error.
+        let none = read_requirements(&cfg, &ws, None, None, Some("removed")).unwrap();
+        assert_eq!(none, "(no requirements)");
+
+        // A missing id is an error, not an empty list.
+        assert!(read_requirements(&cfg, &ws, Some(999), None, None).is_err());
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 }

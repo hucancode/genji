@@ -46,7 +46,7 @@ The **OCD** column applies to `plan`/`build` only when the `--ocd` flag (or the
 | `spawn` | ✓ | ✓ | ✓ |  |
 | `ticket_create` (OCD) | ✓ |  |  |  |
 | `ticket_read` `ticket_claim` `ticket_update` (OCD) | ✓ | ✓ |  |  |
-| `ticket_resolve` `ticket_close` `ticket_reopen` (OCD) | ✓ | ✓ |  |  |
+| `ticket_close` (OCD) | ✓ | ✓ |  |  |
 | `requirement_create` `requirement_update` `requirement_remove` (OCD) | ✓ |  |  |  |
 | `requirement_read` `requirement_tree` `requirement_ask` (OCD) | ✓ | ✓ |  |  |
 | `query_*`, `*_skill`, `prompt_*` |  |  |  | ✓ |
@@ -96,7 +96,7 @@ When OCD is on:
 
 - `plan` and `build` gain the full requirements/tickets surface
   (`requirement_*`, `ticket_*`, plus `ticket_claim`, `ticket_update`,
-  `ticket_reopen`, and `requirement_tree`).
+  and `requirement_tree`).
 - The run **auto-cycles** between `plan` and `build`, starting from the chosen
   mode (default `build`), until there are no `active` requirements or
   `max_cycles` is reached.

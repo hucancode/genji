@@ -1,9 +1,14 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::Agent;
+use crate::config::Config;
 use crate::modes::Mode;
+use std::path::Path;
 
 pub mod basic;
 pub mod plans;
@@ -193,7 +198,7 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["title"]
             }), tickets::create),
-            ocd_tool("ticket_read", PLAN_BUILD, "Read one ticket by id, or list tickets.", json!({
+            ocd_tool("ticket_read", PLAN_BUILD, "Read one ticket by id, or list actionable tickets.", json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"integer"},
@@ -222,21 +227,11 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["id"]
             }), tickets::update),
-            ocd_tool("ticket_resolve", PLAN_BUILD, "Mark a ticket resolved after the work is done and verified.", json!({
-                "type":"object",
-                "properties":{"id":{"type":"integer"},"resolution":{"type":"string"}},
-                "required":["id"]
-            }), tickets::resolve),
-            ocd_tool("ticket_close", PLAN_BUILD, "Close a ticket as obsolete/duplicate/won't-fix.", json!({
+            ocd_tool("ticket_close", PLAN_BUILD, "Close a ticket when its work is done and verified, or it is obsolete/duplicate/won't-fix.", json!({
                 "type":"object",
                 "properties":{"id":{"type":"integer"},"reason":{"type":"string"}},
                 "required":["id"]
             }), tickets::close),
-            ocd_tool("ticket_reopen", PLAN_BUILD, "Reopen a resolved/closed ticket as open, clearing its resolution.", json!({
-                "type":"object",
-                "properties":{"id":{"type":"integer"}},
-                "required":["id"]
-            }), tickets::reopen),
             // ---- requirements (OCD only) ----
             ocd_tool("requirement_create", PLAN, "Create a stakeholder or system requirement.", json!({
                 "type":"object",
@@ -248,7 +243,7 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["level","title","body"]
             }), requirements::create),
-            ocd_tool("requirement_read", PLAN_BUILD, "Read a requirement by id, or list requirements.", json!({
+            ocd_tool("requirement_read", PLAN_BUILD, "Read a requirement by id, or list/filter requirements by level and status when id is omitted.", json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"integer"},
@@ -407,23 +402,72 @@ pub fn specs_for(mode: Mode, ocd: bool, has_skills: bool) -> Vec<ToolSpec> {
         .collect()
 }
 
-/// Execute a tool. Returns (result_text, is_error). Result is truncated here so
-/// every caller gets bounded content.
+/// Execute a tool. Returns (result_text, is_error). Result is bounded here so
+/// every caller gets content that fits the context window; oversized results are
+/// spilled to `.genji/tmp/*.log` and the returned text points at the file.
 pub fn dispatch(agent: &mut Agent, name: &str, args: &Value) -> (String, bool) {
     let res: Result<String> = match registry().iter().find(|t| t.name == name) {
         Some(t) => (t.handler)(agent, args),
         None => Err(anyhow!("unknown or unavailable tool `{name}`")),
     };
     match res {
-        Ok(s) => (
-            crate::llm::truncate(s, agent.cfg.tool_result_max_bytes),
-            false,
-        ),
+        Ok(s) => (bounded_result(&agent.cfg, &agent.workspace, name, s), false),
         Err(e) => (
-            crate::llm::truncate(format!("ERROR: {e:#}"), agent.cfg.tool_result_max_bytes),
+            bounded_result(&agent.cfg, &agent.workspace, name, format!("ERROR: {e:#}")),
             true,
         ),
     }
+}
+
+/// Bound a tool result to `tool_result_max_bytes`. When the result is larger it
+/// is written verbatim to a log file under `tmp_dir` and the inline text is
+/// truncated with a pointer to that file, so the model can page through the
+/// full output instead of losing it.
+fn bounded_result(cfg: &Config, workspace: &Path, name: &str, text: String) -> String {
+    let max = cfg.tool_result_max_bytes;
+    let total = text.len();
+    if total <= max {
+        return text;
+    }
+    match spill_to_log(cfg, workspace, name, &text) {
+        Ok(path) => {
+            let shown = path
+                .strip_prefix(workspace)
+                .unwrap_or(&path)
+                .to_string_lossy();
+            format!(
+                "{}\n[full result ({total} bytes) written to {shown}; read it with the read tool]",
+                crate::llm::truncate(text, max),
+            )
+        }
+        Err(_) => crate::llm::truncate(text, max),
+    }
+}
+
+static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Write a full tool result to `tmp_dir/tool-<name>-<ts>-<seq>.log`.
+fn spill_to_log(cfg: &Config, workspace: &Path, name: &str, text: &str) -> Result<PathBuf> {
+    let dir = cfg.tmp_path(workspace);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = dir.join(format!("tool-{safe}-{ts}-{seq}.log"));
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
 }
 
 // ------------------------------------------------------------------ arg helpers
@@ -451,8 +495,53 @@ pub fn opt_bool(args: &Value, key: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::specs_for;
+    use super::{bounded_result, specs_for};
+    use crate::config::Config;
     use crate::modes::Mode;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_workspace(tag: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("genji-tools-{tag}-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn small_results_are_returned_verbatim() {
+        let ws = temp_workspace("small");
+        let cfg = Config::default();
+        assert_eq!(bounded_result(&cfg, &ws, "bash", "ok".into()), "ok");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn large_results_spill_to_tmp_log() {
+        let ws = temp_workspace("spill");
+        let cfg = Config {
+            tool_result_max_bytes: 16,
+            ..Default::default()
+        };
+        let full = "x".repeat(200);
+        let out = bounded_result(&cfg, &ws, "bash", full.clone());
+        assert!(out.contains("written to .genji/tmp/tool-bash-"), "{out}");
+        assert!(out.contains("read it with the read tool"), "{out}");
+
+        let name = out
+            .split("written to ")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let logged = std::fs::read_to_string(ws.join(name)).unwrap();
+        assert_eq!(logged, full);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 
     fn names(mode: Mode, ocd: bool) -> Vec<String> {
         specs_for(mode, ocd, true)
@@ -507,7 +596,6 @@ mod tests {
         let build = names(Mode::Build, true);
         assert!(build.iter().any(|n| n == "ticket_claim"));
         assert!(build.iter().any(|n| n == "ticket_update"));
-        assert!(build.iter().any(|n| n == "ticket_reopen"));
         // Build still cannot create requirements.
         assert!(!build.iter().any(|n| n == "requirement_create"));
     }

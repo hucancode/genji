@@ -1,16 +1,17 @@
 //! File-backed requirement store.
 //!
-//! Requirements are markdown files under `.genji/requirements/`:
+//! Requirements are markdown files directly under `.genji/requirements/`:
 //!
 //! ```text
 //! .genji/requirements/
-//!   stakeholder/1-cat-image-classifier.md
-//!   system/2-accept-image-files-and-urls.md
+//!   1-cat-image-classifier.md
+//!   2-accept-image-files-and-urls.md
 //! ```
 //!
 //! Metadata lives in simple `key: value` frontmatter (`id`, `level`, `status`,
 //! `parent`, `source`, `created`, `updated`); the text after the first
-//! `# Heading` is the requirement body
+//! `# Heading` is the requirement body. The level (`stakeholder` or `system`)
+//! is read from the frontmatter and defaults to `stakeholder` when absent.
 
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
@@ -59,14 +60,6 @@ fn valid_level(v: &str) -> Option<String> {
         Some(v)
     } else {
         None
-    }
-}
-
-fn infer_level(rel_path: &str) -> String {
-    if rel_path.to_ascii_lowercase().contains("system") {
-        "system".into()
-    } else {
-        "stakeholder".into()
     }
 }
 
@@ -159,10 +152,9 @@ fn rel_to(workspace: &Path, path: &Path) -> String {
         .to_string()
 }
 
-/// Where a requirement's file lives: `<root>/<level>/<id>-<slug>.md`.
+/// Where a requirement's file lives: `<root>/<id>-<slug>.md`.
 fn path_for(cfg: &Config, workspace: &Path, r: &Requirement) -> PathBuf {
     cfg.requirements_path(workspace)
-        .join(&r.level)
         .join(format!("{}-{}.md", r.id, slugify(&r.title, "requirement")))
 }
 
@@ -179,7 +171,6 @@ pub fn load_all(cfg: &Config, workspace: &Path) -> Result<Vec<Requirement>> {
         heading: Option<String>,
         body: String,
         path: PathBuf,
-        rel: String,
     }
 
     let mut raws = Vec::new();
@@ -195,13 +186,11 @@ pub fn load_all(cfg: &Config, workspace: &Path) -> Result<Vec<Requirement>> {
         if let Some(id) = meta.get("id").and_then(|v| v.parse::<i64>().ok()) {
             max_id = max_id.max(id);
         }
-        let rel = rel_to(workspace, &path);
         raws.push(Raw {
             meta,
             heading,
             body,
             path,
-            rel,
         });
     }
 
@@ -226,7 +215,7 @@ pub fn load_all(cfg: &Config, workspace: &Path) -> Result<Vec<Requirement>> {
             .meta
             .get("level")
             .and_then(|v| valid_level(v))
-            .unwrap_or_else(|| infer_level(&raw.rel));
+            .unwrap_or_else(|| "stakeholder".into());
         let title = raw
             .meta
             .get("title")
@@ -444,17 +433,29 @@ pub fn sync(db: &Db, cfg: &Config, workspace: &Path) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_count, create, infer_level, load_all, load_by_id, remove, split_frontmatter,
-        split_heading, update,
+        active_count, create, load_all, load_by_id, remove, split_frontmatter, split_heading,
+        update,
     };
     use crate::config::Config;
     use crate::util::slugify;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn level_from_directory() {
-        assert_eq!(infer_level("requirements/system/a.md"), "system");
-        assert_eq!(infer_level("requirements/stakeholder/a.md"), "stakeholder");
+    fn level_from_frontmatter() {
+        let ws = temp_workspace("level");
+        let cfg = Config::default();
+        let dir = cfg.requirements_path(&ws);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "---\nlevel: system\n---\n# A\n").unwrap();
+        std::fs::write(dir.join("b.md"), "# B\n").unwrap();
+
+        let all = load_all(&cfg, &ws).unwrap();
+        let a = all.iter().find(|r| r.title == "A").unwrap();
+        let b = all.iter().find(|r| r.title == "B").unwrap();
+        assert_eq!(a.level, "system");
+        assert_eq!(b.level, "stakeholder");
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
@@ -546,13 +547,12 @@ mod tests {
             .ends_with("2-accept-files-and-urls.md"));
         assert_eq!(active_count(&cfg, &ws).unwrap(), 1);
 
-        // Changing level moves the file into the other directory.
         update(&cfg, &ws, 2, None, None, None, Some("stakeholder"), None).unwrap();
         let r2c = load_by_id(&cfg, &ws, 2).unwrap().unwrap();
         assert_eq!(r2c.level, "stakeholder");
         assert!(r2c
             .display_path(&ws)
-            .starts_with(".genji/requirements/stakeholder/"));
+            .ends_with(".genji/requirements/2-accept-files-and-urls.md"));
 
         assert!(remove(&cfg, &ws, 2, false).unwrap());
         assert_eq!(active_count(&cfg, &ws).unwrap(), 1);
@@ -567,14 +567,14 @@ mod tests {
     fn assigns_missing_id() {
         let ws = temp_workspace("missing-id");
         let cfg = Config::default();
-        let dir = cfg.requirements_path(&ws).join("system");
+        let dir = cfg.requirements_path(&ws);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("hand-written.md"), "# Hand Written\nBody.\n").unwrap();
 
         let all = load_all(&cfg, &ws).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, 1);
-        assert_eq!(all[0].level, "system");
+        assert_eq!(all[0].level, "stakeholder");
         // The id is persisted back into the file.
         let text = std::fs::read_to_string(dir.join("hand-written.md")).unwrap();
         assert!(

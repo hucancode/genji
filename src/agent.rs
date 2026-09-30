@@ -36,7 +36,6 @@ pub struct Agent {
     pub deadline: Instant,
     pub depth: u32,
     pub seq: i64,
-    pub interactive: bool,
     /// OCD flag: enables the requirements/tickets tools and the auto plan/build
     /// cycle. Off means a plain coding agent with no ticket system.
     pub ocd: bool,
@@ -61,7 +60,6 @@ pub struct AgentParams {
     pub mode: Mode,
     pub depth: u32,
     pub task: String,
-    pub interactive: bool,
     pub ocd: bool,
     pub control: Option<Arc<Control>>,
     /// The shared, live context. Built before the control socket so `/context`
@@ -99,7 +97,6 @@ impl Agent {
             mode,
             depth,
             task,
-            interactive,
             ocd,
             control,
             context,
@@ -148,7 +145,6 @@ impl Agent {
             deadline,
             depth,
             seq: 0,
-            interactive,
             ocd,
             active_plan: None,
             control,
@@ -429,7 +425,7 @@ impl Agent {
                 )?;
                 self.events
                     .tool_result(&tc.id, &tc.name, is_error, dur, &result);
-                if self.cfg.verbose || is_error {
+                if is_error {
                     eprintln!(
                         "[tool] {}({}) -> {} ({}ms)",
                         tc.name,

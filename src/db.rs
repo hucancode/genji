@@ -24,6 +24,7 @@ pub struct Ticket {
 
 /// A partial edit to a ticket. `None` leaves a field untouched; for the two
 /// nullable links `Some(None)` clears the value.
+#[derive(Default)]
 pub struct TicketEdit {
     pub title: Option<String>,
     pub description: Option<String>,
@@ -390,22 +391,11 @@ CREATE TABLE IF NOT EXISTS compactions (
     }
 
     // ---------------------------------------------------------------- tickets
-
-    pub fn ticket_create(
-        &self,
-        title: &str,
-        description: &str,
-        priority: i64,
-        parent_id: Option<i64>,
-        requirement_id: Option<i64>,
-        mode: &str,
-    ) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO tickets(title,description,priority,parent_id,requirement_id,mode,status) VALUES(?,?,?,?,?,?,'open')",
-            params![title, description, priority, parent_id, requirement_id, mode],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
+    //
+    // Actionable tickets (open/in_progress) live as markdown files under
+    // `.genji/tickets/` (see `ticketmd`). This table is the archive for
+    // resolved/closed tickets; `tools::tickets` moves rows between the two
+    // stores.
 
     pub fn ticket_get(&self, id: i64) -> Result<Option<Ticket>> {
         let sql = format!("SELECT {TICKET_COLS} FROM tickets WHERE id=?");
@@ -491,16 +481,64 @@ CREATE TABLE IF NOT EXISTS compactions (
         Ok(n > 0)
     }
 
-    /// Reopen a resolved/closed ticket, clearing its resolution.
-    pub fn ticket_reopen(&self, id: i64) -> Result<bool> {
-        let n = self.conn.execute(
-            &format!(
-                "UPDATE tickets SET status='open', resolution=NULL, resolved_at=NULL, \
-                 closed_at=NULL, updated_at={NOW} WHERE id=?"
-            ),
-            params![id],
-        )?;
+    /// Highest ticket id currently recorded in the database, or 0 when empty.
+    /// Combined with the file store this allocates the next stable id.
+    pub fn ticket_max_id(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id),0) FROM tickets", [], |r| r.get(0))?)
+    }
+
+    /// Remove a ticket row. Used when a resolved/closed ticket is reopened and
+    /// moves back to the file store.
+    pub fn ticket_delete(&self, id: i64) -> Result<bool> {
+        let n = self.conn.execute("DELETE FROM tickets WHERE id=?", params![id])?;
         Ok(n > 0)
+    }
+
+    /// Move a file-backed ticket into the database with an explicit id,
+    /// preserving the fields the file carried. `created_at` is kept when the
+    /// file supplied one; `resolved_at`/`closed_at` are stamped for the
+    /// matching terminal status.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ticket_insert(
+        &self,
+        id: i64,
+        title: &str,
+        description: &str,
+        status: &str,
+        priority: i64,
+        parent_id: Option<i64>,
+        requirement_id: Option<i64>,
+        mode: Option<&str>,
+        resolution: Option<&str>,
+        created_at: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO tickets\
+                 (id,title,description,status,priority,parent_id,requirement_id,mode,resolution,\
+                  created_at,updated_at,resolved_at,closed_at)\
+                 VALUES(?,?,?,?,?,?,?,?,?,COALESCE(?,{NOW}),{NOW},\
+                  CASE WHEN ?='resolved' THEN {NOW} END,\
+                  CASE WHEN ?='closed' THEN {NOW} END)"
+            ),
+            params![
+                id,
+                title,
+                description,
+                status,
+                priority,
+                parent_id,
+                requirement_id,
+                mode,
+                resolution,
+                created_at,
+                status,
+                status
+            ],
+        )?;
+        Ok(())
     }
 
     // ------------------------------------------------------------ requirements
@@ -555,14 +593,6 @@ CREATE TABLE IF NOT EXISTS compactions (
             params![requirement_id, instance_id, question],
         )?;
         Ok(self.conn.last_insert_rowid())
-    }
-
-    pub fn question_answer(&self, id: i64, answer: &str) -> Result<()> {
-        self.conn.execute(
-            &format!("UPDATE requirement_questions SET answer=?,status='answered',answered_at={NOW} WHERE id=?"),
-            params![answer, id],
-        )?;
-        Ok(())
     }
 
     // ---------------------------------------------------------------- skills
@@ -796,11 +826,23 @@ mod tests {
     }
 
     #[test]
-    fn ticket_update_and_reopen() {
+    fn ticket_insert_update_archive() {
         let (db, dir) = temp_db("tickets");
-        let id = db
-            .ticket_create("First", "desc", 2, None, Some(3), "plan")
-            .unwrap();
+        db.ticket_insert(
+            1,
+            "First",
+            "desc",
+            "open",
+            2,
+            None,
+            Some(3),
+            Some("plan"),
+            None,
+            None,
+        )
+        .unwrap();
+        let id = 1;
+        assert_eq!(db.ticket_max_id().unwrap(), 1);
 
         let edit = TicketEdit {
             title: Some("Renamed".into()),
@@ -820,14 +862,12 @@ mod tests {
         db.ticket_set_status(id, "resolved", Some("done")).unwrap();
         assert_eq!(db.ticket_get(id).unwrap().unwrap().status, "resolved");
 
-        assert!(db.ticket_reopen(id).unwrap());
-        let t = db.ticket_get(id).unwrap().unwrap();
-        assert_eq!(t.status, "open");
-        assert_eq!(t.resolution, None);
-        assert!(t.resolved_at.is_none());
+        assert!(db.ticket_delete(id).unwrap());
+        assert!(db.ticket_get(id).unwrap().is_none());
+        assert_eq!(db.ticket_max_id().unwrap(), 0);
 
         assert!(!db.ticket_update(9999, &edit).unwrap());
-        assert!(!db.ticket_reopen(9999).unwrap());
+        assert!(!db.ticket_delete(9999).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -10,6 +10,7 @@ mod proc;
 mod prompts;
 mod registry;
 mod reqmd;
+mod ticketmd;
 mod tools;
 mod util;
 
@@ -52,10 +53,6 @@ struct Cli {
     /// cycle. Without it genji is a plain coding agent.
     #[arg(long, global = true)]
     ocd: bool,
-    #[arg(long, global = true)]
-    verbose: bool,
-    #[arg(long, global = true)]
-    interactive: bool,
     #[arg(long, global = true)]
     workspace: Option<String>,
     #[arg(long, global = true)]
@@ -117,7 +114,7 @@ enum Command {
         /// Instance id (see `genji list`).
         id: String,
     },
-    /// Delete the workspace database and start over with a clean one.
+    /// Wipe the workspace database, plans, requirements, and open tickets, then start over.
     Reset {
         /// Skip the confirmation prompt.
         #[arg(long, short = 'y')]
@@ -127,9 +124,9 @@ enum Command {
 
 fn ensure_layout(cfg: &Config, workspace: &std::path::Path) -> Result<()> {
     for d in [
-        cfg.requirements_path(workspace).join("stakeholder"),
-        cfg.requirements_path(workspace).join("system"),
+        cfg.requirements_path(workspace),
         cfg.plans_path(workspace),
+        cfg.tickets_path(workspace),
         cfg.skills_path(workspace),
     ] {
         std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
@@ -228,7 +225,6 @@ struct RunRequest {
     instance_id: String,
     mode: Mode,
     task: String,
-    interactive: bool,
     ocd: bool,
     quiet: bool,
     control: Option<Arc<control::Control>>,
@@ -243,7 +239,6 @@ fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<Str
         instance_id,
         mode,
         task,
-        interactive,
         ocd,
         quiet,
         control,
@@ -268,7 +263,6 @@ fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<Str
         mode,
         depth,
         task: task.clone(),
-        interactive,
         ocd,
         control,
         context,
@@ -288,7 +282,6 @@ fn run_cycle(req: RunRequest) -> Result<String> {
         instance_id,
         mode: start_mode,
         task,
-        interactive,
         ocd,
         quiet,
         control,
@@ -312,7 +305,6 @@ fn run_cycle(req: RunRequest) -> Result<String> {
         mode: start_mode,
         depth: 0,
         task: task.clone(),
-        interactive,
         ocd,
         control,
         context,
@@ -562,13 +554,36 @@ fn db_files(db_path: &Path) -> [PathBuf; 3] {
     ]
 }
 
-/// `genji reset` — delete the workspace database and recreate an empty one.
+/// Recursively collect every entry under `dir` that is not a directory. A
+/// missing directory yields nothing, so callers do not have to check first.
+/// Symlinks to directories are collected, not followed, so a loop cannot hang
+/// the walk.
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => collect_files(&path, out),
+            _ => out.push(path),
+        }
+    }
+}
+
+/// `genji reset` — wipe the workspace database, plans, requirements, and open
+/// tickets, then recreate an empty database.
 ///
-/// Only the SQLite database (and its WAL/SHM sidecars) is removed; the config,
-/// skills and requirements markdown files under `.genji/` are left untouched.
+/// The whole `.genji/plans`, `.genji/requirements`, and `.genji/tickets` trees
+/// are removed along with the SQLite database (and its WAL/SHM sidecars); the
+/// config and skills are left untouched. The user is told how many files will
+/// be destroyed before anything is deleted.
 fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
     let cfg = Config::load_or_create(workspace)?;
     let db_path = cfg.db_file(workspace);
+    let requirements_dir = cfg.requirements_path(workspace);
+    let plans_dir = cfg.plans_path(workspace);
+    let tickets_dir = cfg.tickets_path(workspace);
 
     // Deleting the database out from under a live instance would split its
     // writes across the old (unlinked) and new files. Refuse instead.
@@ -585,25 +600,45 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
         }
     }
 
-    let existing: Vec<PathBuf> = db_files(&db_path)
+    // Everything reset will destroy: the database (plus WAL/SHM) and every
+    // file under the plans and requirements trees.
+    let db_existing: Vec<PathBuf> = db_files(&db_path)
         .into_iter()
         .filter(|p| p.exists())
         .collect();
+    let mut requirement_files = Vec::new();
+    collect_files(&requirements_dir, &mut requirement_files);
+    let mut plan_files = Vec::new();
+    collect_files(&plans_dir, &mut plan_files);
+    let mut ticket_files = Vec::new();
+    collect_files(&tickets_dir, &mut ticket_files);
+    let total = db_existing.len()
+        + requirement_files.len()
+        + plan_files.len()
+        + ticket_files.len();
 
-    if existing.is_empty() {
+    if total == 0 {
         eprintln!(
-            "[reset] no database at {}; nothing to delete",
-            db_path.display()
+            "[reset] nothing to delete; database, plans, requirements and tickets are already empty"
         );
     } else {
+        eprintln!(
+            "[reset] this will delete {total} file(s): {} database file(s), {} plan(s) in {}, {} requirement(s) in {}, {} open ticket(s) in {}",
+            db_existing.len(),
+            plan_files.len(),
+            plans_dir.display(),
+            requirement_files.len(),
+            requirements_dir.display(),
+            ticket_files.len(),
+            tickets_dir.display(),
+        );
         if !assume_yes {
             if !std::io::stdin().is_terminal() {
                 bail!(
-                    "refusing to delete {} without confirmation; re-run with --yes",
-                    db_path.display()
+                    "refusing to delete {total} file(s) without confirmation; re-run with --yes"
                 );
             }
-            eprint!("Delete {} and start over? [y/N] ", db_path.display());
+            eprint!("Delete {total} file(s) and start over? [y/N] ");
             use std::io::Write;
             std::io::stderr().flush().ok();
             let mut answer = String::new();
@@ -613,13 +648,29 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
                 return Ok(());
             }
         }
-        for p in &existing {
+        for p in &db_existing {
             std::fs::remove_file(p).with_context(|| format!("deleting {}", p.display()))?;
         }
-        eprintln!("[reset] deleted {}", db_path.display());
+        if requirements_dir.exists() {
+            std::fs::remove_dir_all(&requirements_dir)
+                .with_context(|| format!("deleting {}", requirements_dir.display()))?;
+        }
+        if plans_dir.exists() {
+            std::fs::remove_dir_all(&plans_dir)
+                .with_context(|| format!("deleting {}", plans_dir.display()))?;
+        }
+        if tickets_dir.exists() {
+            std::fs::remove_dir_all(&tickets_dir)
+                .with_context(|| format!("deleting {}", tickets_dir.display()))?;
+        }
+        eprintln!("[reset] deleted {total} file(s)");
     }
 
-    // Recreate the schema so the next run starts from a clean, ready database.
+    // Recreate the layout and a clean, ready database so the next run starts
+    // from an empty workspace.
+    for d in [&requirements_dir, &plans_dir, &tickets_dir] {
+        std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
+    }
     let db = Db::open(&db_path)?;
     db.init_schema()?;
     prompts::seed_prompts(&db)?;
@@ -628,15 +679,19 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
         db_path.display()
     );
 
+    let deleted: Vec<String> = db_existing
+        .iter()
+        .chain(requirement_files.iter())
+        .chain(plan_files.iter())
+        .chain(ticket_files.iter())
+        .map(|p| p.display().to_string())
+        .collect();
     println!(
         "{}",
         serde_json::to_string(&json!({
             "workspace": workspace.display().to_string(),
             "db": db_path.display().to_string(),
-            "deleted": existing
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>(),
+            "deleted": deleted,
         }))?
     );
     Ok(())
@@ -912,9 +967,6 @@ fn main() -> Result<()> {
         None => std::env::current_dir().context("resolving current directory")?,
     };
     let mut cfg = Config::load_or_create(&workspace)?;
-    if cli.verbose {
-        cfg.verbose = true;
-    }
     // Provider precedence: --provider > GENJI_PROVIDER > config.provider.
     if let Some(p) = &cli.provider {
         cfg.provider = p.clone();
@@ -938,14 +990,12 @@ fn main() -> Result<()> {
             );
         }
     }
+    ticketmd::sync(&db, &cfg, &workspace)?;
     prompts::seed_prompts(&db)?;
     if synced > 0 && !cli.quiet_startup {
         eprintln!("[skills] synced {synced} skill file(s)");
     }
 
-    let interactive = cli.interactive
-        || cfg.interactive
-        || (!cli.subagent && std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
     // With no mode subcommand we default to build mode. The requirements/tickets
     // system (and the automatic plan/build cycle) is opt-in via `--ocd`.
     let (start_mode, task_arg): (Mode, Option<&str>) = match &cli.command {
@@ -1059,7 +1109,6 @@ fn main() -> Result<()> {
         instance_id,
         mode: start_mode,
         task,
-        interactive,
         ocd,
         quiet,
         control: control.clone(),
