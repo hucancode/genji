@@ -22,6 +22,16 @@ pub struct Ticket {
     pub closed_at: Option<String>,
 }
 
+/// A partial edit to a ticket. `None` leaves a field untouched; for the two
+/// nullable links `Some(None)` clears the value.
+pub struct TicketEdit {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub priority: Option<i64>,
+    pub parent_id: Option<Option<i64>>,
+    pub requirement_id: Option<Option<i64>>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Requirement {
@@ -443,6 +453,56 @@ CREATE TABLE IF NOT EXISTS compactions (
         Ok(n > 0)
     }
 
+    /// Apply a partial field edit. Returns false when the ticket does not
+    /// exist. Status/resolution transitions go through [`Self::ticket_set_status`].
+    pub fn ticket_update(&self, id: i64, e: &TicketEdit) -> Result<bool> {
+        let mut sets: Vec<&str> = Vec::new();
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(v) = &e.title {
+            sets.push("title=?");
+            args.push(Box::new(v.clone()));
+        }
+        if let Some(v) = &e.description {
+            sets.push("description=?");
+            args.push(Box::new(v.clone()));
+        }
+        if let Some(v) = e.priority {
+            sets.push("priority=?");
+            args.push(Box::new(v));
+        }
+        if let Some(v) = e.parent_id {
+            sets.push("parent_id=?");
+            args.push(Box::new(v));
+        }
+        if let Some(v) = e.requirement_id {
+            sets.push("requirement_id=?");
+            args.push(Box::new(v));
+        }
+        if sets.is_empty() {
+            return Ok(self.ticket_get(id)?.is_some());
+        }
+        let sql = format!(
+            "UPDATE tickets SET {}, updated_at={NOW} WHERE id=?",
+            sets.join(", ")
+        );
+        args.push(Box::new(id));
+        let refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let n = self.conn.execute(&sql, refs.as_slice())?;
+        Ok(n > 0)
+    }
+
+    /// Reopen a resolved/closed ticket, clearing its resolution.
+    pub fn ticket_reopen(&self, id: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            &format!(
+                "UPDATE tickets SET status='open', resolution=NULL, resolved_at=NULL, \
+                 closed_at=NULL, updated_at={NOW} WHERE id=?"
+            ),
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
     // ------------------------------------------------------------ requirements
     //
     // Requirements are persisted as markdown files under
@@ -714,5 +774,60 @@ CREATE TABLE IF NOT EXISTS compactions (
             params![instance_id, removed, before, after, summary],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Db, TicketEdit};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_db(tag: &str) -> (Db, std::path::PathBuf) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("genji-db-{tag}-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("test.db")).unwrap();
+        db.init_schema().unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn ticket_update_and_reopen() {
+        let (db, dir) = temp_db("tickets");
+        let id = db
+            .ticket_create("First", "desc", 2, None, Some(3), "plan")
+            .unwrap();
+
+        let edit = TicketEdit {
+            title: Some("Renamed".into()),
+            description: Some("new desc".into()),
+            priority: Some(1),
+            parent_id: Some(Some(9)),
+            requirement_id: Some(None),
+        };
+        assert!(db.ticket_update(id, &edit).unwrap());
+        let t = db.ticket_get(id).unwrap().unwrap();
+        assert_eq!(t.title, "Renamed");
+        assert_eq!(t.description, "new desc");
+        assert_eq!(t.priority, 1);
+        assert_eq!(t.parent_id, Some(9));
+        assert_eq!(t.requirement_id, None);
+
+        db.ticket_set_status(id, "resolved", Some("done")).unwrap();
+        assert_eq!(db.ticket_get(id).unwrap().unwrap().status, "resolved");
+
+        assert!(db.ticket_reopen(id).unwrap());
+        let t = db.ticket_get(id).unwrap().unwrap();
+        assert_eq!(t.status, "open");
+        assert_eq!(t.resolution, None);
+        assert!(t.resolved_at.is_none());
+
+        assert!(!db.ticket_update(9999, &edit).unwrap());
+        assert!(!db.ticket_reopen(9999).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

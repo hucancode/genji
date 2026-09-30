@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use super::{opt_i64, opt_str, req_str};
@@ -119,6 +120,97 @@ pub fn remove(agent: &mut Agent, args: &Value) -> Result<String> {
         "{} requirement #{id}",
         if hard { "deleted" } else { "removed" }
     ))
+}
+
+pub fn tree(agent: &mut Agent, args: &Value) -> Result<String> {
+    let filter = opt_str(args, "status");
+    let reqs: Vec<Requirement> = reqmd::load_all(&agent.cfg, &agent.workspace)?
+        .into_iter()
+        .filter(|r| filter.as_deref().is_none_or(|s| r.status == s))
+        .collect();
+    if reqs.is_empty() {
+        return Ok("(no requirements)".into());
+    }
+
+    // Ticket coverage per requirement id.
+    let tickets = agent.db.ticket_list(None, None)?;
+    let mut open: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut done: BTreeMap<i64, i64> = BTreeMap::new();
+    for t in &tickets {
+        if let Some(rid) = t.requirement_id {
+            match t.status.as_str() {
+                "open" | "in_progress" => *open.entry(rid).or_default() += 1,
+                "resolved" | "closed" => *done.entry(rid).or_default() += 1,
+                _ => {}
+            }
+        }
+    }
+
+    let ids: BTreeSet<i64> = reqs.iter().map(|r| r.id).collect();
+    let mut children: BTreeMap<Option<i64>, Vec<&Requirement>> = BTreeMap::new();
+    for r in &reqs {
+        // Treat a missing parent as a root so nothing disappears from the tree.
+        let parent = match r.parent_id {
+            Some(p) if ids.contains(&p) => Some(p),
+            _ => None,
+        };
+        children.entry(parent).or_default().push(r);
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "requirements: {} active / {} total, tickets: {} open / {} done\n\n",
+        reqs.iter().filter(|r| r.status == "active").count(),
+        reqs.len(),
+        tickets
+            .iter()
+            .filter(|t| matches!(t.status.as_str(), "open" | "in_progress"))
+            .count(),
+        tickets
+            .iter()
+            .filter(|t| matches!(t.status.as_str(), "resolved" | "closed"))
+            .count(),
+    ));
+    let mut visited = BTreeSet::new();
+    if let Some(roots) = children.get(&None) {
+        for r in roots {
+            render_tree(r, &children, &open, &done, 0, &mut visited, &mut out);
+        }
+    }
+    // Safety net for cycles: show anything not reachable from a root.
+    for r in &reqs {
+        if !visited.contains(&r.id) {
+            render_tree(r, &children, &open, &done, 0, &mut visited, &mut out);
+        }
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_tree<'a>(
+    req: &'a Requirement,
+    children: &BTreeMap<Option<i64>, Vec<&'a Requirement>>,
+    open: &BTreeMap<i64, i64>,
+    done: &BTreeMap<i64, i64>,
+    depth: usize,
+    visited: &mut BTreeSet<i64>,
+    out: &mut String,
+) {
+    if !visited.insert(req.id) {
+        return;
+    }
+    let indent = "  ".repeat(depth);
+    let o = open.get(&req.id).copied().unwrap_or(0);
+    let d = done.get(&req.id).copied().unwrap_or(0);
+    out.push_str(&format!(
+        "{indent}#{} [{}:{}] {}  (tickets: {o} open / {d} done)\n",
+        req.id, req.level, req.status, req.title
+    ));
+    if let Some(kids) = children.get(&Some(req.id)) {
+        for k in kids {
+            render_tree(k, children, open, done, depth + 1, visited, out);
+        }
+    }
 }
 
 pub fn ask(agent: &mut Agent, args: &Value) -> Result<String> {

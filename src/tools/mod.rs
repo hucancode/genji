@@ -40,6 +40,9 @@ struct Tool {
     description: &'static str,
     parameters: Value,
     modes: &'static [Mode],
+    /// When true the tool is only exposed while the OCD flag is enabled. This
+    /// is how the requirements/tickets system stays out of the default agent.
+    requires_ocd: bool,
     handler: fn(&mut Agent, &Value) -> Result<String>,
 }
 
@@ -71,6 +74,25 @@ fn tool(
         description,
         parameters,
         modes,
+        requires_ocd: false,
+        handler,
+    }
+}
+
+/// Like [`tool`], but only exposed while the OCD flag is enabled.
+fn ocd_tool(
+    name: &'static str,
+    modes: &'static [Mode],
+    description: &'static str,
+    parameters: Value,
+    handler: fn(&mut Agent, &Value) -> Result<String>,
+) -> Tool {
+    Tool {
+        name,
+        description,
+        parameters,
+        modes,
+        requires_ocd: true,
         handler,
     }
 }
@@ -125,8 +147,8 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["command"]
             }), basic::bash),
-            // ---- tickets ----
-            tool("ticket_create", PLAN, "Create a work ticket.", json!({
+            // ---- tickets (OCD only) ----
+            ocd_tool("ticket_create", PLAN, "Create a work ticket.", json!({
                 "type":"object",
                 "properties":{
                     "title":{"type":"string"},
@@ -137,7 +159,7 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["title"]
             }), tickets::create),
-            tool("ticket_read", PLAN_BUILD, "Read one ticket by id, or list tickets.", json!({
+            ocd_tool("ticket_read", PLAN_BUILD, "Read one ticket by id, or list tickets.", json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"integer"},
@@ -145,18 +167,44 @@ fn registry() -> &'static [Tool] {
                     "requirement_id":{"type":"integer"}
                 }
             }), tickets::read),
-            tool("ticket_resolve", PLAN_BUILD, "Mark a ticket resolved after the work is done and verified.", json!({
+            ocd_tool("ticket_claim", PLAN_BUILD, "Claim the next open ticket (highest priority) or a specific ticket, marking it in_progress.", json!({
+                "type":"object",
+                "properties":{
+                    "id":{"type":"integer","description":"Claim this ticket instead of the next one"},
+                    "requirement_id":{"type":"integer","description":"Only consider tickets for this requirement"}
+                }
+            }), tickets::claim),
+            ocd_tool("ticket_update", PLAN_BUILD, "Update a ticket's fields and/or status.", json!({
+                "type":"object",
+                "properties":{
+                    "id":{"type":"integer"},
+                    "title":{"type":"string"},
+                    "description":{"type":"string"},
+                    "priority":{"type":"integer","description":"1=high, 2=normal, 3=low"},
+                    "parent_id":{"type":"integer"},
+                    "requirement_id":{"type":"integer"},
+                    "status":{"type":"string","enum":["open","in_progress","resolved","closed"]},
+                    "resolution":{"type":"string"}
+                },
+                "required":["id"]
+            }), tickets::update),
+            ocd_tool("ticket_resolve", PLAN_BUILD, "Mark a ticket resolved after the work is done and verified.", json!({
                 "type":"object",
                 "properties":{"id":{"type":"integer"},"resolution":{"type":"string"}},
                 "required":["id"]
             }), tickets::resolve),
-            tool("ticket_close", PLAN_BUILD, "Close a ticket as obsolete/duplicate/won't-fix.", json!({
+            ocd_tool("ticket_close", PLAN_BUILD, "Close a ticket as obsolete/duplicate/won't-fix.", json!({
                 "type":"object",
                 "properties":{"id":{"type":"integer"},"reason":{"type":"string"}},
                 "required":["id"]
             }), tickets::close),
-            // ---- requirements ----
-            tool("requirement_create", PLAN, "Create a stakeholder or system requirement.", json!({
+            ocd_tool("ticket_reopen", PLAN_BUILD, "Reopen a resolved/closed ticket as open, clearing its resolution.", json!({
+                "type":"object",
+                "properties":{"id":{"type":"integer"}},
+                "required":["id"]
+            }), tickets::reopen),
+            // ---- requirements (OCD only) ----
+            ocd_tool("requirement_create", PLAN, "Create a stakeholder or system requirement.", json!({
                 "type":"object",
                 "properties":{
                     "level":{"type":"string","enum":["stakeholder","system"]},
@@ -166,7 +214,7 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["level","title","body"]
             }), requirements::create),
-            tool("requirement_read", PLAN_BUILD, "Read a requirement by id, or list requirements.", json!({
+            ocd_tool("requirement_read", PLAN_BUILD, "Read a requirement by id, or list requirements.", json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"integer"},
@@ -174,7 +222,13 @@ fn registry() -> &'static [Tool] {
                     "status":{"type":"string","enum":["active","met","removed"]}
                 }
             }), requirements::read),
-            tool("requirement_update", PLAN, "Update a requirement's title/body/status/level/parent.", json!({
+            ocd_tool("requirement_tree", PLAN_BUILD, "Show the requirement hierarchy with ticket coverage per requirement.", json!({
+                "type":"object",
+                "properties":{
+                    "status":{"type":"string","enum":["active","met","removed"],"description":"Only show requirements with this status"}
+                }
+            }), requirements::tree),
+            ocd_tool("requirement_update", PLAN, "Update a requirement's title/body/status/level/parent.", json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"integer"},
@@ -186,12 +240,12 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["id"]
             }), requirements::update),
-            tool("requirement_remove", PLAN, "Remove a requirement (soft by default).", json!({
+            ocd_tool("requirement_remove", PLAN, "Remove a requirement (soft by default).", json!({
                 "type":"object",
                 "properties":{"id":{"type":"integer"},"hard":{"type":"boolean"}},
                 "required":["id"]
             }), requirements::remove),
-            tool("requirement_ask", PLAN_BUILD, "Ask the user a clarifying question about a requirement. Recorded in the DB.", json!({
+            ocd_tool("requirement_ask", PLAN_BUILD, "Ask the user a clarifying question about a requirement. Recorded in the DB.", json!({
                 "type":"object",
                 "properties":{
                     "question":{"type":"string"},
@@ -309,10 +363,11 @@ fn registry() -> &'static [Tool] {
     })
 }
 
-pub fn specs_for(mode: Mode) -> Vec<ToolSpec> {
+pub fn specs_for(mode: Mode, ocd: bool) -> Vec<ToolSpec> {
     registry()
         .iter()
         .filter(|t| t.modes.contains(&mode))
+        .filter(|t| !t.requires_ocd || ocd)
         .map(|t| t.spec())
         .collect()
 }
@@ -357,4 +412,60 @@ pub fn opt_i64(args: &Value, key: &str) -> Option<i64> {
 
 pub fn opt_bool(args: &Value, key: &str) -> Option<bool> {
     args.get(key).and_then(|v| v.as_bool())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::specs_for;
+    use crate::modes::Mode;
+
+    fn names(mode: Mode, ocd: bool) -> Vec<String> {
+        specs_for(mode, ocd)
+            .into_iter()
+            .map(|s| s.name.to_string())
+            .collect()
+    }
+
+    fn is_ticket_or_requirement(name: &str) -> bool {
+        name.starts_with("ticket_") || name.starts_with("requirement_")
+    }
+
+    #[test]
+    fn ticket_tools_are_hidden_without_ocd() {
+        for mode in [Mode::Plan, Mode::Build, Mode::Explore, Mode::Retro] {
+            assert!(
+                names(mode, false)
+                    .iter()
+                    .all(|n| !is_ticket_or_requirement(n)),
+                "{mode:?} exposed a ticket/requirement tool with OCD off"
+            );
+        }
+    }
+
+    #[test]
+    fn ticket_tools_appear_with_ocd() {
+        let plan = names(Mode::Plan, true);
+        assert!(plan.iter().any(|n| n == "ticket_create"));
+        assert!(plan.iter().any(|n| n == "requirement_create"));
+        assert!(plan.iter().any(|n| n == "requirement_tree"));
+
+        let build = names(Mode::Build, true);
+        assert!(build.iter().any(|n| n == "ticket_claim"));
+        assert!(build.iter().any(|n| n == "ticket_update"));
+        assert!(build.iter().any(|n| n == "ticket_reopen"));
+        // Build still cannot create requirements.
+        assert!(!build.iter().any(|n| n == "requirement_create"));
+    }
+
+    #[test]
+    fn ocd_does_not_leak_into_explore_or_retro() {
+        for mode in [Mode::Explore, Mode::Retro] {
+            assert!(
+                names(mode, true)
+                    .iter()
+                    .all(|n| !is_ticket_or_requirement(n)),
+                "{mode:?} exposed a ticket/requirement tool with OCD on"
+            );
+        }
+    }
 }

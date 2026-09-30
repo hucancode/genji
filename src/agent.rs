@@ -36,6 +36,9 @@ pub struct Agent {
     pub depth: u32,
     pub seq: i64,
     pub interactive: bool,
+    /// OCD flag: enables the requirements/tickets tools and the auto plan/build
+    /// cycle. Off means a plain coding agent with no ticket system.
+    pub ocd: bool,
     pub control: Option<Arc<Control>>,
     pub events: Arc<EventEmitter>,
     /// Set when a fatal LLM failure ends the run (see [`Agent::status`]).
@@ -54,6 +57,7 @@ pub struct AgentParams {
     pub depth: u32,
     pub task: String,
     pub interactive: bool,
+    pub ocd: bool,
     pub control: Option<Arc<Control>>,
 }
 
@@ -69,6 +73,7 @@ impl Agent {
             depth,
             task,
             interactive,
+            ocd,
             control,
         } = params;
         // The model is derived here, not passed in, so `Agent` and `set_mode`
@@ -76,8 +81,8 @@ impl Agent {
         let model = cfg.model_for_mode(mode);
         let limits = cfg.limits_for_model(&model);
         let llm = LlmClient::new(&cfg, &model)?;
-        let tools = tools::specs_for(mode);
-        let system = build_system(&db, mode)?;
+        let tools = tools::specs_for(mode, ocd);
+        let system = build_system(&db, mode, ocd)?;
         db.instance_start(
             &instance_id,
             mode.as_str(),
@@ -121,6 +126,7 @@ impl Agent {
             depth,
             seq: 0,
             interactive,
+            ocd,
             control,
             events,
             failed: false,
@@ -144,7 +150,7 @@ impl Agent {
     }
 
     pub fn refresh_system_prompt(&mut self) -> Result<()> {
-        let system = build_system(&self.db, self.mode)?;
+        let system = build_system(&self.db, self.mode, self.ocd)?;
         if let Some(first) = self.messages.first_mut() {
             first.content = system;
         } else {
@@ -160,7 +166,7 @@ impl Agent {
         self.token_limit = limits.token_limit;
         self.context_window = limits.context_window;
         self.llm = LlmClient::new(&self.cfg, &self.model)?;
-        self.tools = tools::specs_for(mode);
+        self.tools = tools::specs_for(mode, self.ocd);
         self.db.conn.execute(
             "UPDATE instances SET mode=? WHERE id=?",
             params![mode.as_str(), self.instance_id],
@@ -459,8 +465,15 @@ impl Agent {
     }
 }
 
-pub fn build_system(db: &Db, mode: Mode) -> Result<String> {
-    let base = format!("{}\n{}", shared_preamble(), mode.core_prompt());
+pub fn build_system(db: &Db, mode: Mode, ocd: bool) -> Result<String> {
+    let mut base = format!("{}\n{}", shared_preamble(), mode.core_prompt());
+    if ocd {
+        let guidance = mode.ocd_guidance();
+        if !guidance.trim().is_empty() {
+            base.push('\n');
+            base.push_str(guidance);
+        }
+    }
     // `load_extended` is the single gate for which modes have an extended
     // prompt; it returns empty for RETRO and for an unedited (empty) prompt.
     let extended = prompts::load_extended(db, mode)?;

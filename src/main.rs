@@ -34,8 +34,6 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
     task: Option<String>,
-    #[arg(long, global = true)]
-    cycle: bool,
     #[arg(long, hide = true, global = true)]
     subagent: bool,
     #[arg(long, hide = true, global = true)]
@@ -48,6 +46,10 @@ struct Cli {
     depth: u32,
     #[arg(long, global = true)]
     quiet_startup: bool,
+    /// Enable the requirements/tickets system and the automatic plan/build
+    /// cycle. Without it genji is a plain coding agent.
+    #[arg(long, global = true)]
+    ocd: bool,
     #[arg(long, global = true)]
     verbose: bool,
     #[arg(long, global = true)]
@@ -62,12 +64,12 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Convert stakeholder intent into system requirements and tickets.
+    /// Produce an implementation plan before work begins.
     Plan {
         /// The user request / task.
         task: Option<String>,
     },
-    /// Implement open tickets, verify, and resolve them.
+    /// Implement the requested changes and verify them.
     Build {
         /// The user request / task.
         task: Option<String>,
@@ -153,13 +155,13 @@ enum Startup {
 
 /// Decide how to start from the two inputs the user can provide: an explicit
 /// instruction and the presence of active requirements. An explicit instruction
-/// always wins; otherwise active requirements are the work queue; otherwise
+/// always wins; otherwise, with OCD on, active requirements are the work queue;
 /// nothing was provided and we wait for an instruction.
-fn startup_action(explicit_task: Option<String>, active_requirements: i64) -> Startup {
+fn startup_action(explicit_task: Option<String>, active_requirements: i64, ocd: bool) -> Startup {
     if let Some(t) = explicit_task {
         return Startup::Run(t);
     }
-    if active_requirements > 0 {
+    if ocd && active_requirements > 0 {
         return Startup::Run(DEFAULT_TASK.to_string());
     }
     Startup::Wait
@@ -212,6 +214,7 @@ struct RunRequest {
     mode: Mode,
     task: String,
     interactive: bool,
+    ocd: bool,
     quiet: bool,
     control: Option<Arc<control::Control>>,
 }
@@ -225,6 +228,7 @@ fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<Str
         mode,
         task,
         interactive,
+        ocd,
         quiet,
         control,
     } = req;
@@ -248,6 +252,7 @@ fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<Str
         depth,
         task: task.clone(),
         interactive,
+        ocd,
         control,
     })?;
     agent.add_user(&task)?;
@@ -266,6 +271,7 @@ fn run_cycle(req: RunRequest) -> Result<String> {
         mode: start_mode,
         task,
         interactive,
+        ocd,
         quiet,
         control,
     } = req;
@@ -288,6 +294,7 @@ fn run_cycle(req: RunRequest) -> Result<String> {
         depth: 0,
         task: task.clone(),
         interactive,
+        ocd,
         control,
     })?;
     agent.add_user(&task)?;
@@ -864,8 +871,8 @@ fn main() -> Result<()> {
     let interactive = cli.interactive
         || cfg.interactive
         || (!cli.subagent && std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
-    // With no mode subcommand we default to build mode. Auto-cycling is implied
-    // in that case, and `--cycle` enables it for any explicit starting mode.
+    // With no mode subcommand we default to build mode. The requirements/tickets
+    // system (and the automatic plan/build cycle) is opt-in via `--ocd`.
     let (start_mode, task_arg): (Mode, Option<&str>) = match &cli.command {
         Some(Command::Plan { task }) => (Mode::Plan, task.as_deref()),
         Some(Command::Build { task }) => (Mode::Build, task.as_deref()),
@@ -874,7 +881,9 @@ fn main() -> Result<()> {
         Some(_) => unreachable!("instance subcommand handled above"),
         None => (Mode::Build, cli.task.as_deref()),
     };
-    let cycle = cli.command.is_none() || cli.cycle;
+    let ocd = cli.ocd;
+    // OCD always runs the auto plan/build cycle; a plain run is a single mode.
+    let cycle = ocd;
     let explicit_task = read_task(cli.instructions_file.as_deref(), task_arg)?;
     let quiet = cli.quiet_startup || cli.subagent;
     // One id per run: the instance id. It names the registry record, the event
@@ -936,7 +945,7 @@ fn main() -> Result<()> {
 
     // Start from an explicit instruction when given, else the active
     // requirements, else wait for an instruction on the control socket.
-    let task = match startup_action(explicit_task, reqmd::active_count(&cfg, &workspace)?) {
+    let task = match startup_action(explicit_task, reqmd::active_count(&cfg, &workspace)?, ocd) {
         Startup::Run(t) => t,
         Startup::Wait => match &control {
             Some(c) => match wait_for_instruction(c, &instance_id, quiet)? {
@@ -968,6 +977,7 @@ fn main() -> Result<()> {
         mode: start_mode,
         task,
         interactive,
+        ocd,
         quiet,
         control: control.clone(),
     };

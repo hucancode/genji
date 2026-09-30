@@ -8,9 +8,9 @@ own instructions.
 
 | Mode | Purpose | Writes state? |
 |------|---------|---------------|
-| `plan` | Turn stakeholder intent into system requirements + tickets | yes (full ticket/requirement surface) |
-| `build` | Implement open tickets, verify, resolve them | reduced surface |
-| `explore` | Investigate and report; no ticket/requirement tools | read/inspect only |
+| `plan` | Produce an implementation plan | read/inspect by default; requirements/tickets only with OCD |
+| `build` | Implement requested changes and verify | code; tickets only with OCD |
+| `explore` | Investigate and report; never touches the ticket system | read/inspect only |
 | `retro` | Query history and improve prompts/skills | prompt & skill editing |
 
 The effective system prompt is:
@@ -18,6 +18,7 @@ The effective system prompt is:
 ```
 <shared preamble>
 <mode core prompt>          # not editable
+<OCD guidance>              # only when --ocd is on (plan/build)
 ## Extended guidance
 <editable extended prompt>  # versioned in DB; retro may edit it
 ```
@@ -32,17 +33,21 @@ rolled back (`prompt_history` / `prompt_rollback`). `prompt_edit` rejects
 
 ## Tool matrix
 
+The **OCD** column applies to `plan`/`build` only when the `--ocd` flag (or the
+`ocd` subcommand) is on. Requirement/ticket tools are never exposed in
+`explore`, `retro`, or in `plan`/`build` runs without OCD. See
+[OCD mode](#ocd-requirements--tickets) below.
+
 | Tool | plan | build | explore | retro |
 |------|:----:|:-----:|:-------:|:-----:|
 | `read` `write` `edit` `ls` `bash` | ✓ | ✓ | ✓ | ✓ |
-| `ticket_create` | ✓ |  |  |  |
-| `ticket_read` | ✓ | ✓ |  |  |
-| `ticket_resolve` `ticket_close` | ✓ | ✓ |  |  |
-| `requirement_create` `requirement_update` `requirement_remove` | ✓ |  |  |  |
-| `requirement_read` | ✓ | ✓ |  |  |
-| `requirement_ask` | ✓ | ✓ |  |  |
 | `skill_load` | ✓ | ✓ | ✓ | ✓ |
 | `spawn` | ✓ | ✓ | ✓ |  |
+| `ticket_create` (OCD) | ✓ |  |  |  |
+| `ticket_read` `ticket_claim` `ticket_update` (OCD) | ✓ | ✓ |  |  |
+| `ticket_resolve` `ticket_close` `ticket_reopen` (OCD) | ✓ | ✓ |  |  |
+| `requirement_create` `requirement_update` `requirement_remove` (OCD) | ✓ |  |  |  |
+| `requirement_read` `requirement_tree` `requirement_ask` (OCD) | ✓ | ✓ |  |  |
 | `query_*`, `*_skill`, `prompt_*` |  |  |  | ✓ |
 
 - `ls` respects `.gitignore`, `.ignore`, `.git/info/exclude` and global git
@@ -53,24 +58,49 @@ rolled back (`prompt_history` / `prompt_rollback`). `prompt_edit` rejects
 
 ---
 
+## OCD: requirements & tickets
+
+OCD is an opt-in **flag**, not a mode or subcommand. It is off by default, so a
+plain genji run has no requirement or ticket tools at all. Enable it with any
+of:
+
+```bash
+genji --ocd "build me a cat classifier"
+genji plan --ocd "..."    # --ocd works with plan/build; the run also cycles
+```
+
+When OCD is on:
+
+- `plan` and `build` gain the full requirements/tickets surface
+  (`requirement_*`, `ticket_*`, plus `ticket_claim`, `ticket_update`,
+  `ticket_reopen`, and `requirement_tree`).
+- The run **auto-cycles** between `plan` and `build`, starting from the chosen
+  mode (default `build`), until there are no `active` requirements or
+  `max_cycles` is reached.
+- `explore` and `retro` still never expose requirement/ticket tools.
+
+`spawn` propagates the flag, so a subagent runs with the same ticket surface.
+
+---
+
 ## Automatic mode cycling
 
-With no mode subcommand **and a task**, genji starts in **build** mode and runs:
+Cycling is part of OCD. With OCD on and a task, genji starts in **build** mode
+and runs:
 
 ```
 build → plan → build → plan → …   until active requirements == 0 (or max_cycles)
 ```
-
 State (requirements, tickets, conversation) persists across cycles in one
 run. Plan mode decides whether requirements are truly met; when none remain
-active, the loop stops. The `--cycle` flag applies the same cycling to an
-explicit mode subcommand, starting from that mode (`genji build --cycle` starts
-at build, `genji plan --cycle` starts at plan). A mode subcommand without
-`--cycle` (`genji plan`, `genji build`, `genji explore`, `genji retro`) runs a
-single mode instead. Subagents always run a single mode.
+active, the loop stops. `genji plan --ocd` starts the cycle at plan instead.
+Without OCD there is no auto-cycle: `genji plan`, `genji build`, `genji
+explore`, and `genji retro` each run a single mode. Subagents always run a
+single mode.
 
-Running bare `genji` with **no task at all** does not start a cycle: it opens
-the control socket and waits for an instruction to be sent (see
+With OCD on and **no explicit task**, active requirements are used as the work
+queue. Running bare `genji` with **no task and no OCD** does not start a cycle:
+it opens the control socket and waits for an instruction to be sent (see
 [Mid-run instructions](control-socket.md#running-with-no-instruction)).
 
 ---

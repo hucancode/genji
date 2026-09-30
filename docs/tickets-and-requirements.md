@@ -1,5 +1,10 @@
 # Tickets and requirements
 
+The requirements/tickets system is only active when **OCD** is enabled
+(`genji --ocd ...`, for example `genji plan --ocd "..."`). Without OCD, genji
+is a plain coding agent and none of the `requirement_*`/`ticket_*` tools are
+offered to the model. See [Modes](modes.md#ocd-requirements--tickets).
+
 Requirements have two levels:
 
 - **stakeholder** — intent, as written by the user.
@@ -19,14 +24,18 @@ from the legacy `requirements` table on startup.
 ```
 requirement_create  {level, title, body, parent_id?}
 requirement_read    {id?, level?, status?}
+requirement_tree    {status?}                     # hierarchy + ticket coverage
 requirement_update  {id, title?, body?, status?, level?, parent_id?}
 requirement_remove  {id, hard?}
 requirement_ask     {question, requirement_id?}   # recorded in DB; answered if TTY
 
 ticket_create       {title, description?, priority?, parent_id?, requirement_id?}
 ticket_read         {id?, status?, requirement_id?}
+ticket_claim        {id?, requirement_id?}        # claim next ticket, mark in_progress
+ticket_update       {id, title?, description?, priority?, parent_id?, requirement_id?, status?, resolution?}
 ticket_resolve      {id, resolution?}
 ticket_close        {id, reason?}
+ticket_reopen       {id}
 ```
 
 ---

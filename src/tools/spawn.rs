@@ -52,7 +52,11 @@ pub fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
         (agent.depth + 1).to_string(),
         "--quiet-startup".to_string(),
         "--no-control".to_string(),
-    ];
+    ]
+    .into_iter()
+    // Subagents inherit OCD so a build subagent can work the same tickets.
+    .chain(agent.ocd.then(|| "--ocd".to_string()))
+    .collect::<Vec<_>>();
 
     let cap = agent.cfg.tool_result_max_bytes.saturating_mul(2).max(16384);
     let res = proc::run_capture(
