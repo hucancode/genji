@@ -44,6 +44,9 @@ struct Tool {
     /// When true the tool is only exposed while the OCD flag is enabled. This
     /// is how the requirements/tickets system stays out of the default agent.
     requires_ocd: bool,
+    /// When true the tool is only exposed while at least one skill exists. This
+    /// keeps `skill_load` out of the schema when there is nothing to load.
+    requires_skills: bool,
     handler: fn(&mut Agent, &Value) -> Result<String>,
 }
 
@@ -76,6 +79,7 @@ fn tool(
         parameters,
         modes,
         requires_ocd: false,
+        requires_skills: false,
         handler,
     }
 }
@@ -94,6 +98,26 @@ fn ocd_tool(
         parameters,
         modes,
         requires_ocd: true,
+        requires_skills: false,
+        handler,
+    }
+}
+
+/// Like [`tool`], but only exposed while at least one skill is available.
+fn skill_tool(
+    name: &'static str,
+    modes: &'static [Mode],
+    description: &'static str,
+    parameters: Value,
+    handler: fn(&mut Agent, &Value) -> Result<String>,
+) -> Tool {
+    Tool {
+        name,
+        description,
+        parameters,
+        modes,
+        requires_ocd: false,
+        requires_skills: true,
         handler,
     }
 }
@@ -264,7 +288,7 @@ fn registry() -> &'static [Tool] {
                 "required":["question"]
             }), requirements::ask),
             // ---- skills ----
-            tool("skill_load", ALL_MODES, "Load a skill's instructions by name.", json!({
+            skill_tool("skill_load", ALL_MODES, "Load a skill's instructions by name.", json!({
                 "type":"object",
                 "properties":{"name":{"type":"string"}},
                 "required":["name"]
@@ -373,11 +397,12 @@ fn registry() -> &'static [Tool] {
     })
 }
 
-pub fn specs_for(mode: Mode, ocd: bool) -> Vec<ToolSpec> {
+pub fn specs_for(mode: Mode, ocd: bool, has_skills: bool) -> Vec<ToolSpec> {
     registry()
         .iter()
         .filter(|t| t.modes.contains(&mode))
         .filter(|t| !t.requires_ocd || ocd)
+        .filter(|t| !t.requires_skills || has_skills)
         .map(|t| t.spec())
         .collect()
 }
@@ -430,7 +455,14 @@ mod tests {
     use crate::modes::Mode;
 
     fn names(mode: Mode, ocd: bool) -> Vec<String> {
-        specs_for(mode, ocd)
+        specs_for(mode, ocd, true)
+            .into_iter()
+            .map(|s| s.name.to_string())
+            .collect()
+    }
+
+    fn names_without_skills(mode: Mode, ocd: bool) -> Vec<String> {
+        specs_for(mode, ocd, false)
             .into_iter()
             .map(|s| s.name.to_string())
             .collect()
@@ -478,6 +510,18 @@ mod tests {
         assert!(build.iter().any(|n| n == "ticket_reopen"));
         // Build still cannot create requirements.
         assert!(!build.iter().any(|n| n == "requirement_create"));
+    }
+
+    #[test]
+    fn skill_load_hidden_without_skills() {
+        for mode in [Mode::Plan, Mode::Build, Mode::Explore, Mode::Retro] {
+            assert!(
+                !names_without_skills(mode, false)
+                    .iter()
+                    .any(|n| n == "skill_load"),
+                "{mode:?} exposed skill_load with no skills"
+            );
+        }
     }
 
     #[test]

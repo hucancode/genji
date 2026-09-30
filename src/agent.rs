@@ -81,7 +81,8 @@ pub fn build_context(
     let model = cfg.model_for_mode(mode);
     let window = cfg.limits_for_model(&model).context_window;
     let system = build_system(db, mode, ocd)?;
-    let tools = tools::specs_for(mode, ocd);
+    let has_skills = !db.skill_list()?.is_empty();
+    let tools = tools::specs_for(mode, ocd, has_skills);
     Ok(Arc::new(RwLock::new(ContextComposer::new(
         system, tools, window,
     ))))
@@ -224,7 +225,7 @@ impl Agent {
         self.token_limit = limits.token_limit;
         self.llm = LlmClient::new(&self.cfg, &self.model)?;
         // The composer swaps tools, system prompt, and window together.
-        let tools = tools::specs_for(mode, self.ocd);
+        let tools = tools::specs_for(mode, self.ocd, !self.db.skill_list()?.is_empty());
         let system = self.compose_system()?;
         self.context
             .write()
