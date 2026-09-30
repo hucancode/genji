@@ -52,7 +52,8 @@ The **OCD** column applies to `plan`/`build` only when the `--ocd` flag (or the
 | `query_*`, `*_skill`, `prompt_*` |  |  |  | ✓ |
 
 - `ls` respects `.gitignore`, `.ignore`, `.git/info/exclude` and global git
-  ignores. Non-recursive by default; `recursive: true` walks the tree.
+  ignores. Non-recursive by default; set `max_depth` to walk the tree
+  (0 lists only immediate children, N walks N levels deep).
 - `bash` runs `bash -c <command>` in the workspace with a timeout.
 - Tool results longer than `tool_result_max_bytes` are truncated (head + marker).
   See [Context management](context-management.md).

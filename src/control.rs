@@ -1,13 +1,16 @@
 use anyhow::{bail, Context, Result};
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
+
+use crate::context::ContextComposer;
 
 /// A control socket that lets a user inject instructions into a running agent.
 ///
@@ -15,6 +18,8 @@ use std::time::Duration;
 ///
 /// - any other text -> queued as a user instruction
 /// - `/status` -> returns the agent's current status
+/// - `/context` -> returns the live context snapshot (messages + tools)
+/// - `/context stats` -> returns the computed token breakdown
 /// - `/stop` -> requests a graceful stop
 /// - `/setplan <slug>` -> follow/refine the plan `plans_dir/<slug>.md` (`off` clears)
 /// - `/ping` -> liveness check
@@ -22,14 +27,13 @@ use std::time::Duration;
 /// The server replies with one line and closes its write side.
 pub struct Control {
     pub path: PathBuf,
-    /// Resolved directory that holds plan files. Used by `/setplan` to decide
-    /// whether a plan already exists and should be read.
     plans_dir: PathBuf,
     queue: Mutex<VecDeque<String>>,
     stop: AtomicBool,
     shutdown: AtomicBool,
     status: Mutex<String>,
     plan: Mutex<Option<String>>,
+    context: Arc<RwLock<ContextComposer>>,
 }
 
 /// Result of polling the control socket at a safe point in the run loop.
@@ -40,7 +44,11 @@ pub struct ControlPoll {
 }
 
 impl Control {
-    pub fn start(path: PathBuf, plans_dir: PathBuf) -> Result<Arc<Self>> {
+    pub fn start(
+        path: PathBuf,
+        plans_dir: PathBuf,
+        context: Arc<RwLock<ContextComposer>>,
+    ) -> Result<Arc<Self>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -69,6 +77,7 @@ impl Control {
             shutdown: AtomicBool::new(false),
             status: Mutex::new("starting".to_string()),
             plan: Mutex::new(None),
+            context,
         });
         let c = ctrl.clone();
         thread::Builder::new()
@@ -117,6 +126,14 @@ impl Control {
         *self.status.lock().unwrap() = s.into();
     }
 
+    fn context_snapshot(&self) -> Value {
+        self.context.read().unwrap().snapshot()
+    }
+
+    fn context_stats(&self) -> Value {
+        self.context.read().unwrap().stats().to_json()
+    }
+
     pub fn status(&self) -> String {
         self.status.lock().unwrap().clone()
     }
@@ -137,6 +154,10 @@ fn handle(mut stream: UnixStream, c: &Control) -> Result<()> {
         "error: empty command".to_string()
     } else if line == "/status" {
         format!("status: {}", c.status())
+    } else if line == "/context" {
+        serde_json::to_string(&c.context_snapshot()).unwrap_or_else(|e| format!("error: {e}"))
+    } else if line == "/context stats" {
+        serde_json::to_string(&c.context_stats()).unwrap_or_else(|e| format!("error: {e}"))
     } else if line == "/stop" {
         c.stop.store(true, Ordering::SeqCst);
         "stopping".to_string()
@@ -227,7 +248,9 @@ pub fn send(path: &Path, msg: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{plan_instruction, valid_plan_slug};
+    use super::{Control, plan_instruction, send, valid_plan_slug};
+    use crate::context::ContextComposer;
+    use std::sync::{Arc, RwLock};
 
     fn temp_file(tag: &str, content: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -267,5 +290,48 @@ mod tests {
         assert!(!valid_plan_slug("a/b"));
         assert!(!valid_plan_slug("has space"));
         assert!(!valid_plan_slug(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn context_command_measures_the_shared_composer() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("genji-control-ctx-{nanos}"));
+        let sock = dir.join("control.sock");
+        let composer = Arc::new(RwLock::new(ContextComposer::new(
+            "system".to_string(),
+            Vec::new(),
+            1000,
+        )));
+        let ctrl =
+            Control::start(sock.clone(), dir.clone(), composer).expect("start control");
+
+        let snapshot = send(&sock, "/context").expect("send /context");
+        assert!(
+            snapshot.contains("\"context_window\":1000"),
+            "got: {snapshot}"
+        );
+        assert!(snapshot.contains("\"messages\""), "got: {snapshot}");
+        assert!(snapshot.contains("\"system\""), "got: {snapshot}");
+        // The snapshot is a raw read; the token breakdown is opt-in.
+        assert!(
+            !snapshot.contains("system_prompt_tokens"),
+            "got: {snapshot}"
+        );
+
+        let breakdown = send(&sock, "/context stats").expect("send /context stats");
+        assert!(
+            breakdown.contains("\"context_window\":1000"),
+            "got: {breakdown}"
+        );
+        assert!(
+            breakdown.contains("\"system_prompt_tokens\""),
+            "got: {breakdown}"
+        );
+
+        ctrl.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

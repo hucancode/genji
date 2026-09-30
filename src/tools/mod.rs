@@ -130,13 +130,12 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["path"]
             }), basic::edit),
-            tool("ls", ALL_MODES, "List files/directories respecting .gitignore. Non-recursive unless recursive=true.", json!({
+            tool("ls", ALL_MODES, "List files/directories respecting .gitignore.", json!({
                 "type":"object",
                 "properties":{
                     "path":{"type":"string","description":"Directory (default .)"},
-                    "recursive":{"type":"boolean"},
-                    "max_depth":{"type":"integer"},
-                    "show_hidden":{"type":"boolean"}
+                    "max_depth":{"type":"integer","description":"Recursion depth; Default = 0 = lists only immediate children"},
+                    "show_hidden":{"type":"boolean","description":"default false"}
                 }
             }), basic::ls),
             tool("bash", ALL_MODES, "Run a shell command via bash -c in the workspace. Returns exit code, stdout, stderr.", json!({

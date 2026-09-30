@@ -2,10 +2,11 @@ use anyhow::Result;
 use rusqlite::params;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::{expand_tilde, Config};
+use crate::context::ContextComposer;
 use crate::control::{Control, ControlPoll};
 use crate::db::Db;
 use crate::events::EventEmitter;
@@ -13,7 +14,7 @@ use crate::llm::{self, ChatMessage, LlmClient};
 use crate::modes::{shared_preamble, Mode};
 use crate::prompts;
 use crate::registry;
-use crate::tools::{self, ToolSpec};
+use crate::tools;
 
 const MAX_LLM_RETRIES: u32 = 3;
 
@@ -25,12 +26,12 @@ pub struct Agent {
     pub mode: Mode,
     pub model: String,
     pub llm: LlmClient,
-    pub messages: Vec<ChatMessage>,
-    pub tools: Vec<ToolSpec>,
+    /// Owns the system prompt, conversation turns, tool definitions, and the
+    /// context window accounting. Shared with the control socket so `/context`
+    /// can measure it on demand; the agent never touches the message vector.
+    pub context: Arc<RwLock<ContextComposer>>,
     pub tokens_used: i64,
-    pub last_prompt_tokens: i64,
     pub token_limit: i64,
-    pub context_window: i64,
     pub started: Instant,
     pub deadline: Instant,
     pub depth: u32,
@@ -63,6 +64,27 @@ pub struct AgentParams {
     pub interactive: bool,
     pub ocd: bool,
     pub control: Option<Arc<Control>>,
+    /// The shared, live context. Built before the control socket so `/context`
+    /// can read it directly; the agent writes to it as the conversation grows.
+    pub context: Arc<RwLock<ContextComposer>>,
+}
+
+/// Build the initial context for a mode: system prompt, tools, and window.
+/// Called before the control socket exists so both it and the agent share one
+/// composer.
+pub fn build_context(
+    cfg: &Config,
+    db: &Db,
+    mode: Mode,
+    ocd: bool,
+) -> Result<Arc<RwLock<ContextComposer>>> {
+    let model = cfg.model_for_mode(mode);
+    let window = cfg.limits_for_model(&model).context_window;
+    let system = build_system(db, mode, ocd)?;
+    let tools = tools::specs_for(mode, ocd);
+    Ok(Arc::new(RwLock::new(ContextComposer::new(
+        system, tools, window,
+    ))))
 }
 
 impl Agent {
@@ -79,14 +101,13 @@ impl Agent {
             interactive,
             ocd,
             control,
+            context,
         } = params;
         // The model is derived here, not passed in, so `Agent` and `set_mode`
         // share one source of truth for model selection.
         let model = cfg.model_for_mode(mode);
         let limits = cfg.limits_for_model(&model);
         let llm = LlmClient::new(&cfg, &model)?;
-        let tools = tools::specs_for(mode, ocd);
-        let system = build_system(&db, mode, ocd)?;
         db.instance_start(
             &instance_id,
             mode.as_str(),
@@ -119,12 +140,9 @@ impl Agent {
             mode,
             model,
             llm,
-            messages: vec![ChatMessage::system(system)],
-            tools,
+            context,
             tokens_used: 0,
-            last_prompt_tokens: 0,
             token_limit: limits.token_limit,
-            context_window: limits.context_window,
             started: Instant::now(),
             deadline,
             depth,
@@ -156,11 +174,7 @@ impl Agent {
 
     pub fn refresh_system_prompt(&mut self) -> Result<()> {
         let system = self.compose_system()?;
-        if let Some(first) = self.messages.first_mut() {
-            first.content = system;
-        } else {
-            self.messages.push(ChatMessage::system(system));
-        }
+        self.context.write().unwrap().set_system(system);
         Ok(())
     }
 
@@ -208,20 +222,23 @@ impl Agent {
         self.model = self.cfg.model_for_mode(mode);
         let limits = self.cfg.limits_for_model(&self.model);
         self.token_limit = limits.token_limit;
-        self.context_window = limits.context_window;
         self.llm = LlmClient::new(&self.cfg, &self.model)?;
-        self.tools = tools::specs_for(mode, self.ocd);
+        // The composer swaps tools, system prompt, and window together.
+        let tools = tools::specs_for(mode, self.ocd);
+        let system = self.compose_system()?;
+        self.context
+            .write()
+            .unwrap()
+            .switch_mode(tools, system, limits.context_window);
         self.db.conn.execute(
             "UPDATE instances SET mode=? WHERE id=?",
             params![mode.as_str(), self.instance_id],
         )?;
-        self.refresh_system_prompt()?;
         self.events.mode(mode.as_str(), &self.model);
         Ok(())
     }
 
-    /// Append a message to the in-memory conversation and the persistent log.
-    pub fn log(&mut self, msg: ChatMessage) -> Result<()> {
+    fn persist(&mut self, msg: &ChatMessage) -> Result<()> {
         match msg.role.as_str() {
             "user" => self.events.user(&msg.content),
             "assistant" => {
@@ -253,7 +270,26 @@ impl Agent {
             msg.reasoning_content.as_deref(),
         )?;
         self.seq += 1;
-        self.messages.push(msg);
+        Ok(())
+    }
+
+    pub fn log(&mut self, msg: ChatMessage) -> Result<()> {
+        self.persist(&msg)?;
+        self.context.write().unwrap().push(msg);
+        Ok(())
+    }
+
+    pub fn log_tool_result(
+        &mut self,
+        tool_call_id: &str,
+        content: impl Into<String>,
+    ) -> Result<()> {
+        let msg = ChatMessage::tool_result(tool_call_id, content);
+        self.persist(&msg)?;
+        self.context
+            .write()
+            .unwrap()
+            .push_tool_result(tool_call_id, msg.content);
         Ok(())
     }
 
@@ -314,13 +350,20 @@ impl Agent {
             }
             self.maybe_compact()?;
 
-            let tools_json: Vec<Value> = self.tools.iter().map(|t| t.to_json()).collect();
-            let resp = match self.llm.chat(&self.messages, &tools_json) {
+            let result = {
+                let ctx = self.context.read().unwrap();
+                let tools_json = ctx.tools_json();
+                self.llm.chat(ctx.messages(), &tools_json)
+            };
+            let resp = match result {
                 Ok(r) => r,
                 Err(e) => return Ok(self.fail(format!("LLM request failed: {e:#}"))),
             };
             self.tokens_used += resp.prompt_tokens + resp.completion_tokens;
-            self.last_prompt_tokens = resp.prompt_tokens;
+            self.context
+                .write()
+                .unwrap()
+                .set_last_prompt_tokens(resp.prompt_tokens);
             self.events
                 .tokens(self.tokens_used, resp.prompt_tokens, resp.completion_tokens);
             let _ = self
@@ -394,7 +437,7 @@ impl Agent {
                         dur
                     );
                 }
-                self.log(ChatMessage::tool_result(&tc.id, result))?;
+                self.log_tool_result(&tc.id, result)?;
             }
 
             iterations += 1;
@@ -458,62 +501,23 @@ impl Agent {
     }
 
     fn maybe_compact(&mut self) -> Result<()> {
-        let threshold = (self.context_window as f64 * self.cfg.compact_threshold) as i64;
-        let est = if self.last_prompt_tokens > 0 {
-            self.last_prompt_tokens
-        } else {
-            llm::estimate_messages(&self.messages)
+        let compacted = self.context.write().unwrap().maybe_compact(
+            self.cfg.compact_threshold,
+            self.cfg.compact_keep_recent,
+            &self.llm,
+        )?;
+        let Some(c) = compacted else {
+            return Ok(());
         };
-        if est >= threshold {
-            self.compact()?;
-        }
-        Ok(())
-    }
-
-    fn compact(&mut self) -> Result<()> {
-        let keep = self.cfg.compact_keep_recent.max(2);
-        if self.messages.len() <= keep + 2 {
-            return Ok(());
-        }
-        let mut split = self.messages.len() - keep;
-        // Never start the kept window with an orphaned tool result.
-        while split < self.messages.len() && self.messages[split].role == "tool" {
-            split += 1;
-        }
-        if split <= 1 {
-            return Ok(());
-        }
-        let before = llm::estimate_messages(&self.messages);
-        let middle: Vec<ChatMessage> = self.messages[1..split].to_vec();
-        let rendered = llm::truncate(render_messages(&middle), 120_000);
-        let summary_req = vec![
-            ChatMessage::system(
-                "You compress agent conversation history. Preserve decisions, file paths, \
-                 tool outcomes, open problems, requirements and ticket ids. Be dense and factual.",
-            ),
-            ChatMessage::user(format!(
-                "Summarize this conversation segment:\n\n{rendered}"
-            )),
-        ];
-        let resp = self.llm.chat(&summary_req, &[])?;
-        let summary = resp.message.content.trim().to_string();
-        self.tokens_used += resp.prompt_tokens + resp.completion_tokens;
-
-        let system = self.messages[0].clone();
-        let recent: Vec<ChatMessage> = self.messages[split..].to_vec();
-        let removed = (split - 1) as i64;
-        let mut new_msgs = vec![system];
-        new_msgs.push(ChatMessage::user(format!(
-            "[compacted summary of earlier conversation]\n{summary}"
-        )));
-        new_msgs.extend(recent);
-        self.messages = new_msgs;
-        let after = llm::estimate_messages(&self.messages);
-        self.last_prompt_tokens = 0;
+        self.tokens_used += c.prompt_tokens + c.completion_tokens;
         self.db
-            .compaction_add(&self.instance_id, removed, before, after, &summary)?;
-        eprintln!("[compact] removed {removed} messages ({before} -> {after} est tokens)");
-        self.events.compaction(removed, before, after, &summary);
+            .compaction_add(&self.instance_id, c.removed, c.before, c.after, &c.summary)?;
+        eprintln!(
+            "[compact] removed {} messages ({} -> {} est tokens)",
+            c.removed, c.before, c.after
+        );
+        self.events
+            .compaction(c.removed, c.before, c.after, &c.summary);
         Ok(())
     }
 
@@ -540,24 +544,4 @@ pub fn build_system(db: &Db, mode: Mode, ocd: bool) -> Result<String> {
         return Ok(base);
     }
     Ok(format!("{base}\n\n## Extended guidance\n{extended}"))
-}
-
-fn render_messages(msgs: &[ChatMessage]) -> String {
-    let mut out = String::new();
-    for m in msgs {
-        out.push_str(&format!("[{}] {}", m.role, m.content));
-        if !m.tool_calls.is_empty() {
-            let calls: Vec<String> = m
-                .tool_calls
-                .iter()
-                .map(|c| format!("{}({})", c.name, llm::truncate(c.arguments.clone(), 200)))
-                .collect();
-            out.push_str(&format!("\n  calls: {}", calls.join(", ")));
-        }
-        if let Some(id) = &m.tool_call_id {
-            out.push_str(&format!(" (tool_call_id={id})"));
-        }
-        out.push_str("\n\n");
-    }
-    out
 }

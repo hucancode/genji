@@ -8,6 +8,7 @@ While a top-level run is active, genji listens on a Unix-domain socket
 genji list           # find the instance id
 genji instruct <id> "focus on the parser first; ignore the docs for now"
 genji inspect <id>   # brief summary
+genji context <id>   # full context that will be sent to the model
 genji stop <id>      # ask for a graceful stop
 genji stop id1,id2   # several ids (comma-separated or spaced)
 genji stop all       # every registered instance
@@ -27,6 +28,10 @@ left by a crash is detected and replaced automatically.
    printf '/ping\n'   | nc -U "$SOCK"        # -> pong
    # current status
    printf '/status\n' | nc -U "$SOCK"        # -> status: idle
+   # the full context about to be sent to the model (messages + tools)
+   printf '/context\n' | nc -U "$SOCK"
+   # token breakdown of that context
+   printf '/context stats\n' | nc -U "$SOCK"
    # inject an instruction (any line not starting with "/")
    printf 'focus on the parser first\n' | nc -U "$SOCK"
    # -> queued (1 pending)
@@ -37,6 +42,24 @@ left by a crash is detected and replaced automatically.
    # graceful stop
    printf '/stop\n'   | nc -U "$SOCK"        # -> stopping
  ```
+
+## Inspecting the context
+
+`/context` returns the live context the agent is about to send on its next
+model call: a JSON object with `context_window`, `last_prompt_tokens`, the
+`messages` array (system prompt first), and the `tools` array. It is a direct
+read of the composer — no token estimates and no cached copy. `genji context
+<id>` prints this snapshot, pretty-printed.
+
+`/context stats` additionally computes the token breakdown: `total_tokens`,
+`context_window`, `percent`, `system_prompt_tokens`, `system_tools_tokens`, and
+`turn_messages_tokens`. `genji inspect <id>` asks for this for a live instance
+and shows it in brief. Context is pull-only: it is never broadcast to the event
+stream or trace.
+
+```bash
+genji context <id>              # full context snapshot (JSON) on stdout
+```
 
 ## Selecting a plan
 

@@ -109,8 +109,13 @@ genji instruct <id> "focus on the parser"
 (including a subagent) whose trace still exists. `inspect` prints a single JSON
 object to stdout and a short human summary to stderr — no trace. It reports the
 trace path, event count, whether the run ended, and, when available, the
-`instance_start` metadata (workspace, mode, model, parent, task) plus the live
+`instance_start` metadata (workspace, mode, model, parent, task) and the live
 instance fields (pid, uptime, status).
+
+For a **live** instance it also asks the control socket for the current context
+(`/context`) and adds a brief token/percentage breakdown (system prompt, system
+tools, turn messages). Context is pull-only: it is never written to the event
+trace, so a finished run has no context summary.
 
 ```bash
 genji inspect 7ab121              # by live instance id
@@ -121,6 +126,10 @@ genji inspect 18d9ef8d77430f7e    # by finished instance id (or unique prefix)
 # trace:   ~/.genji/events/18d9ef8d77430f7e.jsonl
 # events:  12 (ended)
 # mode:    build  model: qwen2.5-coder-7b
+# context: 1234 / 32768 tokens (3.8%)
+#   system prompt: 500 (1.5%)
+#   system tools: 2000 (6.1%)
+#   turn messages: 2734 (8.3%)
 ```
 
 Errors (unknown ids, unreachable sockets, missing arguments) go to stderr with a

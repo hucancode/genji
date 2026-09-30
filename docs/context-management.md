@@ -1,5 +1,27 @@
 # Context management
 
+## Composition and budget
+
+The prompt sent to the model has three parts: the **system prompt** (shared +
+mode + OCD + extended guidance, plus any active plan), the **system tools** (the
+tool definitions for the mode), and the **turn messages** (the conversation).
+`ContextComposer` owns all three and the operations that shape them: pushing
+messages and tool results, switching mode, compaction, and stats.
+
+Inspect the current context:
+
+- **Live snapshot:** `genji context <id>` sends `/context` over the control
+  socket and prints the live prompt the model will receive next — the system
+  prompt, tool definitions, conversation turns, and window size — read directly
+  from the composer, with no token computation.
+- **Size breakdown:** `/context stats` (used by `genji inspect <id>`) computes
+  the token breakdown: size and percentage of the window for the system prompt,
+  system tools, and turn messages. It is measured on request by walking the
+  live context strings: no cached counters, no message cloning.
+- **`genji inspect <id>`:** for a live instance, `inspect` asks the control
+  socket for the breakdown and prints it in brief. Context is pull-only: it is
+  never written to the event trace, so a finished run has no summary.
+
 ## Auto compaction
 
 Before each model call, if the last reported prompt size exceeds

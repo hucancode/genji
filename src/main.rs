@@ -1,5 +1,6 @@
 mod agent;
 mod config;
+mod context;
 mod control;
 mod db;
 mod events;
@@ -16,7 +17,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use agent::{Agent, AgentParams};
 use config::Config;
@@ -106,6 +107,11 @@ enum Command {
         id: String,
         /// Plan slug (the `<slug>.md` file under the plans directory).
         slug: String,
+    },
+    /// Show the context that will be sent to the model (`/context`).
+    Context {
+        /// Instance id (see `genji list`).
+        id: String,
     },
     Inspect {
         /// Instance id (see `genji list`).
@@ -226,6 +232,7 @@ struct RunRequest {
     ocd: bool,
     quiet: bool,
     control: Option<Arc<control::Control>>,
+    context: Arc<RwLock<context::ContextComposer>>,
 }
 
 fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<String> {
@@ -240,6 +247,7 @@ fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<Str
         ocd,
         quiet,
         control,
+        context,
     } = req;
     if !quiet {
         let model = cfg.model_for_mode(mode);
@@ -263,6 +271,7 @@ fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<Str
         interactive,
         ocd,
         control,
+        context,
     })?;
     agent.add_user(&task)?;
     let report = agent.run_loop()?;
@@ -283,6 +292,7 @@ fn run_cycle(req: RunRequest) -> Result<String> {
         ocd,
         quiet,
         control,
+        context,
     } = req;
     if !quiet {
         eprintln!(
@@ -305,6 +315,7 @@ fn run_cycle(req: RunRequest) -> Result<String> {
         interactive,
         ocd,
         control,
+        context,
     })?;
     agent.add_user(&task)?;
 
@@ -668,6 +679,18 @@ fn cmd_setplan(id: &str, slug: &str) -> Result<()> {
     Ok(())
 }
 
+/// `genji context <id>` — dump the live context the model will receive next:
+/// the system prompt, tool definitions, and conversation turns. stdout is the
+/// snapshot JSON, read directly from the running composer.
+fn cmd_context(id: &str) -> Result<()> {
+    let inst = registry::find(id)?;
+    let resp = control::send(Path::new(&inst.control_socket), "/context")?;
+    let value: serde_json::Value = serde_json::from_str(&resp)
+        .with_context(|| format!("unexpected /context reply: {resp}"))?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
 /// Resolve an instance id (exact, else a unique prefix) to its trace file.
 fn find_trace(instance: &str) -> Result<std::path::PathBuf> {
     let dir = registry::events_dir();
@@ -768,6 +791,15 @@ fn is_instance_end(line: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Ask a live instance for its computed context size breakdown. Returns `None`
+/// when the instance is not answering or has not built a snapshot yet. Context
+/// is pull-only: `genji inspect` requests it, it is never broadcast to the trace.
+fn query_context(socket: &str) -> Option<context::ContextInfo> {
+    let reply = control::send(Path::new(socket), "/context stats").ok()?;
+    let value: serde_json::Value = serde_json::from_str(&reply).ok()?;
+    Some(context::ContextInfo::from_json(&value))
+}
+
 /// `genji inspect <id>` — a brief summary of an instance.
 ///
 /// stdout is a single JSON object; the human-readable view goes to stderr. Use
@@ -782,6 +814,10 @@ fn cmd_inspect(id: &str) -> Result<()> {
         .instance
         .as_ref()
         .map(|i| query_status(&i.control_socket));
+    let context = target
+        .instance
+        .as_ref()
+        .and_then(|i| query_context(&i.control_socket));
 
     let mut obj = json!({
         "type": "instance",
@@ -791,6 +827,9 @@ fn cmd_inspect(id: &str) -> Result<()> {
         "ended": ended,
     });
     let map = obj.as_object_mut().expect("object");
+    if let Some(info) = &context {
+        map.insert("context".into(), info.to_json());
+    }
     if let Some(s) = &start {
         for key in ["workspace", "mode", "model", "parent", "depth", "task"] {
             if let Some(v) = s.get(key) {
@@ -836,6 +875,11 @@ fn cmd_inspect(id: &str) -> Result<()> {
     if let Some(st) = &status {
         eprintln!("status:  {st}");
     }
+    if let Some(info) = &context {
+        for line in info.summary().lines() {
+            eprintln!("{line}");
+        }
+    }
     Ok(())
 }
 
@@ -852,6 +896,7 @@ fn main() -> Result<()> {
             return cmd_instruct(id, &text);
         }
         Some(Command::Setplan { id, slug }) => return cmd_setplan(id, slug),
+        Some(Command::Context { id }) => return cmd_context(id),
         Some(Command::Inspect { id }) => return cmd_inspect(id),
         Some(Command::Reset { yes }) => {
             let workspace = match &cli.workspace {
@@ -947,6 +992,10 @@ fn main() -> Result<()> {
     // for the active model via `cfg.limits_for_model`, so a profile or model
     // switch carries its own budget. Nothing to patch globally here.
 
+    // Build the context before the control socket so both share one composer:
+    // the agent writes to it, `/context` takes a read guard and measures it.
+    let context = agent::build_context(&cfg, &db, start_mode, ocd)?;
+
     // Top-level runs open a control socket so instructions can be injected
     // mid-run; subagents never do. Controllable runs also register themselves so
     // `genji list`/`stop`/`instruct`/`inspect` can find them from anywhere.
@@ -957,6 +1006,7 @@ fn main() -> Result<()> {
         let c = control::Control::start(
             cfg.control_path(&workspace),
             cfg.plans_path(&workspace),
+            context.clone(),
         )?;
         if !quiet {
             eprintln!("[control] listening on {}", c.path.display());
@@ -1013,6 +1063,7 @@ fn main() -> Result<()> {
         ocd,
         quiet,
         control: control.clone(),
+        context,
     };
     let report = if cycle {
         run_cycle(request)?

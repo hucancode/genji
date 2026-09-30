@@ -146,9 +146,10 @@ pub fn ls(agent: &mut Agent, args: &Value) -> Result<String> {
     if !root.exists() {
         bail!("path does not exist: {}", root.display());
     }
-    let recursive = opt_bool(args, "recursive").unwrap_or(false);
     let show_hidden = opt_bool(args, "show_hidden").unwrap_or(false);
-    let max_depth = opt_i64(args, "max_depth").unwrap_or(if recursive { 6 } else { 1 });
+    // max_depth is the number of recursion levels below `path`; 0 means
+    // non-recursive (list only immediate children).
+    let max_depth = opt_i64(args, "max_depth").unwrap_or(0).max(0);
 
     let mut builder = ignore::WalkBuilder::new(&root);
     builder
@@ -159,7 +160,7 @@ pub fn ls(agent: &mut Agent, args: &Value) -> Result<String> {
         .ignore(true)
         .parents(false)
         .require_git(false)
-        .max_depth(Some(max_depth.max(1) as usize));
+        .max_depth(Some((max_depth + 1) as usize));
 
     let mut lines: Vec<String> = Vec::new();
     let mut dirs = 0usize;
