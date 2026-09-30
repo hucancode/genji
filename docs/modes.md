@@ -8,7 +8,7 @@ own instructions.
 
 | Mode | Purpose | Writes state? |
 |------|---------|---------------|
-| `plan` | Produce an implementation plan | read/inspect by default; requirements/tickets only with OCD |
+| `plan` | Produce and persist an implementation plan | plans; requirements/tickets only with OCD |
 | `build` | Implement requested changes and verify | code; tickets only with OCD |
 | `explore` | Investigate and report; never touches the ticket system | read/inspect only |
 | `retro` | Query history and improve prompts/skills | prompt & skill editing |
@@ -41,6 +41,7 @@ The **OCD** column applies to `plan`/`build` only when the `--ocd` flag (or the
 | Tool | plan | build | explore | retro |
 |------|:----:|:-----:|:-------:|:-----:|
 | `read` `write` `edit` `ls` `bash` | ✓ | ✓ | ✓ | ✓ |
+| `plan_write` | ✓ |  |  |  |
 | `skill_load` | ✓ | ✓ | ✓ | ✓ |
 | `spawn` | ✓ | ✓ | ✓ |  |
 | `ticket_create` (OCD) | ✓ |  |  |  |
@@ -55,6 +56,27 @@ The **OCD** column applies to `plan`/`build` only when the `--ocd` flag (or the
 - `bash` runs `bash -c <command>` in the workspace with a timeout.
 - Tool results longer than `tool_result_max_bytes` are truncated (head + marker).
   See [Context management](context-management.md).
+
+---
+
+## Plans
+
+`plan` mode persists its plan with `plan_write` as a markdown file under
+`plans_dir` (default `.genji/plans/`), named `<title-slug>.md`. Writing the plan
+to disk (rather than only reporting it) means it outlives the run and can be
+reviewed, versioned, or reused. Call `plan_write` again with the same title to
+refine an existing plan.
+
+Without OCD the plan file is the only artifact. With
+[OCD](#ocd-requirements--tickets) on, plan mode *additionally* refines the
+requirements/tickets system, and the plan should stay consistent with it.
+
+A user can point a running agent at a specific plan with `/setplan <slug>`
+(or `genji setplan <id> <slug>`) in **any** mode. The selection is injected
+into the system prompt for the rest of the run: `plan` refines the file,
+`build` follows it and reports changes it needs. See
+[Mid-run instructions](control-socket.md#selecting-a-plan).
+
 
 ---
 

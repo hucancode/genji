@@ -219,6 +219,7 @@ pub struct Config {
     pub max_cycles: usize,
     pub db_path: String,
     pub requirements_dir: String,
+    pub plans_dir: String,
     pub skills_dir: String,
     pub control_socket: String,
     pub control_enabled: bool,
@@ -277,6 +278,7 @@ impl Default for Config {
             max_cycles: 30,
             db_path: ".genji/genji.db".into(),
             requirements_dir: ".genji/requirements".into(),
+            plans_dir: ".genji/plans".into(),
             skills_dir: ".genji/skills".into(),
             control_socket: ".genji/control.sock".into(),
             control_enabled: true,
@@ -329,6 +331,9 @@ impl Config {
 
     pub fn requirements_path(&self, workspace: &Path) -> PathBuf {
         self.workspace_path(workspace, &self.requirements_dir)
+    }
+    pub fn plans_path(&self, workspace: &Path) -> PathBuf {
+        self.workspace_path(workspace, &self.plans_dir)
     }
     pub fn skills_path(&self, workspace: &Path) -> PathBuf {
         self.workspace_path(workspace, &self.skills_dir)

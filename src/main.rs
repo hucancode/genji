@@ -10,6 +10,7 @@ mod prompts;
 mod registry;
 mod reqmd;
 mod tools;
+mod util;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -99,6 +100,13 @@ enum Command {
         #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
         instruction: Vec<String>,
     },
+    /// Point a running instance at a plan to follow/refine (`/setplan <slug>`).
+    Setplan {
+        /// Instance id (see `genji list`).
+        id: String,
+        /// Plan slug (the `<slug>.md` file under the plans directory).
+        slug: String,
+    },
     Inspect {
         /// Instance id (see `genji list`).
         id: String,
@@ -115,6 +123,7 @@ fn ensure_layout(cfg: &Config, workspace: &std::path::Path) -> Result<()> {
     for d in [
         cfg.requirements_path(workspace).join("stakeholder"),
         cfg.requirements_path(workspace).join("system"),
+        cfg.plans_path(workspace),
         cfg.skills_path(workspace),
     ] {
         std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
@@ -639,6 +648,26 @@ fn cmd_instruct(id: &str, instruction: &str) -> Result<()> {
     Ok(())
 }
 
+/// `genji setplan <id> <slug>` — select the plan a running instance follows.
+/// stdout is machine output (JSON); the human message goes to stderr.
+fn cmd_setplan(id: &str, slug: &str) -> Result<()> {
+    if slug.trim().is_empty() {
+        bail!("missing plan slug (usage: genji setplan <id> <slug>)");
+    }
+    let inst = registry::find(id)?;
+    let resp = control::send(
+        Path::new(&inst.control_socket),
+        &format!("/setplan {slug}"),
+    )?;
+    let message = status_text(&resp);
+    println!(
+        "{}",
+        serde_json::to_string(&json!({ "id": inst.id, "plan": slug, "message": message }))?
+    );
+    eprintln!("{message}");
+    Ok(())
+}
+
 /// Resolve an instance id (exact, else a unique prefix) to its trace file.
 fn find_trace(instance: &str) -> Result<std::path::PathBuf> {
     let dir = registry::events_dir();
@@ -822,6 +851,7 @@ fn main() -> Result<()> {
             let text = instruction.join(" ");
             return cmd_instruct(id, &text);
         }
+        Some(Command::Setplan { id, slug }) => return cmd_setplan(id, slug),
         Some(Command::Inspect { id }) => return cmd_inspect(id),
         Some(Command::Reset { yes }) => {
             let workspace = match &cli.workspace {
@@ -924,7 +954,10 @@ fn main() -> Result<()> {
     let control = if cli.no_control || !cfg.control_enabled {
         None
     } else {
-        let c = control::Control::start(cfg.control_path(&workspace))?;
+        let c = control::Control::start(
+            cfg.control_path(&workspace),
+            cfg.plans_path(&workspace),
+        )?;
         if !quiet {
             eprintln!("[control] listening on {}", c.path.display());
         }

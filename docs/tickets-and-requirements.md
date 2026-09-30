@@ -13,7 +13,8 @@ Requirements have two levels:
 Lifecycle: `active` → `met` (satisfied) or `removed`. The automatic cycle stops
 when it can no longer find any `active` requirement. Build mode deliberately
 cannot create/update requirements; it resolves tickets and reports. Plan mode
-owns requirement status.
+owns requirement status, and also persists its human-readable plan under
+`.genji/plans/` (see [Modes](modes.md#plans)).
 
 Requirements are persisted as markdown files under `.genji/requirements/`
 (`<id>-<slug>.md` inside a `stakeholder/` or `system/` subdirectory). Nothing is

@@ -25,7 +25,7 @@
 | `max_cycles` | `30` | Max plan/build cycles |
 | `max_subagent_depth` | `2` | Subagent nesting limit |
 | `db_path` | `.genji/genji.db` | SQLite database |
-| `requirements_dir` / `skills_dir` | `.genji/requirements` / `.genji/skills` | Content dirs |
+| `requirements_dir` / `plans_dir` / `skills_dir` | `.genji/requirements` / `.genji/plans` / `.genji/skills` | Content dirs |
 | `control_socket` | `.genji/control.sock` | Unix socket for mid-run steering |
 | `control_enabled` | `true` | Open the control socket for top-level runs |
 | `auto_ingest_requirements` | `true` | Load (and migrate legacy DB rows to) `.genji/requirements/**/*.md` on startup |
@@ -49,6 +49,8 @@ requirements/
 .genji/
   config.json              # runtime configuration (created on first run)
   genji.db                 # SQLite: instances, tickets, requirements, prompts, history
+  plans/
+    *.md                   # implementation plans written by plan mode
   skills/
     *.md                   # skills (frontmatter + body)
   control.sock             # Unix socket for mid-run steering (while running)

@@ -16,15 +16,20 @@ use std::time::Duration;
 /// - any other text -> queued as a user instruction
 /// - `/status` -> returns the agent's current status
 /// - `/stop` -> requests a graceful stop
+/// - `/setplan <slug>` -> follow/refine the plan `plans_dir/<slug>.md` (`off` clears)
 /// - `/ping` -> liveness check
 ///
 /// The server replies with one line and closes its write side.
 pub struct Control {
     pub path: PathBuf,
+    /// Resolved directory that holds plan files. Used by `/setplan` to decide
+    /// whether a plan already exists and should be read.
+    plans_dir: PathBuf,
     queue: Mutex<VecDeque<String>>,
     stop: AtomicBool,
     shutdown: AtomicBool,
     status: Mutex<String>,
+    plan: Mutex<Option<String>>,
 }
 
 /// Result of polling the control socket at a safe point in the run loop.
@@ -35,7 +40,7 @@ pub struct ControlPoll {
 }
 
 impl Control {
-    pub fn start(path: PathBuf) -> Result<Arc<Self>> {
+    pub fn start(path: PathBuf, plans_dir: PathBuf) -> Result<Arc<Self>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -58,10 +63,12 @@ impl Control {
         listener.set_nonblocking(true)?;
         let ctrl = Arc::new(Control {
             path: path.clone(),
+            plans_dir,
             queue: Mutex::new(VecDeque::new()),
             stop: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             status: Mutex::new("starting".to_string()),
+            plan: Mutex::new(None),
         });
         let c = ctrl.clone();
         thread::Builder::new()
@@ -96,6 +103,16 @@ impl Control {
         self.stop.load(Ordering::SeqCst)
     }
 
+    /// The plan slug selected with `/setplan`, if any. The agent polls this so a
+    /// user can point a running run at a specific plan without restarting it.
+    pub fn active_plan(&self) -> Option<String> {
+        self.plan.lock().unwrap().clone()
+    }
+
+    fn set_plan(&self, slug: Option<String>) {
+        *self.plan.lock().unwrap() = slug;
+    }
+
     pub fn set_status(&self, s: impl Into<String>) {
         *self.status.lock().unwrap() = s.into();
     }
@@ -123,6 +140,34 @@ fn handle(mut stream: UnixStream, c: &Control) -> Result<()> {
     } else if line == "/stop" {
         c.stop.store(true, Ordering::SeqCst);
         "stopping".to_string()
+    } else if line == "/setplan" || line == "/setplan " {
+        "error: usage: /setplan <slug>".to_string()
+    } else if let Some(rest) = line.strip_prefix("/setplan ") {
+        let slug = rest.trim();
+        if slug.is_empty() {
+            "error: usage: /setplan <slug>".to_string()
+        } else if slug.eq_ignore_ascii_case("off") {
+            c.set_plan(None);
+            "plan cleared".to_string()
+        } else if !valid_plan_slug(slug) {
+            format!("error: invalid plan slug `{slug}` (use letters, digits, '-' or '_')")
+        } else {
+            c.set_plan(Some(slug.to_string()));
+            // An existing, non-empty plan is read and refined by the agent; a
+            // missing or empty one is only pointed at, so `plan_write` creates
+            // or fills it later without an instruction to follow yet.
+            let file = c.plans_dir.join(format!("{slug}.md"));
+            let mut q = c.queue.lock().unwrap();
+            if let Some(instruction) = plan_instruction(&file, slug) {
+                q.push_back(instruction);
+                format!(
+                    "plan set to {slug} ({} pending, existing plan queued)",
+                    q.len()
+                )
+            } else {
+                format!("plan set to {slug} (empty; awaiting plan content)")
+            }
+        }
     } else if line == "/ping" {
         "pong".to_string()
     } else {
@@ -135,6 +180,32 @@ fn handle(mut stream: UnixStream, c: &Control) -> Result<()> {
     let _ = stream.flush();
     let _ = stream.shutdown(Shutdown::Write);
     Ok(())
+}
+
+/// Build the instruction queued when `/setplan` selects a plan. Returns `None`
+/// when the plan file is missing or empty, in which case the selection only
+/// takes effect via the system prompt and `plan_write` fills the file later.
+fn plan_instruction(plan_file: &Path, slug: &str) -> Option<String> {
+    let existing = std::fs::read_to_string(plan_file).ok()?;
+    if existing.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Read the active plan `{slug}` at `{}` first and treat it as the source of \
+         truth for this work. Update the plan if the approach changes, then continue \
+         until it is satisfied.",
+        plan_file.display()
+    ))
+}
+
+/// A `/setplan` slug must be safe to use as a bare file name: letters, digits,
+/// `-` and `_`, at most 64 chars, and no path separators.
+fn valid_plan_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 64
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Client: connect to a running agent's control socket and send one line.
@@ -152,4 +223,49 @@ pub fn send(path: &Path, msg: &str) -> Result<String> {
     let mut resp = String::new();
     let _ = stream.read_to_string(&mut resp);
     Ok(resp.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{plan_instruction, valid_plan_slug};
+
+    fn temp_file(tag: &str, content: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("genji-control-{tag}-{nanos}.md"));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn existing_nonempty_plan_queues_instruction() {
+        let file = temp_file("plan", "# Plan\n\nDo the thing.");
+        let ins = plan_instruction(&file, "do-the-thing").expect("expected instruction");
+        assert!(ins.contains("do-the-thing"));
+        assert!(ins.contains(&file.display().to_string()));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn empty_or_missing_plan_queues_nothing() {
+        let empty = temp_file("empty", "   \n\t");
+        assert!(plan_instruction(&empty, "empty").is_none());
+        let _ = std::fs::remove_file(&empty);
+        assert!(
+            plan_instruction(std::path::Path::new("/nonexistent/genji-plan.md"), "x").is_none()
+        );
+    }
+
+    #[test]
+    fn plan_slugs_are_safe_file_names() {
+        assert!(valid_plan_slug("rate-limiting"));
+        assert!(valid_plan_slug("Plan_2"));
+        assert!(!valid_plan_slug(""));
+        assert!(!valid_plan_slug("../escape"));
+        assert!(!valid_plan_slug("a/b"));
+        assert!(!valid_plan_slug("has space"));
+        assert!(!valid_plan_slug(&"x".repeat(65)));
+    }
 }

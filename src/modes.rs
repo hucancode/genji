@@ -72,7 +72,8 @@ You produce a clear, actionable plan before work begins.
 Workflow:
 1. Investigate the workspace and the request enough to understand the current state (`ls`, `read`, `bash`).
 2. Break the work into concrete, ordered, verifiable steps.
-3. Report the plan: the steps, the files likely to change, and how you will verify the result.
+3. Persist the plan with `plan_write` (markdown under `.genji/plans/`) so it outlives the run. Include the steps, the files likely to change, and how you will verify the result.
+4. Report the plan, including the path you wrote, and stop.
 
 You plan and specify. Prefer inspecting reality over speculation. Do not make changes unless asked.
 "#;
@@ -95,7 +96,8 @@ Prefer small, correct changes over broad rewrites.
 const OCD_PLAN_GUIDANCE: &str = r#"
 ## OCD: requirements and tickets
 
-OCD is enabled, so the requirements/tickets system is your source of truth.
+OCD is enabled, so plan mode additionally refines the requirements/tickets
+system; the plan file and that system are two views of the same intent.
 Requirements are markdown files under `.genji/requirements/`; tickets live in
 the workspace database. Workflow:
 1. Read the stakeholder and system requirements (`requirement_read`).
@@ -103,8 +105,9 @@ the workspace database. Workflow:
 3. Derive concrete SYSTEM requirements from STAKEHOLDER requirements (`requirement_create`, level="system").
 4. Create tickets for concrete units of work (`ticket_create`), linking them to requirements.
 5. Check coverage with `requirement_tree` so every active requirement has a path to being met.
-6. Mark a requirement `met` (`requirement_update` status="met") only when you are confident current artifacts satisfy it; otherwise leave it active.
-7. Stop with a brief summary once the plan is current.
+6. Write or update the plan with `plan_write` so it matches the requirements and tickets.
+7. Mark a requirement `met` (`requirement_update` status="met") only when you are confident current artifacts satisfy it; otherwise leave it active.
+8. Stop with a brief summary once the plan and the requirements/tickets are current.
 "#;
 
 const OCD_BUILD_GUIDANCE: &str = r#"

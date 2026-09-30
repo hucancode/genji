@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::db::Db;
+use crate::util::slugify;
 
 #[derive(Debug, Clone)]
 pub struct Requirement {
@@ -66,29 +67,6 @@ fn infer_level(rel_path: &str) -> String {
         "system".into()
     } else {
         "stakeholder".into()
-    }
-}
-
-fn slug(title: &str) -> String {
-    let mut out = String::new();
-    let mut prev_dash = false;
-    for c in title.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-        if out.len() >= 60 {
-            break;
-        }
-    }
-    let s = out.trim_matches('-').to_string();
-    if s.is_empty() {
-        "requirement".into()
-    } else {
-        s
     }
 }
 
@@ -185,7 +163,7 @@ fn rel_to(workspace: &Path, path: &Path) -> String {
 fn path_for(cfg: &Config, workspace: &Path, r: &Requirement) -> PathBuf {
     cfg.requirements_path(workspace)
         .join(&r.level)
-        .join(format!("{}-{}.md", r.id, slug(&r.title)))
+        .join(format!("{}-{}.md", r.id, slugify(&r.title, "requirement")))
 }
 
 /// Load every requirement file. Files missing an `id` are assigned one and
@@ -466,10 +444,11 @@ pub fn sync(db: &Db, cfg: &Config, workspace: &Path) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_count, create, infer_level, load_all, load_by_id, remove, slug, split_frontmatter,
+        active_count, create, infer_level, load_all, load_by_id, remove, split_frontmatter,
         split_heading, update,
     };
     use crate::config::Config;
+    use crate::util::slugify;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -498,10 +477,10 @@ mod tests {
     #[test]
     fn slugging() {
         assert_eq!(
-            slug("Accept image files & URLs!"),
+            slugify("Accept image files & URLs!", "requirement"),
             "accept-image-files-urls"
         );
-        assert_eq!(slug(""), "requirement");
+        assert_eq!(slugify("", "requirement"), "requirement");
     }
 
     fn temp_workspace(tag: &str) -> std::path::PathBuf {

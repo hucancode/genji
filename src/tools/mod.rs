@@ -6,6 +6,7 @@ use crate::agent::Agent;
 use crate::modes::Mode;
 
 pub mod basic;
+pub mod plans;
 pub mod requirements;
 pub mod retro;
 pub mod skills;
@@ -147,6 +148,16 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["command"]
             }), basic::bash),
+            // ---- plans ----
+            tool("plan_write", PLAN, "Persist an implementation plan as markdown under the plans directory (default .genji/plans/). Reuse the same title to refine an existing plan.", json!({
+                "type":"object",
+                "properties":{
+                    "title":{"type":"string","description":"Short plan title; drives the file name and default heading"},
+                    "content":{"type":"string","description":"Plan body in markdown"},
+                    "path":{"type":"string","description":"Optional explicit path (default: plans_dir/<title-slug>.md)"}
+                },
+                "required":["title","content"]
+            }), plans::write),
             // ---- tickets (OCD only) ----
             ocd_tool("ticket_create", PLAN, "Create a work ticket.", json!({
                 "type":"object",
@@ -428,6 +439,19 @@ mod tests {
 
     fn is_ticket_or_requirement(name: &str) -> bool {
         name.starts_with("ticket_") || name.starts_with("requirement_")
+    }
+
+    #[test]
+    fn plan_write_is_plan_only() {
+        assert!(names(Mode::Plan, false).iter().any(|n| n == "plan_write"));
+        for mode in [Mode::Build, Mode::Explore, Mode::Retro] {
+            assert!(
+                !names(mode, false).iter().any(|n| n == "plan_write"),
+                "{mode:?} exposed plan_write"
+            );
+        }
+        // OCD does not change plan tool availability.
+        assert!(names(Mode::Plan, true).iter().any(|n| n == "plan_write"));
     }
 
     #[test]

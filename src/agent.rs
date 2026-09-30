@@ -39,6 +39,10 @@ pub struct Agent {
     /// OCD flag: enables the requirements/tickets tools and the auto plan/build
     /// cycle. Off means a plain coding agent with no ticket system.
     pub ocd: bool,
+    /// Plan slug selected by the user via the control socket (`/setplan`).
+    /// Surfaced in the system prompt so the model follows it; plan mode also
+    /// refines it.
+    pub active_plan: Option<String>,
     pub control: Option<Arc<Control>>,
     pub events: Arc<EventEmitter>,
     /// Set when a fatal LLM failure ends the run (see [`Agent::status`]).
@@ -127,6 +131,7 @@ impl Agent {
             seq: 0,
             interactive,
             ocd,
+            active_plan: None,
             control,
             events,
             failed: false,
@@ -150,13 +155,52 @@ impl Agent {
     }
 
     pub fn refresh_system_prompt(&mut self) -> Result<()> {
-        let system = build_system(&self.db, self.mode, self.ocd)?;
+        let system = self.compose_system()?;
         if let Some(first) = self.messages.first_mut() {
             first.content = system;
         } else {
             self.messages.push(ChatMessage::system(system));
         }
         Ok(())
+    }
+
+    /// The full system prompt: shared + core + OCD guidance + extended prompt,
+    /// plus a section for the user-selected plan when one is active. Works in
+    /// every mode; in build mode the model follows the plan rather than editing
+    /// it (`plan_write` is plan-only).
+    fn compose_system(&self) -> Result<String> {
+        let mut system = build_system(&self.db, self.mode, self.ocd)?;
+        if let Some(slug) = &self.active_plan {
+            let file = self
+                .cfg
+                .plans_path(&self.workspace)
+                .join(format!("{slug}.md"));
+            let path = self.display_path(&file);
+            let exists = std::fs::read_to_string(&file)
+                .map(|c| !c.trim().is_empty())
+                .unwrap_or(false);
+            let guidance = if exists {
+                if self.mode == Mode::Plan {
+                    "read it before acting, update it with `plan_write` when the approach \
+                     changes, and treat it as the source of truth."
+                } else {
+                    "read it before acting, treat it as the source of truth, and report any \
+                     changes it needs."
+                }
+            } else if self.mode == Mode::Plan {
+                "no plan file exists yet; create it with `plan_write` before acting, then \
+                 keep it up to date."
+            } else {
+                "no plan file exists yet; plan mode owns writing it, so continue and report \
+                 the plan it needs."
+            };
+            let verb = if exists { "Follow it" } else { "Populate it" };
+            system.push_str(&format!(
+                "\n\n## Active plan\n\n\
+                 The user selected plan `{slug}` at `{path}`. {verb}: {guidance}"
+            ));
+        }
+        Ok(system)
     }
 
     pub fn set_mode(&mut self, mode: Mode) -> Result<()> {
@@ -247,7 +291,7 @@ impl Agent {
 
             // Mid-run steering: safe here because all tool results from the
             // previous assistant turn have already been appended.
-            let poll = self.poll_control();
+            let poll = self.poll_control()?;
             if poll.stop {
                 let m = "(stopped by user via control socket)".to_string();
                 eprintln!("[control] {m}");
@@ -261,6 +305,10 @@ impl Agent {
                     self.tokens_used,
                     self.started.elapsed().as_secs()
                 );
+                let status = match &self.active_plan {
+                    Some(p) => format!("{status} plan={p}"),
+                    None => status,
+                };
                 c.set_status(status.clone());
                 self.events.status(&status);
             }
@@ -307,7 +355,7 @@ impl Agent {
                 self.log(assistant)?;
                 // An instruction may have arrived while producing this final
                 // message; if so, keep going rather than ending the run.
-                let poll = self.poll_control();
+                let poll = self.poll_control()?;
                 if poll.stop {
                     return Ok("(stopped by user via control socket)".to_string());
                 }
@@ -379,11 +427,22 @@ impl Agent {
         }
     }
 
-    fn poll_control(&mut self) -> ControlPoll {
+    fn poll_control(&mut self) -> Result<ControlPoll> {
         let Some(ctrl) = self.control.clone() else {
-            return ControlPoll::default();
+            return Ok(ControlPoll::default());
         };
         let mut out = ControlPoll::default();
+        // Adopt a plan selected via `/setplan` before draining instructions, so
+        // the instruction queued with it is answered with the plan in context.
+        let plan = ctrl.active_plan();
+        if plan != self.active_plan {
+            match &plan {
+                Some(p) => eprintln!("[control] following plan: {p}"),
+                None => eprintln!("[control] plan cleared"),
+            }
+            self.active_plan = plan;
+            self.refresh_system_prompt()?;
+        }
         for ins in ctrl.drain() {
             eprintln!(
                 "[control] injecting instruction: {}",
@@ -395,7 +454,7 @@ impl Agent {
         if ctrl.stop_requested() {
             out.stop = true;
         }
-        out
+        Ok(out)
     }
 
     fn maybe_compact(&mut self) -> Result<()> {
