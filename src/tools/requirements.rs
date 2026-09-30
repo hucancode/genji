@@ -63,8 +63,8 @@ pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
     let status = opt_str(args, "status");
     let reqs: Vec<Requirement> = reqmd::load_all(&agent.cfg, &agent.workspace)?
         .into_iter()
-        .filter(|r| level.as_deref().map_or(true, |l| r.level == l))
-        .filter(|r| status.as_deref().map_or(true, |s| r.status == s))
+        .filter(|r| level.as_deref().is_none_or(|l| r.level == l))
+        .filter(|r| status.as_deref().is_none_or(|s| r.status == s))
         .collect();
     if reqs.is_empty() {
         return Ok("(no requirements)".into());
