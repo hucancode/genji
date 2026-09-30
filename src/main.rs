@@ -104,6 +104,12 @@ enum Command {
         /// Instance id (see `genji list`).
         id: String,
     },
+    /// Delete the workspace database and start over with a clean one.
+    Reset {
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 fn ensure_layout(cfg: &Config, workspace: &std::path::Path) -> Result<()> {
@@ -527,6 +533,94 @@ fn cmd_stop(ids: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The SQLite database and its WAL/SHM companions.
+fn db_files(db_path: &Path) -> [PathBuf; 3] {
+    let base = db_path.as_os_str().to_string_lossy();
+    [
+        db_path.to_path_buf(),
+        PathBuf::from(format!("{base}-wal")),
+        PathBuf::from(format!("{base}-shm")),
+    ]
+}
+
+/// `genji reset` — delete the workspace database and recreate an empty one.
+///
+/// Only the SQLite database (and its WAL/SHM sidecars) is removed; the config,
+/// skills and requirements markdown files under `.genji/` are left untouched.
+fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
+    let cfg = Config::load_or_create(workspace)?;
+    let db_path = cfg.db_file(workspace);
+
+    // Deleting the database out from under a live instance would split its
+    // writes across the old (unlinked) and new files. Refuse instead.
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let here = canon(workspace);
+    for inst in registry::list_live() {
+        if canon(Path::new(&inst.workspace)) == here {
+            bail!(
+                "instance {} (pid {}) is running in this workspace; stop it first with `genji stop {}`",
+                inst.id,
+                inst.pid,
+                inst.id
+            );
+        }
+    }
+
+    let existing: Vec<PathBuf> = db_files(&db_path)
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect();
+
+    if existing.is_empty() {
+        eprintln!("[reset] no database at {}; nothing to delete", db_path.display());
+    } else {
+        if !assume_yes {
+            if !std::io::stdin().is_terminal() {
+                bail!(
+                    "refusing to delete {} without confirmation; re-run with --yes",
+                    db_path.display()
+                );
+            }
+            eprint!(
+                "Delete {} and start over? [y/N] ",
+                db_path.display()
+            );
+            use std::io::Write;
+            std::io::stderr().flush().ok();
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                eprintln!("[reset] aborted");
+                return Ok(());
+            }
+        }
+        for p in &existing {
+            std::fs::remove_file(p)
+                .with_context(|| format!("deleting {}", p.display()))?;
+        }
+        eprintln!("[reset] deleted {}", db_path.display());
+    }
+
+    // Recreate the schema so the next run starts from a clean, ready database.
+    let db = Db::open(&db_path)?;
+    db.init_schema()?;
+    prompts::seed_prompts(&db)?;
+    eprintln!("[reset] initialized clean database at {}", db_path.display());
+
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "workspace": workspace.display().to_string(),
+            "db": db_path.display().to_string(),
+            "deleted": existing
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+        }))?
+    );
+    Ok(())
+}
+
 /// `genji instruct <id> <instruction>` — queue text for a running instance.
 /// stdout is machine output (JSON); the human message goes to stderr.
 fn cmd_instruct(id: &str, instruction: &str) -> Result<()> {
@@ -727,6 +821,13 @@ fn main() -> Result<()> {
             return cmd_instruct(id, &text);
         }
         Some(Command::Inspect { id }) => return cmd_inspect(id),
+        Some(Command::Reset { yes }) => {
+            let workspace = match &cli.workspace {
+                Some(w) => PathBuf::from(w),
+                None => std::env::current_dir().context("resolving current directory")?,
+            };
+            return cmd_reset(&workspace, *yes);
+        }
         _ => {}
     }
     let workspace = match &cli.workspace {
