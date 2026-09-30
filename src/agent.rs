@@ -14,6 +14,8 @@ use crate::modes::{shared_preamble, Mode};
 use crate::prompts;
 use crate::tools::{self, ToolSpec};
 
+const MAX_LLM_RETRIES: u32 = 3;
+
 #[allow(dead_code)]
 pub struct Agent {
     pub cfg: Config,
@@ -38,6 +40,8 @@ pub struct Agent {
     pub verbose: bool,
     pub control: Option<Arc<Control>>,
     pub events: Arc<EventEmitter>,
+    /// Set when a fatal LLM failure ends the run (see [`Agent::status`]).
+    pub failed: bool,
 }
 
 impl Agent {
@@ -93,6 +97,7 @@ impl Agent {
             verbose,
             control,
             events,
+            failed: false,
         })
     }
 
@@ -200,6 +205,7 @@ impl Agent {
     /// limit is hit. Returns the final assistant text.
     pub fn run_loop(&mut self) -> Result<String> {
         let mut iterations = 0usize;
+        let mut llm_retries = 0u32;
         loop {
             if let Some(reason) = self.budget_exceeded() {
                 eprintln!("[budget] {reason}");
@@ -231,13 +237,7 @@ impl Agent {
             let tools_json: Vec<Value> = self.tools.iter().map(|t| t.to_json()).collect();
             let resp = match self.llm.chat(&self.messages, &tools_json) {
                 Ok(r) => r,
-                Err(e) => {
-                    let msg = format!("LLM error: {e:#}");
-                    eprintln!("[llm] {msg}");
-                    self.events.error(&msg);
-                    let _ = self.log(ChatMessage::assistant(&msg));
-                    return Ok(msg);
-                }
+                Err(e) => return Ok(self.fail(format!("LLM request failed: {e:#}"))),
             };
             self.tokens_used += resp.prompt_tokens + resp.completion_tokens;
             self.last_prompt_tokens = resp.prompt_tokens;
@@ -246,6 +246,23 @@ impl Agent {
             let _ = self
                 .db
                 .instance_set_tokens(&self.instance_id, self.tokens_used);
+
+            if resp.is_truncated() {
+                if llm_retries >= MAX_LLM_RETRIES {
+                    return Ok(self.fail(format!(
+                        "LLM request failed: response truncated {MAX_LLM_RETRIES} times"
+                    )));
+                }
+                llm_retries += 1;
+                let msg = format!(
+                    "LLM response truncated (finish_reason=length); retry {llm_retries}/{MAX_LLM_RETRIES}"
+                );
+                eprintln!("[llm] {msg}");
+                self.events.error(&msg);
+                std::thread::sleep(Duration::from_millis(500 * u64::from(llm_retries)));
+                continue;
+            }
+            llm_retries = 0;
 
             let assistant = resp.message.clone();
             if assistant.tool_calls.is_empty() {
@@ -313,6 +330,23 @@ impl Agent {
         }
     }
 
+    fn fail(&mut self, msg: String) -> String {
+        eprintln!("[llm] {msg}");
+        self.events.error(&msg);
+        let _ = self.log(ChatMessage::assistant(&msg));
+        self.failed = true;
+        msg
+    }
+
+    /// Run outcome to record with [`Agent::finish`].
+    pub fn status(&self) -> &'static str {
+        if self.failed {
+            "failed"
+        } else {
+            "done"
+        }
+    }
+
     fn poll_control(&mut self) -> ControlPoll {
         let Some(ctrl) = self.control.clone() else {
             return ControlPoll::default();
@@ -366,7 +400,9 @@ impl Agent {
                 "You compress agent conversation history. Preserve decisions, file paths, \
                  tool outcomes, open problems, requirements and ticket ids. Be dense and factual.",
             ),
-            ChatMessage::user(format!("Summarize this conversation segment:\n\n{rendered}")),
+            ChatMessage::user(format!(
+                "Summarize this conversation segment:\n\n{rendered}"
+            )),
         ];
         let resp = self.llm.chat(&summary_req, &[])?;
         let summary = resp.message.content.trim().to_string();

@@ -50,7 +50,11 @@ pub fn sync_skills(db: &Db, dir: &Path) -> Result<usize> {
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("skill").to_string();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("skill")
+            .to_string();
         let text = std::fs::read_to_string(&path)?;
         let (name, desc, body) = parse_skill(&text, &stem);
         let existing = db.skill_get(&name)?;
@@ -89,7 +93,9 @@ fn save_skill(
     agent
         .db
         .skill_upsert(name, &path.to_string_lossy(), description, content)?;
-    agent.db.skill_version_add(name, content, description, author, reason)?;
+    agent
+        .db
+        .skill_version_add(name, content, description, author, reason)?;
     write_skill_file(agent, name, description, content)?;
     Ok(())
 }
@@ -107,15 +113,14 @@ pub fn load(agent: &mut Agent, args: &Value) -> Result<String> {
             ))
         }
         None => {
-            let names: Vec<String> = agent
-                .db
-                .skill_list()?
-                .into_iter()
-                .map(|s| s.name)
-                .collect();
+            let names: Vec<String> = agent.db.skill_list()?.into_iter().map(|s| s.name).collect();
             bail!(
                 "skill `{name}` not found. available: {}",
-                if names.is_empty() { "(none)".into() } else { names.join(", ") }
+                if names.is_empty() {
+                    "(none)".into()
+                } else {
+                    names.join(", ")
+                }
             )
         }
     }
@@ -132,7 +137,11 @@ pub fn list(agent: &mut Agent, _args: &Value) -> Result<String> {
             "- {} (uses={}): {}\n",
             s.name,
             s.uses,
-            if s.description.is_empty() { "(no description)" } else { &s.description }
+            if s.description.is_empty() {
+                "(no description)"
+            } else {
+                &s.description
+            }
         ));
     }
     Ok(out)

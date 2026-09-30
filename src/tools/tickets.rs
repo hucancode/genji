@@ -35,9 +35,14 @@ pub fn create(agent: &mut Agent, args: &Value) -> Result<String> {
     let parent_id = opt_i64(args, "parent_id");
     let requirement_id = opt_i64(args, "requirement_id");
     let mode = agent.mode.as_str().to_string();
-    let id = agent
-        .db
-        .ticket_create(&title, &description, priority, parent_id, requirement_id, &mode)?;
+    let id = agent.db.ticket_create(
+        &title,
+        &description,
+        priority,
+        parent_id,
+        requirement_id,
+        &mode,
+    )?;
     Ok(format!("created ticket #{id}: {title}"))
 }
 

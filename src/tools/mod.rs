@@ -32,7 +32,11 @@ impl ToolSpec {
 }
 
 fn t(name: &'static str, description: &'static str, parameters: Value) -> ToolSpec {
-    ToolSpec { name, description, parameters }
+    ToolSpec {
+        name,
+        description,
+        parameters,
+    }
 }
 
 pub fn all_specs() -> Vec<ToolSpec> {
@@ -311,7 +315,10 @@ pub fn dispatch(agent: &mut Agent, name: &str, args: &Value) -> (String, bool) {
         other => Err(anyhow!("unknown or unavailable tool `{other}`")),
     };
     match res {
-        Ok(s) => (crate::llm::truncate(s, agent.cfg.tool_result_max_bytes), false),
+        Ok(s) => (
+            crate::llm::truncate(s, agent.cfg.tool_result_max_bytes),
+            false,
+        ),
         Err(e) => (
             crate::llm::truncate(format!("ERROR: {e:#}"), agent.cfg.tool_result_max_bytes),
             true,
@@ -329,7 +336,9 @@ pub fn req_str(args: &Value, key: &str) -> Result<String> {
 }
 
 pub fn opt_str(args: &Value, key: &str) -> Option<String> {
-    args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 pub fn opt_i64(args: &Value, key: &str) -> Option<i64> {

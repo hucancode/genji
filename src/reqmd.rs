@@ -10,10 +10,7 @@
 //!
 //! Metadata lives in simple `key: value` frontmatter (`id`, `level`, `status`,
 //! `parent`, `source`, `created`, `updated`); the text after the first
-//! `# Heading` is the requirement body. Nothing is written to SQLite.
-//!
-//! Files are keyed by their frontmatter `id`, which is also what tickets
-//! reference. Files that lack an `id` get one assigned and persisted on load.
+//! `# Heading` is the requirement body
 
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
@@ -214,7 +211,13 @@ pub fn load_all(cfg: &Config, workspace: &Path) -> Result<Vec<Requirement>> {
             max_id = max_id.max(id);
         }
         let rel = rel_to(workspace, &path);
-        raws.push(Raw { meta, heading, body, path, rel });
+        raws.push(Raw {
+            meta,
+            heading,
+            body,
+            path,
+            rel,
+        });
     }
 
     let mut next_id = max_id + 1;
@@ -452,7 +455,9 @@ fn migrate_from_db(db: &Db, cfg: &Config, workspace: &Path) -> Result<usize> {
 pub fn sync(db: &Db, cfg: &Config, workspace: &Path) -> Result<usize> {
     let migrated = migrate_from_db(db, cfg, workspace)?;
     if migrated > 0 {
-        eprintln!("[requirements] migrated {migrated} requirement(s) from the database to markdown");
+        eprintln!(
+            "[requirements] migrated {migrated} requirement(s) from the database to markdown"
+        );
     }
     Ok(load_all(cfg, workspace)?.len())
 }
@@ -474,7 +479,10 @@ mod tests {
 
     #[test]
     fn heading_extraction() {
-        assert_eq!(split_heading("intro\n# Real Title\nbody"), (Some("Real Title".into()), "intro\nbody".into()));
+        assert_eq!(
+            split_heading("intro\n# Real Title\nbody"),
+            (Some("Real Title".into()), "intro\nbody".into())
+        );
         assert_eq!(split_heading("no heading"), (None, "no heading".into()));
     }
 
@@ -488,7 +496,10 @@ mod tests {
 
     #[test]
     fn slugging() {
-        assert_eq!(slug("Accept image files & URLs!"), "accept-image-files-urls");
+        assert_eq!(
+            slug("Accept image files & URLs!"),
+            "accept-image-files-urls"
+        );
         assert_eq!(slug(""), "requirement");
     }
 
@@ -509,14 +520,26 @@ mod tests {
         let cfg = Config::default();
 
         let r1 = create(
-            &cfg, &ws, "stakeholder", "Cat Classifier", "Must classify cats.", None, "agent",
+            &cfg,
+            &ws,
+            "stakeholder",
+            "Cat Classifier",
+            "Must classify cats.",
+            None,
+            "agent",
         )
         .unwrap();
         assert_eq!(r1.id, 1);
         assert!(r1.path.exists());
 
         let r2 = create(
-            &cfg, &ws, "system", "Accept URLs", "Accept image URLs.", Some(1), "agent",
+            &cfg,
+            &ws,
+            "system",
+            "Accept URLs",
+            "Accept image URLs.",
+            Some(1),
+            "agent",
         )
         .unwrap();
         assert_eq!(r2.id, 2);
@@ -524,7 +547,14 @@ mod tests {
 
         // Editing the title renames the backing file.
         assert!(update(
-            &cfg, &ws, 2, Some("Accept Files and URLs"), None, Some("met"), None, None
+            &cfg,
+            &ws,
+            2,
+            Some("Accept Files and URLs"),
+            None,
+            Some("met"),
+            None,
+            None
         )
         .unwrap());
         let r2b = load_by_id(&cfg, &ws, 2).unwrap().unwrap();
@@ -538,7 +568,9 @@ mod tests {
         update(&cfg, &ws, 2, None, None, None, Some("stakeholder"), None).unwrap();
         let r2c = load_by_id(&cfg, &ws, 2).unwrap().unwrap();
         assert_eq!(r2c.level, "stakeholder");
-        assert!(r2c.source_path.starts_with(".genji/requirements/stakeholder/"));
+        assert!(r2c
+            .source_path
+            .starts_with(".genji/requirements/stakeholder/"));
 
         assert!(remove(&cfg, &ws, 2, false).unwrap());
         assert_eq!(active_count(&cfg, &ws).unwrap(), 1);
@@ -563,7 +595,10 @@ mod tests {
         assert_eq!(all[0].level, "system");
         // The id is persisted back into the file.
         let text = std::fs::read_to_string(dir.join("hand-written.md")).unwrap();
-        assert!(text.contains("id: 1"), "frontmatter should gain an id:\n{text}");
+        assert!(
+            text.contains("id: 1"),
+            "frontmatter should gain an id:\n{text}"
+        );
 
         let _ = std::fs::remove_dir_all(&ws);
     }

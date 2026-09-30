@@ -97,7 +97,12 @@ pub fn run_capture(
 }
 
 /// Convenience for running a shell command string via `bash -c`.
-pub fn run_bash(command: &str, cwd: &Path, timeout: Duration, max_read_bytes: usize) -> Result<ProcResult> {
+pub fn run_bash(
+    command: &str,
+    cwd: &Path,
+    timeout: Duration,
+    max_read_bytes: usize,
+) -> Result<ProcResult> {
     run_capture(
         "bash",
         &["-c".to_string(), command.to_string()],

@@ -65,7 +65,10 @@ pub fn instance(agent: &mut Agent, args: &Value) -> Result<String> {
         out.push_str(&format!("#{seq} [{role}] {snippet}\n"));
         if let Some(tc) = tc {
             if tc != "null" && !tc.is_empty() {
-                out.push_str(&format!("    tool_calls: {}\n", tc.chars().take(200).collect::<String>()));
+                out.push_str(&format!(
+                    "    tool_calls: {}\n",
+                    tc.chars().take(200).collect::<String>()
+                ));
             }
         }
     }
@@ -77,7 +80,9 @@ pub fn instance(agent: &mut Agent, args: &Value) -> Result<String> {
 
 pub fn messages(agent: &mut Agent, args: &Value) -> Result<String> {
     let limit = opt_i64(args, "limit").unwrap_or(50).clamp(1, 500);
-    let mut sql = String::from("SELECT instance_id,seq,role,substr(content,1,400),created_at FROM messages WHERE 1=1");
+    let mut sql = String::from(
+        "SELECT instance_id,seq,role,substr(content,1,400),created_at FROM messages WHERE 1=1",
+    );
     let mut p: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(s) = opt_str(args, "instance_id") {
         sql.push_str(" AND instance_id=?");

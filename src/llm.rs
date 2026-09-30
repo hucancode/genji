@@ -22,13 +22,25 @@ pub struct ToolCall {
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into(), ..Default::default() }
+        Self {
+            role: "system".into(),
+            content: content.into(),
+            ..Default::default()
+        }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into(), ..Default::default() }
+        Self {
+            role: "user".into(),
+            content: content.into(),
+            ..Default::default()
+        }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into(), ..Default::default() }
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+            ..Default::default()
+        }
     }
     pub fn tool_result(tool_call_id: &str, content: impl Into<String>) -> Self {
         Self {
@@ -88,6 +100,14 @@ pub struct LlmResponse {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub finish_reason: Option<String>,
+}
+
+impl LlmResponse {
+    /// True when the provider stopped early because it hit the output cap,
+    /// leaving the answer and/or tool calls incomplete.
+    pub fn is_truncated(&self) -> bool {
+        self.finish_reason.as_deref() == Some("length")
+    }
 }
 
 pub fn estimate_messages(messages: &[ChatMessage]) -> i64 {
@@ -160,7 +180,10 @@ impl LlmClient {
             "stream": false,
         });
         if let Some(obj) = body.as_object_mut() {
-            obj.insert(self.provider.max_tokens_field.clone(), json!(self.max_tokens));
+            obj.insert(
+                self.provider.max_tokens_field.clone(),
+                json!(self.max_tokens),
+            );
         }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
@@ -181,7 +204,11 @@ impl LlmClient {
                         break;
                     }
                     let backoff = Duration::from_millis(800 * (1u64 << attempt));
-                    eprintln!("[llm] retry {}/3 after error, sleeping {:?}", attempt + 1, backoff);
+                    eprintln!(
+                        "[llm] retry {}/3 after error, sleeping {:?}",
+                        attempt + 1,
+                        backoff
+                    );
                     std::thread::sleep(backoff);
                 }
             }
@@ -190,10 +217,7 @@ impl LlmClient {
     }
 
     fn post_once(&self, url: &str, body: &Value) -> Result<LlmResponse> {
-        let mut req = self
-            .agent
-            .post(url)
-            .set("Content-Type", "application/json");
+        let mut req = self.agent.post(url).set("Content-Type", "application/json");
 
         // Auth: local servers usually need none, so only send when we have a key.
         let key = self.provider.resolve_api_key();
@@ -255,10 +279,12 @@ fn is_retryable(e: &anyhow::Error) -> bool {
 }
 
 fn parse_response(value: &Value) -> Result<LlmResponse> {
-    let choice = value
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .ok_or_else(|| anyhow!("llm response has no choices: {}", truncate(value.to_string(), 400)))?;
+    let choice = value.get("choices").and_then(|c| c.get(0)).ok_or_else(|| {
+        anyhow!(
+            "llm response has no choices: {}",
+            truncate(value.to_string(), 400)
+        )
+    })?;
     let msg = choice.get("message").cloned().unwrap_or(Value::Null);
     let content = msg
         .get("content")
@@ -278,17 +304,28 @@ fn parse_response(value: &Value) -> Result<LlmResponse> {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("call_{i}"));
             let f = c.get("function").cloned().unwrap_or(Value::Null);
-            let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = f
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let arguments = match f.get("arguments") {
                 Some(Value::String(s)) => s.clone(),
                 Some(v) => v.to_string(),
                 None => "{}".into(),
             };
-            tool_calls.push(ToolCall { id, name, arguments });
+            tool_calls.push(ToolCall {
+                id,
+                name,
+                arguments,
+            });
         }
     }
     let usage = value.get("usage").cloned().unwrap_or(Value::Null);
-    let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+    let prompt_tokens = usage
+        .get("prompt_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     let completion_tokens = usage
         .get("completion_tokens")
         .and_then(|v| v.as_i64())
@@ -342,5 +379,20 @@ mod tests {
     fn encodes_query_values() {
         assert_eq!(url_encode("2024-10-21"), "2024-10-21");
         assert_eq!(url_encode("a b/c"), "a%20b%2Fc");
+    }
+
+    #[test]
+    fn detects_truncation() {
+        let mut resp = super::LlmResponse {
+            message: Default::default(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            finish_reason: Some("length".into()),
+        };
+        assert!(resp.is_truncated());
+        resp.finish_reason = Some("stop".into());
+        assert!(!resp.is_truncated());
+        resp.finish_reason = None;
+        assert!(!resp.is_truncated());
     }
 }

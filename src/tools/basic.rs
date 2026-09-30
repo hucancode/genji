@@ -8,8 +8,8 @@ use crate::proc;
 
 pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
     let path = agent.resolve_path(&req_str(args, "path")?);
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let offset = opt_i64(args, "offset").unwrap_or(1).max(1) as usize;
     let limit = opt_i64(args, "limit").unwrap_or(2000).max(1) as usize;
 
@@ -103,8 +103,8 @@ fn apply_edits(content: &str, edits: &[(String, String)], replace_all: bool) -> 
 
 pub fn edit(agent: &mut Agent, args: &Value) -> Result<String> {
     let path = agent.resolve_path(&req_str(args, "path")?);
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
 
     let replace_all = opt_bool(args, "replace_all").unwrap_or(false);
     let mut edits: Vec<(String, String)> = Vec::new();
@@ -214,7 +214,12 @@ pub fn bash(agent: &mut Agent, args: &Value) -> Result<String> {
     let res = proc::run_bash(&command, &cwd, timeout, cap)
         .with_context(|| format!("running command: {command}"))?;
     let mut out = String::new();
-    out.push_str(&format!("exit_code: {}\n", res.code.map(|c| c.to_string()).unwrap_or_else(|| "none".into())));
+    out.push_str(&format!(
+        "exit_code: {}\n",
+        res.code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "none".into())
+    ));
     if res.timed_out {
         out.push_str(&format!("[timed out after {}s]\n", timeout.as_secs()));
     }

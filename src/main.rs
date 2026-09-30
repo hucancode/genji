@@ -168,9 +168,11 @@ fn startup_action(explicit_task: Option<String>, active_requirements: i64) -> St
     Startup::Wait
 }
 
-/// Block until the user injects an instruction over the control socket (or asks
-/// to stop). Returns `None` if a stop was requested before any instruction.
-fn wait_for_instruction(control: &control::Control, id: &str, quiet: bool) -> Result<Option<String>> {
+fn wait_for_instruction(
+    control: &control::Control,
+    id: &str,
+    quiet: bool,
+) -> Result<Option<String>> {
     control.set_status("idle");
     if !quiet {
         eprintln!(
@@ -258,7 +260,8 @@ fn run_single(
     )?;
     agent.add_user(&task)?;
     let report = agent.run_loop()?;
-    agent.finish("done", &report)?;
+    let status = agent.status();
+    agent.finish(status, &report)?;
     Ok(report)
 }
 
@@ -312,9 +315,8 @@ fn run_cycle(
         let active = reqmd::active_count(&agent.cfg, &agent.workspace)?;
         events.cycle(cycle + 1, max_cycles, current.as_str(), active);
         if cycle > 0 && active == 0 {
-            last_report = format!(
-                "All requirements are met (0 active). Stopped after {cycle} cycle(s)."
-            );
+            last_report =
+                format!("All requirements are met (0 active). Stopped after {cycle} cycle(s).");
             if !quiet {
                 eprintln!("[cycle] {last_report}");
             }
@@ -353,13 +355,18 @@ fn run_cycle(
             eprintln!("[cycle] stop requested; ending cycle");
             break;
         }
+        if agent.failed {
+            eprintln!("[cycle] LLM failure; ending cycle");
+            break;
+        }
         current = match current {
             Mode::Plan => Mode::Build,
             Mode::Build => Mode::Plan,
             _ => Mode::Plan,
         };
     }
-    agent.finish("done", &last_report)?;
+    let status = agent.status();
+    agent.finish(status, &last_report)?;
     Ok(last_report)
 }
 
@@ -572,7 +579,10 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
         .collect();
 
     if existing.is_empty() {
-        eprintln!("[reset] no database at {}; nothing to delete", db_path.display());
+        eprintln!(
+            "[reset] no database at {}; nothing to delete",
+            db_path.display()
+        );
     } else {
         if !assume_yes {
             if !std::io::stdin().is_terminal() {
@@ -581,10 +591,7 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
                     db_path.display()
                 );
             }
-            eprint!(
-                "Delete {} and start over? [y/N] ",
-                db_path.display()
-            );
+            eprint!("Delete {} and start over? [y/N] ", db_path.display());
             use std::io::Write;
             std::io::stderr().flush().ok();
             let mut answer = String::new();
@@ -595,8 +602,7 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
             }
         }
         for p in &existing {
-            std::fs::remove_file(p)
-                .with_context(|| format!("deleting {}", p.display()))?;
+            std::fs::remove_file(p).with_context(|| format!("deleting {}", p.display()))?;
         }
         eprintln!("[reset] deleted {}", db_path.display());
     }
@@ -605,7 +611,10 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
     let db = Db::open(&db_path)?;
     db.init_schema()?;
     prompts::seed_prompts(&db)?;
-    eprintln!("[reset] initialized clean database at {}", db_path.display());
+    eprintln!(
+        "[reset] initialized clean database at {}",
+        db_path.display()
+    );
 
     println!(
         "{}",
@@ -707,9 +716,10 @@ fn resolve_target(id: &str) -> Result<TraceTarget> {
 /// Read a target's trace. A missing file is empty for a live instance.
 fn read_trace(target: &TraceTarget) -> Result<Option<String>> {
     if target.trace_path.exists() {
-        Ok(Some(std::fs::read_to_string(&target.trace_path).with_context(
-            || format!("reading event trace {}", target.trace_path.display()),
-        )?))
+        Ok(Some(
+            std::fs::read_to_string(&target.trace_path)
+                .with_context(|| format!("reading event trace {}", target.trace_path.display()))?,
+        ))
     } else if target.instance.is_some() {
         Ok(None)
     } else {
@@ -870,7 +880,10 @@ fn main() -> Result<()> {
         eprintln!("[genji] initialized workspace at {}", workspace.display());
         eprintln!("  config:       {}", Config::path_in(&workspace).display());
         eprintln!("  skills:       {}", cfg.skills_path(&workspace).display());
-        eprintln!("  requirements: {}", cfg.requirements_path(&workspace).display());
+        eprintln!(
+            "  requirements: {}",
+            cfg.requirements_path(&workspace).display()
+        );
         eprintln!("  db:           {}", cfg.db_file(&workspace).display());
         return Ok(());
     }

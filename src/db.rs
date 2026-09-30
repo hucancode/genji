@@ -100,7 +100,8 @@ fn r_row(r: &Row) -> rusqlite::Result<Requirement> {
     })
 }
 
-const REQ_COLS: &str = "id,level,title,body,status,parent_id,source,source_path,created_at,updated_at";
+const REQ_COLS: &str =
+    "id,level,title,body,status,parent_id,source,source_path,created_at,updated_at";
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
@@ -405,13 +406,14 @@ CREATE TABLE IF NOT EXISTS compactions (
 
     pub fn ticket_get(&self, id: i64) -> Result<Option<Ticket>> {
         let sql = format!("SELECT {TICKET_COLS} FROM tickets WHERE id=?");
-        Ok(self
-            .conn
-            .query_row(&sql, params![id], t_row)
-            .optional()?)
+        Ok(self.conn.query_row(&sql, params![id], t_row).optional()?)
     }
 
-    pub fn ticket_list(&self, status: Option<&str>, requirement_id: Option<i64>) -> Result<Vec<Ticket>> {
+    pub fn ticket_list(
+        &self,
+        status: Option<&str>,
+        requirement_id: Option<i64>,
+    ) -> Result<Vec<Ticket>> {
         let mut sql = format!("SELECT {TICKET_COLS} FROM tickets WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(s) = status {
@@ -430,7 +432,12 @@ CREATE TABLE IF NOT EXISTS compactions (
     }
 
     /// Transition a ticket. `status` is open|in_progress|resolved|closed.
-    pub fn ticket_set_status(&self, id: i64, status: &str, resolution: Option<&str>) -> Result<bool> {
+    pub fn ticket_set_status(
+        &self,
+        id: i64,
+        status: &str,
+        resolution: Option<&str>,
+    ) -> Result<bool> {
         let n = self.conn.execute(
             &format!(
                 "UPDATE tickets SET status=?, resolution=COALESCE(?,resolution), updated_at={NOW},
@@ -484,7 +491,12 @@ CREATE TABLE IF NOT EXISTS compactions (
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn question_ask(&self, requirement_id: Option<i64>, instance_id: &str, question: &str) -> Result<i64> {
+    pub fn question_ask(
+        &self,
+        requirement_id: Option<i64>,
+        instance_id: &str,
+        question: &str,
+    ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO requirement_questions(requirement_id,instance_id,question) VALUES(?,?,?)",
             params![requirement_id, instance_id, question],
@@ -502,7 +514,13 @@ CREATE TABLE IF NOT EXISTS compactions (
 
     // ---------------------------------------------------------------- skills
 
-    pub fn skill_upsert(&self, name: &str, path: &str, description: &str, content: &str) -> Result<i64> {
+    pub fn skill_upsert(
+        &self,
+        name: &str,
+        path: &str,
+        description: &str,
+        content: &str,
+    ) -> Result<i64> {
         self.conn.execute(
             &format!(
                 "INSERT INTO skills(name,path,description,content,uses) VALUES(?,?,?,?,0)
@@ -511,9 +529,11 @@ CREATE TABLE IF NOT EXISTS compactions (
             ),
             params![name, path, description, content],
         )?;
-        let id: i64 = self
-            .conn
-            .query_row("SELECT id FROM skills WHERE name=?", params![name], |r| r.get(0))?;
+        let id: i64 =
+            self.conn
+                .query_row("SELECT id FROM skills WHERE name=?", params![name], |r| {
+                    r.get(0)
+                })?;
         Ok(id)
     }
 
@@ -538,9 +558,9 @@ CREATE TABLE IF NOT EXISTS compactions (
     }
 
     pub fn skill_list(&self) -> Result<Vec<SkillRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id,name,path,description,content,uses FROM skills ORDER BY name",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id,name,path,description,content,uses FROM skills ORDER BY name")?;
         let rows = stmt.query_map([], |r| {
             Ok(SkillRow {
                 id: r.get(0)?,
@@ -559,10 +579,8 @@ CREATE TABLE IF NOT EXISTS compactions (
             "INSERT INTO skill_loads(instance_id,skill_name) VALUES(?,?)",
             params![instance_id, name],
         )?;
-        self.conn.execute(
-            "UPDATE skills SET uses=uses+1 WHERE name=?",
-            params![name],
-        )?;
+        self.conn
+            .execute("UPDATE skills SET uses=uses+1 WHERE name=?", params![name])?;
         Ok(())
     }
 
@@ -574,13 +592,11 @@ CREATE TABLE IF NOT EXISTS compactions (
         author: &str,
         reason: &str,
     ) -> Result<i64> {
-        let version: i64 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(MAX(version),0)+1 FROM skill_versions WHERE skill_name=?",
-                params![name],
-                |r| r.get(0),
-            )?;
+        let version: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(version),0)+1 FROM skill_versions WHERE skill_name=?",
+            params![name],
+            |r| r.get(0),
+        )?;
         self.conn.execute(
             "INSERT INTO skill_versions(skill_name,version,content,description,author,reason) VALUES(?,?,?,?,?,?)",
             params![name, version, content, description, author, reason],
@@ -636,7 +652,10 @@ CREATE TABLE IF NOT EXISTS compactions (
             params![mode],
             |r| r.get(0),
         )?;
-        self.conn.execute("UPDATE prompt_versions SET active=0 WHERE mode=?", params![mode])?;
+        self.conn.execute(
+            "UPDATE prompt_versions SET active=0 WHERE mode=?",
+            params![mode],
+        )?;
         self.conn.execute(
             "INSERT INTO prompt_versions(mode,version,content,author,reason,active) VALUES(?,?,?,?,?,1)",
             params![mode, version, content, author, reason],
@@ -656,7 +675,10 @@ CREATE TABLE IF NOT EXISTS compactions (
         if exists.is_none() {
             return Ok(false);
         }
-        self.conn.execute("UPDATE prompt_versions SET active=0 WHERE mode=?", params![mode])?;
+        self.conn.execute(
+            "UPDATE prompt_versions SET active=0 WHERE mode=?",
+            params![mode],
+        )?;
         self.conn.execute(
             "UPDATE prompt_versions SET active=1 WHERE mode=? AND version=?",
             params![mode, version],
