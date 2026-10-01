@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -45,12 +45,12 @@ impl Mode {
         !matches!(self, Mode::Retro)
     }
 
-    /// Extra system-prompt guidance appended when the OCD flag is on. Empty for
+    /// Extra system-prompt guidance appended when the Formal flag is on. Empty for
     /// modes that never touch the requirements/tickets system.
-    pub fn ocd_guidance(&self) -> &'static str {
+    pub fn formal_guidance(&self) -> &'static str {
         match self {
-            Mode::Plan => OCD_PLAN_GUIDANCE,
-            Mode::Build => OCD_BUILD_GUIDANCE,
+            Mode::Plan => FORMAL_PLAN_GUIDANCE,
+            Mode::Build => FORMAL_BUILD_GUIDANCE,
             _ => "",
         }
     }
@@ -91,13 +91,13 @@ Workflow:
 Prefer small, correct changes over broad rewrites.
 "#;
 
-// OCD is an opt-in flag (not a mode): when it is on, plan/build gain the
+// Formal is an opt-in flag (not a mode): when it is on, plan/build gain the
 // requirements/tickets surface and the run auto-cycles between them. These
-// guidance blocks are appended to the matching core prompt only when OCD is on.
-const OCD_PLAN_GUIDANCE: &str = r#"
-## OCD: requirements and tickets
+// guidance blocks are appended to the matching core prompt only when Formal is on.
+const FORMAL_PLAN_GUIDANCE: &str = r#"
+## Formal: requirements and tickets
 
-OCD is enabled, so plan mode additionally refines the requirements/tickets
+Formal is enabled, so plan mode additionally refines the requirements/tickets
 system; the plan file and that system are two views of the same intent.
 Requirements are markdown files under `.genji/requirements/`; open tickets are
 markdown files under `.genji/tickets/` (resolved ones are archived in the
@@ -112,10 +112,10 @@ database). Workflow:
 8. Stop with a brief summary once the plan and the requirements/tickets are current.
 "#;
 
-const OCD_BUILD_GUIDANCE: &str = r#"
-## OCD: requirements and tickets
+const FORMAL_BUILD_GUIDANCE: &str = r#"
+## Formal: requirements and tickets
 
-OCD is enabled. Open tickets are your work queue and the requirements are the
+Formal is enabled. Open tickets are your work queue and the requirements are the
 success criteria. Workflow:
 1. Read the requirements and open tickets (`requirement_read`, `ticket_read`).
 2. Claim the highest-value open ticket with `ticket_claim` (or read a specific one).

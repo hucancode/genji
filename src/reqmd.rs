@@ -13,13 +13,12 @@
 //! `# Heading` is the requirement body. The level (`stakeholder` or `system`)
 //! is read from the frontmatter and defaults to `stakeholder` when absent.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
-use crate::db::Db;
 use crate::util::slugify;
 
 #[derive(Debug, Clone)]
@@ -66,18 +65,18 @@ fn valid_level(v: &str) -> Option<String> {
 /// Split leading `---` frontmatter from the markdown body.
 fn split_frontmatter(text: &str) -> (BTreeMap<String, String>, String) {
     let mut meta = BTreeMap::new();
-    if let Some(rest) = text.strip_prefix("---\n") {
-        if let Some(idx) = rest.find("\n---") {
-            let fm = &rest[..idx];
-            let after = &rest[idx + 4..];
-            for line in fm.lines() {
-                if let Some((k, v)) = line.split_once(':') {
-                    meta.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
-                }
+    if let Some(rest) = text.strip_prefix("---\n")
+        && let Some(idx) = rest.find("\n---")
+    {
+        let fm = &rest[..idx];
+        let after = &rest[idx + 4..];
+        for line in fm.lines() {
+            if let Some((k, v)) = line.split_once(':') {
+                meta.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
             }
-            let body = after.strip_prefix('\n').unwrap_or(after);
-            return (meta, body.to_string());
         }
+        let body = after.strip_prefix('\n').unwrap_or(after);
+        return (meta, body.to_string());
     }
     (meta, text.to_string())
 }
@@ -87,11 +86,11 @@ fn split_heading(text: &str) -> (Option<String>, String) {
     let mut heading = None;
     let mut lines: Vec<&str> = Vec::new();
     for line in text.lines() {
-        if heading.is_none() {
-            if let Some(h) = line.strip_prefix("# ") {
-                heading = Some(h.trim().to_string());
-                continue;
-            }
+        if heading.is_none()
+            && let Some(h) = line.strip_prefix("# ")
+        {
+            heading = Some(h.trim().to_string());
+            continue;
         }
         lines.push(line);
     }
@@ -154,8 +153,11 @@ fn rel_to(workspace: &Path, path: &Path) -> String {
 
 /// Where a requirement's file lives: `<root>/<id>-<slug>.md`.
 fn path_for(cfg: &Config, workspace: &Path, r: &Requirement) -> PathBuf {
-    cfg.requirements_path(workspace)
-        .join(format!("{}-{}.md", r.id, slugify(&r.title, "requirement")))
+    cfg.requirements_path(workspace).join(format!(
+        "{}-{}.md",
+        r.id,
+        slugify(&r.title, "requirement")
+    ))
 }
 
 /// Load every requirement file. Files missing an `id` are assigned one and
@@ -386,47 +388,9 @@ pub fn remove(cfg: &Config, workspace: &Path, id: i64, hard: bool) -> Result<boo
     update(cfg, workspace, id, None, None, Some("removed"), None, None)
 }
 
-/// One-time migration of legacy DB requirements into markdown files. Runs only
-/// when no requirement files exist yet, preserving ids so tickets keep working.
-fn migrate_from_db(db: &Db, cfg: &Config, workspace: &Path) -> Result<usize> {
-    if !db.has_table("requirements")? {
-        return Ok(0);
-    }
-    if !load_all(cfg, workspace)?.is_empty() {
-        return Ok(0);
-    }
-    let reqs = db.requirement_list(None, None)?;
-    let mut n = 0;
-    for r in reqs {
-        let mut req = Requirement {
-            id: r.id,
-            level: r.level,
-            title: r.title,
-            body: r.body,
-            status: r.status,
-            parent_id: r.parent_id,
-            source: r.source,
-            path: PathBuf::new(),
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-        };
-        let path = path_for(cfg, workspace, &req);
-        req.path = path.clone();
-        write_at(&path, &req)?;
-        n += 1;
-    }
-    Ok(n)
-}
-
-/// Load (and normalize) all requirement files, migrating legacy DB rows on the
-/// first run. Returns the number of requirement files present.
-pub fn sync(db: &Db, cfg: &Config, workspace: &Path) -> Result<usize> {
-    let migrated = migrate_from_db(db, cfg, workspace)?;
-    if migrated > 0 {
-        eprintln!(
-            "[requirements] migrated {migrated} requirement(s) from the database to markdown"
-        );
-    }
+/// Load and normalize Markdown requirements. Markdown is the only source of
+/// truth; there is intentionally no database migration path.
+pub fn sync(cfg: &Config, workspace: &Path) -> Result<usize> {
     Ok(load_all(cfg, workspace)?.len())
 }
 
@@ -527,32 +491,36 @@ mod tests {
         assert_eq!(active_count(&cfg, &ws).unwrap(), 2);
 
         // Editing the title renames the backing file.
-        assert!(update(
-            &cfg,
-            &ws,
-            2,
-            Some("Accept Files and URLs"),
-            None,
-            Some("met"),
-            None,
-            None
-        )
-        .unwrap());
+        assert!(
+            update(
+                &cfg,
+                &ws,
+                2,
+                Some("Accept Files and URLs"),
+                None,
+                Some("met"),
+                None,
+                None
+            )
+            .unwrap()
+        );
         let r2b = load_by_id(&cfg, &ws, 2).unwrap().unwrap();
         assert_eq!(r2b.title, "Accept Files and URLs");
         assert_eq!(r2b.status, "met");
         assert_eq!(r2b.parent_id, Some(1));
-        assert!(r2b
-            .display_path(&ws)
-            .ends_with("2-accept-files-and-urls.md"));
+        assert!(
+            r2b.display_path(&ws)
+                .ends_with("2-accept-files-and-urls.md")
+        );
         assert_eq!(active_count(&cfg, &ws).unwrap(), 1);
 
         update(&cfg, &ws, 2, None, None, None, Some("stakeholder"), None).unwrap();
         let r2c = load_by_id(&cfg, &ws, 2).unwrap().unwrap();
         assert_eq!(r2c.level, "stakeholder");
-        assert!(r2c
-            .display_path(&ws)
-            .ends_with(".genji/requirements/2-accept-files-and-urls.md"));
+        assert!(
+            r2c.display_path(&ws)
+                .ends_with(".genji/requirements/2-accept-files-and-urls.md")
+        );
 
         assert!(remove(&cfg, &ws, 2, false).unwrap());
         assert_eq!(active_count(&cfg, &ws).unwrap(), 1);

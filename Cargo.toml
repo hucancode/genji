@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "A minimal coding agent"
 
+[features]
+default = []
+formal = []
+
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 ureq = { version = "2", features = ["json"] }

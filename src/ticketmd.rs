@@ -1,7 +1,6 @@
-//! File-backed store for *open* tickets.
+//! File-backed store for formal-mode tickets.
 //!
-//! Tickets that are still being worked (`open` or `in_progress`) live as
-//! markdown files directly under `.genji/tickets/`:
+//! All tickets live as Markdown files directly under `.genji/tickets/`:
 //!
 //! ```text
 //! .genji/tickets/
@@ -11,10 +10,9 @@
 //!
 //! Metadata lives in simple `key: value` frontmatter (`id`, `status`,
 //! `priority`, `parent`, `requirement`, `mode`, `created`, `updated`); the text
-//! after the first `# Heading` is the ticket description. Once a ticket is
-//! resolved or closed it leaves this store and is archived in the SQLite
-//! `tickets` table (see [`crate::db::Db::ticket_insert`]). `move_to_db` /
-//! `move_to_file` in `tools::tickets` drive that transition.
+//! after the first `# Heading` is the ticket description. Status and
+//! resolution remain in the Markdown frontmatter; there is no database archive
+//! or migration path.
 
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -22,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
-use crate::db::{Db, TicketEdit};
+use crate::db::TicketEdit;
 use crate::util::slugify;
 
 #[derive(Debug, Clone)]
@@ -47,9 +45,7 @@ impl Ticket {
     /// Display path relative to the workspace (falls back to the absolute path
     /// when it is outside).
     pub fn display_path(&self, workspace: &Path) -> Option<String> {
-        self.path
-            .as_ref()
-            .map(|p| rel_to(workspace, p))
+        self.path.as_ref().map(|p| rel_to(workspace, p))
     }
 }
 
@@ -64,18 +60,18 @@ fn now_secs() -> String {
 /// Split leading `---` frontmatter from the markdown body.
 fn split_frontmatter(text: &str) -> (BTreeMap<String, String>, String) {
     let mut meta = BTreeMap::new();
-    if let Some(rest) = text.strip_prefix("---\n") {
-        if let Some(idx) = rest.find("\n---") {
-            let fm = &rest[..idx];
-            let after = &rest[idx + 4..];
-            for line in fm.lines() {
-                if let Some((k, v)) = line.split_once(':') {
-                    meta.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
-                }
+    if let Some(rest) = text.strip_prefix("---\n")
+        && let Some(idx) = rest.find("\n---")
+    {
+        let fm = &rest[..idx];
+        let after = &rest[idx + 4..];
+        for line in fm.lines() {
+            if let Some((k, v)) = line.split_once(':') {
+                meta.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
             }
-            let body = after.strip_prefix('\n').unwrap_or(after);
-            return (meta, body.to_string());
         }
+        let body = after.strip_prefix('\n').unwrap_or(after);
+        return (meta, body.to_string());
     }
     (meta, text.to_string())
 }
@@ -85,11 +81,11 @@ fn split_heading(text: &str) -> (Option<String>, String) {
     let mut heading = None;
     let mut lines: Vec<&str> = Vec::new();
     for line in text.lines() {
-        if heading.is_none() {
-            if let Some(h) = line.strip_prefix("# ") {
-                heading = Some(h.trim().to_string());
-                continue;
-            }
+        if heading.is_none()
+            && let Some(h) = line.strip_prefix("# ")
+        {
+            heading = Some(h.trim().to_string());
+            continue;
         }
         lines.push(line);
     }
@@ -108,10 +104,10 @@ fn render(t: &Ticket) -> String {
     if let Some(r) = t.requirement_id {
         s.push_str(&format!("requirement: {r}\n"));
     }
-    if let Some(m) = &t.mode {
-        if !m.trim().is_empty() {
-            s.push_str(&format!("mode: {m}\n"));
-        }
+    if let Some(m) = &t.mode
+        && !m.trim().is_empty()
+    {
+        s.push_str(&format!("mode: {m}\n"));
     }
     if let Some(r) = &t.resolution {
         s.push_str(&format!("resolution: {r}\n"));
@@ -298,24 +294,21 @@ pub fn load_all(cfg: &Config, workspace: &Path) -> Result<Vec<Ticket>> {
 }
 
 pub fn load_by_id(cfg: &Config, workspace: &Path, id: i64) -> Result<Option<Ticket>> {
-    Ok(load_all(cfg, workspace)?
-        .into_iter()
-        .find(|t| t.id == id))
+    Ok(load_all(cfg, workspace)?.into_iter().find(|t| t.id == id))
 }
 
-/// Next ticket id, taken across both stores so ids stay unique and stable.
-pub fn next_id(db: &Db, cfg: &Config, workspace: &Path) -> Result<i64> {
-    let file_max = load_all(cfg, workspace)?
+/// Next ticket id from the Markdown store.
+pub fn next_id(cfg: &Config, workspace: &Path) -> Result<i64> {
+    Ok(load_all(cfg, workspace)?
         .iter()
         .map(|t| t.id)
         .max()
-        .unwrap_or(0);
-    Ok(file_max.max(db.ticket_max_id()?) + 1)
+        .unwrap_or(0)
+        + 1)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn create(
-    db: &Db,
     cfg: &Config,
     workspace: &Path,
     title: &str,
@@ -327,7 +320,7 @@ pub fn create(
 ) -> Result<Ticket> {
     let now = now_secs();
     let mut ticket = Ticket {
-        id: next_id(db, cfg, workspace)?,
+        id: next_id(cfg, workspace)?,
         title: title.to_string(),
         description: description.to_string(),
         status: "open".into(),
@@ -391,256 +384,16 @@ pub fn update(
     let new_path = path_for(cfg, workspace, &ticket);
     ticket.path = Some(new_path.clone());
     write_at(&new_path, &ticket)?;
-    if let Some(old) = old_path {
-        if old != new_path && old.exists() {
-            let _ = std::fs::remove_file(&old);
-        }
+    if let Some(old) = old_path
+        && old != new_path
+        && old.exists()
+    {
+        let _ = std::fs::remove_file(&old);
     }
     Ok(Some(ticket))
 }
 
-/// Write a ticket to its file (used when a DB ticket is reopened).
-pub fn save(cfg: &Config, workspace: &Path, ticket: &Ticket) -> Result<()> {
-    let path = path_for(cfg, workspace, ticket);
-    write_at(&path, ticket)
-}
-
-/// One-time migration of legacy open/in_progress DB tickets into files. Only
-/// rows that are still actionable are moved; resolved/closed history stays in
-/// the database.
-pub fn sync(db: &Db, cfg: &Config, workspace: &Path) -> Result<usize> {
-    let open = db.ticket_list(None, None)?;
-    let existing: std::collections::BTreeSet<i64> = load_all(cfg, workspace)?
-        .iter()
-        .map(|t| t.id)
-        .collect();
-    let mut migrated = 0;
-    for t in open {
-        if !matches!(t.status.as_str(), "open" | "in_progress") {
-            continue;
-        }
-        if existing.contains(&t.id) {
-            continue;
-        }
-        let ticket = Ticket {
-            id: t.id,
-            title: t.title,
-            description: t.description,
-            status: t.status,
-            priority: t.priority,
-            parent_id: t.parent_id,
-            requirement_id: t.requirement_id,
-            mode: t.mode,
-            resolution: t.resolution,
-            created_at: t.created_at,
-            updated_at: t.updated_at,
-            path: None,
-        };
-        save(cfg, workspace, &ticket)?;
-        db.ticket_delete(t.id)?;
-        migrated += 1;
-    }
-    if migrated > 0 {
-        eprintln!(
-            "[tickets] migrated {migrated} open ticket(s) from the database to {}",
-            cfg.tickets_path(workspace).display()
-        );
-    }
+/// Load and normalize Markdown tickets. Markdown is the only source of truth.
+pub fn sync(cfg: &Config, workspace: &Path) -> Result<usize> {
     Ok(load_all(cfg, workspace)?.len())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{create, load_all, load_by_id, next_id, save, update};
-    use crate::config::Config;
-    use crate::db::{Db, TicketEdit};
-
-    fn temp_workspace(tag: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("genji-ticketmd-{tag}-{nanos}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn memory_db() -> Db {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        let db = Db { conn };
-        db.init_schema().unwrap();
-        db
-    }
-
-    #[test]
-    fn file_store_lifecycle() {
-        let ws = temp_workspace("lifecycle");
-        let cfg = Config::default();
-        let db = memory_db();
-
-        let t = create(
-            &db,
-            &cfg,
-            &ws,
-            "Add rate limit",
-            "Reject more than 100 req/min.",
-            1,
-            None,
-            Some(3),
-            "plan",
-        )
-        .unwrap();
-        assert_eq!(t.id, 1);
-        assert!(t.path.as_ref().unwrap().exists());
-        assert!(t
-            .display_path(&ws)
-            .unwrap()
-            .ends_with(".genji/tickets/1-add-rate-limit.md"));
-
-        let edit = TicketEdit {
-            title: Some("Add API rate limit".into()),
-            priority: Some(3),
-            ..Default::default()
-        };
-        let updated = update(&cfg, &ws, 1, &edit, Some("in_progress"), None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.title, "Add API rate limit");
-        assert_eq!(updated.status, "in_progress");
-        assert_eq!(updated.priority, 3);
-        // Renaming the title renames the file and removes the old one.
-        assert!(updated
-            .display_path(&ws)
-            .unwrap()
-            .ends_with("1-add-api-rate-limit.md"));
-        assert!(!ws
-            .join(".genji/tickets/1-add-rate-limit.md")
-            .exists());
-
-        assert_eq!(load_all(&cfg, &ws).unwrap().len(), 1);
-        assert!(load_by_id(&cfg, &ws, 1).unwrap().is_some());
-        assert_eq!(next_id(&db, &cfg, &ws).unwrap(), 2);
-    }
-
-    #[test]
-    fn db_id_steers_next_file_id() {
-        let ws = temp_workspace("db-id");
-        let cfg = Config::default();
-        let db = memory_db();
-        db.ticket_insert(
-            9,
-            "archived",
-            "",
-            "resolved",
-            2,
-            None,
-            None,
-            None,
-            Some("done"),
-            None,
-        )
-        .unwrap();
-        assert_eq!(create(&db, &cfg, &ws, "next", "", 2, None, None, "build").unwrap().id, 10);
-    }
-
-    #[test]
-    fn reopen_round_trip_through_db() {
-        let ws = temp_workspace("reopen");
-        let cfg = Config::default();
-        let db = memory_db();
-        let mut t = create(&db, &cfg, &ws, "Fix bug", "broken", 2, None, None, "build").unwrap();
-        t.status = "resolved".into();
-        t.resolution = Some("fixed".into());
-        // archive into the DB and drop the file
-        db.ticket_insert(
-            t.id,
-            &t.title,
-            &t.description,
-            &t.status,
-            t.priority,
-            t.parent_id,
-            t.requirement_id,
-            t.mode.as_deref(),
-            t.resolution.as_deref(),
-            Some(&t.created_at),
-        )
-        .unwrap();
-        std::fs::remove_file(t.path.as_ref().unwrap()).unwrap();
-
-        assert!(db.ticket_get(t.id).unwrap().is_some());
-        assert!(load_by_id(&cfg, &ws, t.id).unwrap().is_none());
-
-        // reopen back into a file
-        let mut back = t.clone();
-        back.status = "open".into();
-        back.resolution = None;
-        save(&cfg, &ws, &back).unwrap();
-        db.ticket_delete(t.id).unwrap();
-
-        let reopened = load_by_id(&cfg, &ws, t.id).unwrap().unwrap();
-        assert_eq!(reopened.status, "open");
-        assert!(reopened.resolution.is_none());
-        assert!(db.ticket_get(t.id).unwrap().is_none());
-    }
-
-    #[test]
-    fn sync_migrates_open_rows_only() {
-        let ws = temp_workspace("sync");
-        let cfg = Config::default();
-        let db = memory_db();
-        db.ticket_insert(1, "open one", "", "open", 2, None, Some(3), Some("plan"), None, None)
-            .unwrap();
-        db.ticket_insert(2, "working", "", "in_progress", 1, None, None, None, None, None)
-            .unwrap();
-        db.ticket_insert(
-            3,
-            "archived",
-            "",
-            "resolved",
-            2,
-            None,
-            None,
-            None,
-            Some("done"),
-            None,
-        )
-        .unwrap();
-
-        let files = super::sync(&db, &cfg, &ws).unwrap();
-        assert_eq!(files, 2);
-        // Open rows moved to files and out of the DB; resolved history stayed.
-        assert!(load_by_id(&cfg, &ws, 1).unwrap().is_some());
-        assert!(load_by_id(&cfg, &ws, 2).unwrap().is_some());
-        assert!(db.ticket_get(1).unwrap().is_none());
-        assert!(db.ticket_get(2).unwrap().is_none());
-        assert!(db.ticket_get(3).unwrap().is_some());
-
-        // Idempotent: a second pass finds nothing left to move.
-        assert_eq!(super::sync(&db, &cfg, &ws).unwrap(), 2);
-    }
-
-    #[test]
-    fn frontmatter_and_heading_round_trip() {
-        let ws = temp_workspace("round");
-        let cfg = Config::default();
-        let dir = cfg.tickets_path(&ws);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("hand-written.md"),
-            "---\nstatus: in_progress\npriority: 1\nrequirement: 4\n---\n# Hand Written\nBody.\n",
-        )
-        .unwrap();
-
-        let all = load_all(&cfg, &ws).unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].id, 1);
-        assert_eq!(all[0].title, "Hand Written");
-        assert_eq!(all[0].status, "in_progress");
-        assert_eq!(all[0].priority, 1);
-        assert_eq!(all[0].requirement_id, Some(4));
-        // The id is persisted back into the file.
-        let text = std::fs::read_to_string(dir.join("hand-written.md")).unwrap();
-        assert!(text.contains("id: 1"), "frontmatter should gain an id:\n{text}");
-    }
 }

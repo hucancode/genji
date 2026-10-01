@@ -8,8 +8,8 @@ own instructions.
 
 | Mode | Purpose | Writes state? |
 |------|---------|---------------|
-| `plan` | Produce and persist an implementation plan | plans; requirements/tickets only with OCD |
-| `build` | Implement requested changes and verify | code; tickets only with OCD |
+| `plan` | Produce and persist an implementation plan | plans; requirements/tickets only with Formal |
+| `build` | Implement requested changes and verify | code; tickets only with Formal |
 | `explore` | Investigate and report; never touches the ticket system | read/inspect only |
 | `retro` | Query history and improve prompts/skills | prompt & skill editing |
 
@@ -18,7 +18,7 @@ The effective system prompt is:
 ```
 <shared preamble>
 <mode core prompt>          # not editable
-<OCD guidance>              # only when --ocd is on (plan/build)
+<Formal guidance>              # only when --formal is on (plan/build)
 ## Extended guidance
 <editable extended prompt>  # versioned in DB; retro may edit it
 ```
@@ -33,10 +33,10 @@ rolled back (`prompt_history` / `prompt_rollback`). `prompt_edit` rejects
 
 ## Tool matrix
 
-The **OCD** column applies to `plan`/`build` only when the `--ocd` flag (or the
-`ocd` subcommand) is on. Requirement/ticket tools are never exposed in
-`explore`, `retro`, or in `plan`/`build` runs without OCD. See
-[OCD mode](#ocd-requirements--tickets) below.
+The **Formal** column applies to `plan`/`build` only when the `--formal` flag is
+available by compiling with `--features formal`. Requirement/ticket tools are
+never exposed in `explore`, `retro`, or in `plan`/`build` runs without Formal. See
+[Formal mode](#formal-requirements--tickets) below.
 
 | Tool | plan | build | explore | retro |
 |------|:----:|:-----:|:-------:|:-----:|
@@ -44,11 +44,11 @@ The **OCD** column applies to `plan`/`build` only when the `--ocd` flag (or the
 | `plan_write` | ✓ |  |  |  |
 | `skill_load` | ✓ | ✓ | ✓ | ✓ |
 | `spawn` | ✓ | ✓ | ✓ |  |
-| `ticket_create` (OCD) | ✓ |  |  |  |
-| `ticket_read` `ticket_claim` `ticket_update` (OCD) | ✓ | ✓ |  |  |
-| `ticket_close` (OCD) | ✓ | ✓ |  |  |
-| `requirement_create` `requirement_update` `requirement_remove` (OCD) | ✓ |  |  |  |
-| `requirement_read` `requirement_tree` `requirement_ask` (OCD) | ✓ | ✓ |  |  |
+| `ticket_create` (Formal) | ✓ |  |  |  |
+| `ticket_read` `ticket_claim` `ticket_update` (Formal) | ✓ | ✓ |  |  |
+| `ticket_close` (Formal) | ✓ | ✓ |  |  |
+| `requirement_create` `requirement_update` `requirement_remove` (Formal) | ✓ |  |  |  |
+| `requirement_read` `requirement_tree` `requirement_ask` (Formal) | ✓ | ✓ |  |  |
 | `query_*`, `*_skill`, `prompt_*` |  |  |  | ✓ |
 
 - `ls` respects `.gitignore`, `.ignore`, `.git/info/exclude` and global git
@@ -68,8 +68,8 @@ to disk (rather than only reporting it) means it outlives the run and can be
 reviewed, versioned, or reused. Call `plan_write` again with the same title to
 refine an existing plan.
 
-Without OCD the plan file is the only artifact. With
-[OCD](#ocd-requirements--tickets) on, plan mode *additionally* refines the
+Without Formal the plan file is the only artifact. With
+[Formal](#formal-requirements--tickets) on, plan mode *additionally* refines the
 requirements/tickets system, and the plan should stay consistent with it.
 
 A user can point a running agent at a specific plan with `/setplan <slug>`
@@ -81,18 +81,18 @@ into the system prompt for the rest of the run: `plan` refines the file,
 
 ---
 
-## OCD: requirements & tickets
+## Formal: requirements & tickets
 
-OCD is an opt-in **flag**, not a mode or subcommand. It is off by default, so a
+Formal is an opt-in **flag**, not a mode or subcommand. It is off by default, so a
 plain genji run has no requirement or ticket tools at all. Enable it with any
 of:
 
 ```bash
-genji --ocd "build me a cat classifier"
-genji plan --ocd "..."    # --ocd works with plan/build; the run also cycles
+genji --formal "build me a cat classifier"
+genji plan --formal "..."    # --formal works with plan/build; the run also cycles
 ```
 
-When OCD is on:
+When Formal is on:
 
 - `plan` and `build` gain the full requirements/tickets surface
   (`requirement_*`, `ticket_*`, plus `ticket_claim`, `ticket_update`,
@@ -108,7 +108,7 @@ When OCD is on:
 
 ## Automatic mode cycling
 
-Cycling is part of OCD. With OCD on and a task, genji starts in **build** mode
+Cycling is part of Formal. With Formal on and a task, genji starts in **build** mode
 and runs:
 
 ```
@@ -116,13 +116,14 @@ build → plan → build → plan → …   until active requirements == 0 (or m
 ```
 State (requirements, tickets, conversation) persists across cycles in one
 run. Plan mode decides whether requirements are truly met; when none remain
-active, the loop stops. `genji plan --ocd` starts the cycle at plan instead.
-Without OCD there is no auto-cycle: `genji plan`, `genji build`, `genji
+active, the loop stops. `genji plan --formal` starts the cycle at plan instead.
+Without Formal there is no auto-cycle: `genji plan`, `genji build`, `genji
 explore`, and `genji retro` each run a single mode. Subagents always run a
-single mode.
+single mode. A binary built without `--features formal` has no `--formal` flag
+and does not compile or initialize the requirements/tickets system.
 
-With OCD on and **no explicit task**, active requirements are used as the work
-queue. Running bare `genji` with **no task and no OCD** does not start a cycle:
+With Formal on and **no explicit task**, active requirements are used as the work
+queue. Running bare `genji` with **no task and no Formal** does not start a cycle:
 it opens the control socket and waits for an instruction to be sent (see
 [Mid-run instructions](control-socket.md#running-with-no-instruction)).
 

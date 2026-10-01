@@ -8,7 +8,7 @@
 //! which is detected by probing the control socket and cleaned up on the next
 //! listing.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,15 +57,15 @@ impl Instance {
 /// Directory holding instance records. `GENJI_REGISTRY_DIR` overrides it
 /// (handy for tests); otherwise it lives under the user's home directory.
 pub fn dir() -> PathBuf {
-    if let Ok(d) = std::env::var("GENJI_REGISTRY_DIR") {
-        if !d.trim().is_empty() {
-            return PathBuf::from(d);
-        }
+    if let Ok(d) = std::env::var("GENJI_REGISTRY_DIR")
+        && !d.trim().is_empty()
+    {
+        return PathBuf::from(d);
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.trim().is_empty() {
-            return PathBuf::from(home).join(".genji").join("instances");
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        return PathBuf::from(home).join(".genji").join("instances");
     }
     std::env::temp_dir().join("genji-instances")
 }

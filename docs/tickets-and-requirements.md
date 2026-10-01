@@ -1,9 +1,11 @@
 # Tickets and requirements
 
-The requirements/tickets system is only active when **OCD** is enabled
-(`genji --ocd ...`, for example `genji plan --ocd "..."`). Without OCD, genji
-is a plain coding agent and none of the `requirement_*`/`ticket_*` tools are
-offered to the model. See [Modes](modes.md#ocd-requirements--tickets).
+The requirements/tickets system is compiled only with the `formal` Cargo
+feature. Build that variant with `cargo build --features formal`, then enable it
+at runtime with `genji --formal ...` (for example `genji plan --formal "..."`).
+A binary built without the feature has no `--formal` flag, does not create or
+read requirement/ticket files, and does not offer those tools to the model. See
+[Modes](modes.md#formal-requirements--tickets).
 
 Requirements have two levels:
 
@@ -19,17 +21,11 @@ owns requirement status, and also persists its human-readable plan under
 Requirements are persisted as markdown files directly under
 `.genji/requirements/` (`<id>-<slug>.md`). Nothing is stored in SQLite: tickets
 reference a requirement by the numeric `id` recorded in the file's frontmatter,
-and the level (`stakeholder`/`system`) lives in the frontmatter as well. A
-one-time migration exports any pre-existing rows from the legacy
-`requirements` table on startup.
+and the level (`stakeholder`/`system`) lives in the frontmatter as well.
 
-Tickets have a split store. Tickets that are still actionable (`open` or
-`in_progress`) are markdown files under `.genji/tickets/`
-(`<id>-<slug>.md`). A ticket is archived in the SQLite `tickets` table when it
-is closed (`ticket_close`) or its status is set to `resolved`/`closed` with
-`ticket_update`; the file is removed. Ids are allocated across both stores so a
-ticket keeps its number across the transition. A one-time migration moves any
-pre-existing open/in_progress DB tickets into files on startup.
+Tickets are also Markdown-only under `.genji/tickets/` (`<id>-<slug>.md`).
+Status and resolution remain in frontmatter, including for closed tickets.
+There is one source of truth and no migration or archive database.
 
 ```
 requirement_create  {level, title, body, parent_id?}

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::{opt_str, req_str};
 use crate::agent::Agent;
-use crate::config::{expand_tilde, Config};
+use crate::config::{Config, expand_tilde};
 use crate::util::slugify;
 
 /// Persist a plan and return the path it was written to. Split out from the

@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow};
+use serde_json::{Value, json};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::Agent;
@@ -12,10 +12,12 @@ use std::path::Path;
 
 pub mod basic;
 pub mod plans;
+#[cfg(feature = "formal")]
 pub mod requirements;
 pub mod retro;
 pub mod skills;
 pub mod spawn;
+#[cfg(feature = "formal")]
 pub mod tickets;
 
 #[derive(Debug, Clone)]
@@ -46,9 +48,9 @@ struct Tool {
     description: &'static str,
     parameters: Value,
     modes: &'static [Mode],
-    /// When true the tool is only exposed while the OCD flag is enabled. This
+    /// When true the tool is only exposed while the Formal flag is enabled. This
     /// is how the requirements/tickets system stays out of the default agent.
-    requires_ocd: bool,
+    requires_formal: bool,
     /// When true the tool is only exposed while at least one skill exists. This
     /// keeps `skill_load` out of the schema when there is nothing to load.
     requires_skills: bool,
@@ -63,10 +65,17 @@ impl Tool {
             parameters: self.parameters.clone(),
         }
     }
+
+    fn available(&self, mode: Mode, formal: bool, has_skills: bool) -> bool {
+        self.modes.contains(&mode)
+            && (!self.requires_formal || formal)
+            && (!self.requires_skills || has_skills)
+    }
 }
 
 const ALL_MODES: &[Mode] = &[Mode::Plan, Mode::Build, Mode::Explore, Mode::Retro];
 const PLAN: &[Mode] = &[Mode::Plan];
+#[cfg(feature = "formal")]
 const PLAN_BUILD: &[Mode] = &[Mode::Plan, Mode::Build];
 const PLAN_BUILD_EXPLORE: &[Mode] = &[Mode::Plan, Mode::Build, Mode::Explore];
 const RETRO: &[Mode] = &[Mode::Retro];
@@ -83,14 +92,15 @@ fn tool(
         description,
         parameters,
         modes,
-        requires_ocd: false,
+        requires_formal: false,
         requires_skills: false,
         handler,
     }
 }
 
-/// Like [`tool`], but only exposed while the OCD flag is enabled.
-fn ocd_tool(
+/// Like [`tool`], but only exposed while the Formal flag is enabled.
+#[cfg(feature = "formal")]
+fn formal_tool(
     name: &'static str,
     modes: &'static [Mode],
     description: &'static str,
@@ -102,7 +112,7 @@ fn ocd_tool(
         description,
         parameters,
         modes,
-        requires_ocd: true,
+        requires_formal: true,
         requires_skills: false,
         handler,
     }
@@ -121,7 +131,7 @@ fn skill_tool(
         description,
         parameters,
         modes,
-        requires_ocd: false,
+        requires_formal: false,
         requires_skills: true,
         handler,
     }
@@ -186,8 +196,9 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["title","content"]
             }), plans::write),
-            // ---- tickets (OCD only) ----
-            ocd_tool("ticket_create", PLAN, "Create a work ticket.", json!({
+            // ---- tickets (Formal only) ----
+            #[cfg(feature = "formal")]
+            formal_tool("ticket_create", PLAN, "Create a work ticket.", json!({
                 "type":"object",
                 "properties":{
                     "title":{"type":"string"},
@@ -198,7 +209,8 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["title"]
             }), tickets::create),
-            ocd_tool("ticket_read", PLAN_BUILD, "Read one ticket by id, or list actionable tickets.", json!({
+            #[cfg(feature = "formal")]
+            formal_tool("ticket_read", PLAN_BUILD, "Read one ticket by id, or list actionable tickets.", json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"integer"},
@@ -206,14 +218,16 @@ fn registry() -> &'static [Tool] {
                     "requirement_id":{"type":"integer"}
                 }
             }), tickets::read),
-            ocd_tool("ticket_claim", PLAN_BUILD, "Claim the next open ticket (highest priority) or a specific ticket, marking it in_progress.", json!({
+            #[cfg(feature = "formal")]
+            formal_tool("ticket_claim", PLAN_BUILD, "Claim the next open ticket (highest priority) or a specific ticket, marking it in_progress.", json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"integer","description":"Claim this ticket instead of the next one"},
                     "requirement_id":{"type":"integer","description":"Only consider tickets for this requirement"}
                 }
             }), tickets::claim),
-            ocd_tool("ticket_update", PLAN_BUILD, "Update a ticket's fields and/or status.", json!({
+            #[cfg(feature = "formal")]
+            formal_tool("ticket_update", PLAN_BUILD, "Update a ticket's fields and/or status.", json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"integer"},
@@ -227,13 +241,15 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["id"]
             }), tickets::update),
-            ocd_tool("ticket_close", PLAN_BUILD, "Close a ticket when its work is done and verified, or it is obsolete/duplicate/won't-fix.", json!({
+            #[cfg(feature = "formal")]
+            formal_tool("ticket_close", PLAN_BUILD, "Close a ticket when its work is done and verified, or it is obsolete/duplicate/won't-fix.", json!({
                 "type":"object",
                 "properties":{"id":{"type":"integer"},"reason":{"type":"string"}},
                 "required":["id"]
             }), tickets::close),
-            // ---- requirements (OCD only) ----
-            ocd_tool("requirement_create", PLAN, "Create a stakeholder or system requirement.", json!({
+            // ---- requirements (Formal only) ----
+            #[cfg(feature = "formal")]
+            formal_tool("requirement_create", PLAN, "Create a stakeholder or system requirement.", json!({
                 "type":"object",
                 "properties":{
                     "level":{"type":"string","enum":["stakeholder","system"]},
@@ -243,7 +259,8 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["level","title","body"]
             }), requirements::create),
-            ocd_tool("requirement_read", PLAN_BUILD, "Read a requirement by id, or list/filter requirements by level and status when id is omitted.", json!({
+            #[cfg(feature = "formal")]
+            formal_tool("requirement_read", PLAN_BUILD, "Read a requirement by id, or list/filter requirements by level and status when id is omitted.", json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"integer"},
@@ -251,13 +268,15 @@ fn registry() -> &'static [Tool] {
                     "status":{"type":"string","enum":["active","met","removed"]}
                 }
             }), requirements::read),
-            ocd_tool("requirement_tree", PLAN_BUILD, "Show the requirement hierarchy with ticket coverage per requirement.", json!({
+            #[cfg(feature = "formal")]
+            formal_tool("requirement_tree", PLAN_BUILD, "Show the requirement hierarchy with ticket coverage per requirement.", json!({
                 "type":"object",
                 "properties":{
                     "status":{"type":"string","enum":["active","met","removed"],"description":"Only show requirements with this status"}
                 }
             }), requirements::tree),
-            ocd_tool("requirement_update", PLAN, "Update a requirement's title/body/status/level/parent.", json!({
+            #[cfg(feature = "formal")]
+            formal_tool("requirement_update", PLAN, "Update a requirement's title/body/status/level/parent.", json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"integer"},
@@ -269,12 +288,14 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["id"]
             }), requirements::update),
-            ocd_tool("requirement_remove", PLAN, "Remove a requirement (soft by default).", json!({
+            #[cfg(feature = "formal")]
+            formal_tool("requirement_remove", PLAN, "Remove a requirement (soft by default).", json!({
                 "type":"object",
                 "properties":{"id":{"type":"integer"},"hard":{"type":"boolean"}},
                 "required":["id"]
             }), requirements::remove),
-            ocd_tool("requirement_ask", PLAN_BUILD, "Ask the user a clarifying question about a requirement. Recorded in the DB.", json!({
+            #[cfg(feature = "formal")]
+            formal_tool("requirement_ask", PLAN_BUILD, "Ask the user a clarifying question about a requirement. Recorded in the DB.", json!({
                 "type":"object",
                 "properties":{
                     "question":{"type":"string"},
@@ -392,12 +413,10 @@ fn registry() -> &'static [Tool] {
     })
 }
 
-pub fn specs_for(mode: Mode, ocd: bool, has_skills: bool) -> Vec<ToolSpec> {
+pub fn specs_for(mode: Mode, formal: bool, has_skills: bool) -> Vec<ToolSpec> {
     registry()
         .iter()
-        .filter(|t| t.modes.contains(&mode))
-        .filter(|t| !t.requires_ocd || ocd)
-        .filter(|t| !t.requires_skills || has_skills)
+        .filter(|t| t.available(mode, formal, has_skills))
         .map(|t| t.spec())
         .collect()
 }
@@ -406,10 +425,17 @@ pub fn specs_for(mode: Mode, ocd: bool, has_skills: bool) -> Vec<ToolSpec> {
 /// every caller gets content that fits the context window; oversized results are
 /// spilled to `.genji/tmp/*.log` and the returned text points at the file.
 pub fn dispatch(agent: &mut Agent, name: &str, args: &Value) -> (String, bool) {
-    let res: Result<String> = match registry().iter().find(|t| t.name == name) {
-        Some(t) => (t.handler)(agent, args),
-        None => Err(anyhow!("unknown or unavailable tool `{name}`")),
-    };
+    let res: Result<String> = (|| {
+        let t = registry()
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| anyhow!("unknown tool `{name}`"))?;
+        let has_skills = !t.requires_skills || !agent.db.skill_list()?.is_empty();
+        if !t.available(agent.mode, agent.formal, has_skills) {
+            return Err(anyhow!("tool `{name}` is unavailable in the current mode"));
+        }
+        (t.handler)(agent, args)
+    })();
     match res {
         Ok(s) => (bounded_result(&agent.cfg, &agent.workspace, name, s), false),
         Err(e) => (
@@ -543,15 +569,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
-    fn names(mode: Mode, ocd: bool) -> Vec<String> {
-        specs_for(mode, ocd, true)
+    fn names(mode: Mode, formal: bool) -> Vec<String> {
+        specs_for(mode, formal, true)
             .into_iter()
             .map(|s| s.name.to_string())
             .collect()
     }
 
-    fn names_without_skills(mode: Mode, ocd: bool) -> Vec<String> {
-        specs_for(mode, ocd, false)
+    fn names_without_skills(mode: Mode, formal: bool) -> Vec<String> {
+        specs_for(mode, formal, false)
             .into_iter()
             .map(|s| s.name.to_string())
             .collect()
@@ -570,24 +596,25 @@ mod tests {
                 "{mode:?} exposed plan_write"
             );
         }
-        // OCD does not change plan tool availability.
+        // Formal does not change plan tool availability.
         assert!(names(Mode::Plan, true).iter().any(|n| n == "plan_write"));
     }
 
     #[test]
-    fn ticket_tools_are_hidden_without_ocd() {
+    fn ticket_tools_are_hidden_without_formal() {
         for mode in [Mode::Plan, Mode::Build, Mode::Explore, Mode::Retro] {
             assert!(
                 names(mode, false)
                     .iter()
                     .all(|n| !is_ticket_or_requirement(n)),
-                "{mode:?} exposed a ticket/requirement tool with OCD off"
+                "{mode:?} exposed a ticket/requirement tool with Formal off"
             );
         }
     }
 
+    #[cfg(feature = "formal")]
     #[test]
-    fn ticket_tools_appear_with_ocd() {
+    fn ticket_tools_appear_with_formal() {
         let plan = names(Mode::Plan, true);
         assert!(plan.iter().any(|n| n == "ticket_create"));
         assert!(plan.iter().any(|n| n == "requirement_create"));
@@ -613,13 +640,13 @@ mod tests {
     }
 
     #[test]
-    fn ocd_does_not_leak_into_explore_or_retro() {
+    fn formal_does_not_leak_into_explore_or_retro() {
         for mode in [Mode::Explore, Mode::Retro] {
             assert!(
                 names(mode, true)
                     .iter()
                     .all(|n| !is_ticket_or_requirement(n)),
-                "{mode:?} exposed a ticket/requirement tool with OCD on"
+                "{mode:?} exposed a ticket/requirement tool with Formal on"
             );
         }
     }

@@ -1,8 +1,9 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +25,8 @@ use crate::context::ContextComposer;
 /// - `/setplan <slug>` -> follow/refine the plan `plans_dir/<slug>.md` (`off` clears)
 /// - `/ping` -> liveness check
 ///
-/// The server replies with one line and closes its write side.
+/// Each command receives one response line and the server then closes its
+/// write side. The append-only event trace remains the complete event record.
 pub struct Control {
     pub path: PathBuf,
     plans_dir: PathBuf,
@@ -68,6 +70,8 @@ impl Control {
         }
         let listener = UnixListener::bind(&path)
             .with_context(|| format!("binding control socket {}", path.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("securing control socket {}", path.display()))?;
         listener.set_nonblocking(true)?;
         let ctrl = Arc::new(Control {
             path: path.clone(),
@@ -89,7 +93,12 @@ impl Control {
                     }
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            let _ = handle(stream, &c);
+                            let client = c.clone();
+                            let _ = thread::Builder::new()
+                                .name("genji-control-client".into())
+                                .spawn(move || {
+                                    let _ = handle(stream, &client);
+                                });
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(50));
@@ -305,8 +314,7 @@ mod tests {
             Vec::new(),
             1000,
         )));
-        let ctrl =
-            Control::start(sock.clone(), dir.clone(), composer).expect("start control");
+        let ctrl = Control::start(sock.clone(), dir.clone(), composer).expect("start control");
 
         let snapshot = send(&sock, "/context").expect("send /context");
         assert!(

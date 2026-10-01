@@ -112,56 +112,6 @@ impl Default for ProviderConfig {
 }
 
 impl ProviderConfig {
-    fn from_legacy(cfg: &Config) -> Self {
-        ProviderConfig {
-            api_key: cfg.api_key.clone(),
-            api_key_env: cfg.api_key_env.clone(),
-            auth_file: cfg.auth_file.clone(),
-            auth_key: cfg.provider.clone(),
-            models: cfg.models.clone(),
-            base_url: cfg.base_url.clone(),
-            ..Default::default()
-        }
-    }
-
-    /// Inherit any empty fields from the legacy top-level config, and derive
-    /// `auth` from `kind` when unset.
-    fn filled_from(mut self, cfg: &Config, name: &str) -> Self {
-        if self.base_url.is_empty() {
-            self.base_url = cfg.base_url.clone();
-        }
-        if self.api_key.is_empty() {
-            self.api_key = cfg.api_key.clone();
-        }
-        if self.api_key_env.is_empty() {
-            self.api_key_env = cfg.api_key_env.clone();
-        }
-        if self.auth_file.is_empty() {
-            self.auth_file = cfg.auth_file.clone();
-        }
-        if self.auth_key.is_empty() {
-            self.auth_key = if name.is_empty() {
-                cfg.provider.clone()
-            } else {
-                name.to_string()
-            };
-        }
-        if self.kind.is_empty() {
-            self.kind = "openai".into();
-        }
-        if self.auth.is_empty() {
-            self.auth = if self.kind == "azure" {
-                "api-key".into()
-            } else {
-                "bearer".into()
-            };
-        }
-        if self.max_tokens_field.is_empty() {
-            self.max_tokens_field = "max_tokens".into();
-        }
-        self
-    }
-
     pub fn is_azure(&self) -> bool {
         self.kind.eq_ignore_ascii_case("azure")
     }
@@ -171,24 +121,21 @@ impl ProviderConfig {
         if !self.api_key.is_empty() {
             return self.api_key.clone();
         }
-        if !self.api_key_env.is_empty() {
-            if let Ok(v) = std::env::var(&self.api_key_env) {
-                if !v.is_empty() {
-                    return v;
-                }
-            }
+        if !self.api_key_env.is_empty()
+            && let Ok(v) = std::env::var(&self.api_key_env)
+            && !v.is_empty()
+        {
+            return v;
         }
         let path = expand_tilde(&self.auth_file);
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(key) = v
-                    .get(&self.auth_key)
-                    .and_then(|p| p.get("key"))
-                    .and_then(|k| k.as_str())
-                {
-                    return key.to_string();
-                }
-            }
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(key) = v
+                .get(&self.auth_key)
+                .and_then(|p| p.get("key"))
+                .and_then(|k| k.as_str())
+        {
+            return key.to_string();
         }
         String::new()
     }
@@ -199,12 +146,6 @@ impl ProviderConfig {
 pub struct Config {
     pub provider: String,
     pub providers: BTreeMap<String, ProviderConfig>,
-    pub base_url: String,
-    pub api_key: String,
-    pub api_key_env: String,
-    pub auth_file: String,
-    pub default_model: String,
-    pub models: ModelsConfig,
     pub token_limit: i64,
     pub time_limit_secs: u64,
     pub compact_threshold: f64,
@@ -216,15 +157,19 @@ pub struct Config {
     pub bash_timeout_secs: u64,
     pub spawn_timeout_secs: u64,
     pub max_subagent_depth: u32,
+    #[cfg(feature = "formal")]
     pub max_cycles: usize,
     pub db_path: String,
+    #[cfg(feature = "formal")]
     pub requirements_dir: String,
     pub plans_dir: String,
+    #[cfg(feature = "formal")]
     pub tickets_dir: String,
     pub skills_dir: String,
     pub tmp_dir: String,
     pub control_socket: String,
     pub control_enabled: bool,
+    #[cfg(feature = "formal")]
     pub auto_ingest_requirements: bool,
 }
 
@@ -233,11 +178,11 @@ impl Default for Config {
         let mut providers = BTreeMap::new();
         let mut model_limits = BTreeMap::new();
         model_limits.insert(
-            "qwen2.5-coder-7b".into(),
+            "qwen3-coder-30b-a3b".into(),
             ModelLimits {
-                token_limit: Some(2_000_000),
+                token_limit: Some(4_000_000),
                 context_window: Some(32_768),
-                max_output_tokens: Some(4_096),
+                max_output_tokens: Some(8_192),
             },
         );
         providers.insert(
@@ -245,7 +190,7 @@ impl Default for Config {
             ProviderConfig {
                 kind: "openai".into(),
                 base_url: "http://127.0.0.1:8080/v1".into(),
-                model: "qwen2.5-coder-7b".into(),
+                model: "qwen3-coder-30b-a3b".into(),
                 model_limits,
                 ..Default::default()
             },
@@ -253,37 +198,30 @@ impl Default for Config {
         Self {
             provider: "local".into(),
             providers,
-            base_url: "http://127.0.0.1:8080/v1".into(),
-            api_key: String::new(),
-            api_key_env: String::new(),
-            auth_file: String::new(),
-            default_model: "qwen2.5-coder-7b".into(),
-            models: ModelsConfig {
-                plan: "qwen2.5-coder-7b".into(),
-                build: "qwen2.5-coder-7b".into(),
-                explore: "qwen2.5-coder-7b".into(),
-                retro: "qwen2.5-coder-7b".into(),
-            },
-            token_limit: 2_000_000,
+            token_limit: 4_000_000,
             time_limit_secs: 1800,
             compact_threshold: 0.70,
             compact_keep_recent: 6,
             context_window: 32_768,
-            max_output_tokens: 4_096,
+            max_output_tokens: 8_192,
             tool_result_max_bytes: 24_000,
             max_tool_iterations: 80,
             bash_timeout_secs: 120,
             spawn_timeout_secs: 900,
             max_subagent_depth: 2,
+            #[cfg(feature = "formal")]
             max_cycles: 30,
             db_path: ".genji/genji.db".into(),
+            #[cfg(feature = "formal")]
             requirements_dir: ".genji/requirements".into(),
             plans_dir: ".genji/plans".into(),
+            #[cfg(feature = "formal")]
             tickets_dir: ".genji/tickets".into(),
             skills_dir: ".genji/skills".into(),
             tmp_dir: ".genji/tmp".into(),
             control_socket: ".genji/control.sock".into(),
             control_enabled: true,
+            #[cfg(feature = "formal")]
             auto_ingest_requirements: true,
         }
     }
@@ -329,12 +267,14 @@ impl Config {
         self.workspace_path(workspace, &self.db_path)
     }
 
+    #[cfg(feature = "formal")]
     pub fn requirements_path(&self, workspace: &Path) -> PathBuf {
         self.workspace_path(workspace, &self.requirements_dir)
     }
     pub fn plans_path(&self, workspace: &Path) -> PathBuf {
         self.workspace_path(workspace, &self.plans_dir)
     }
+    #[cfg(feature = "formal")]
     pub fn tickets_path(&self, workspace: &Path) -> PathBuf {
         self.workspace_path(workspace, &self.tickets_dir)
     }
@@ -348,27 +288,42 @@ impl Config {
         self.workspace_path(workspace, &self.control_socket)
     }
 
+    /// Return the configured provider profile. A profile is required; there is
+    /// intentionally no flat/legacy configuration fallback.
     pub fn resolve_active_provider(&self) -> ProviderConfig {
-        match self.providers.get(&self.provider) {
-            Some(p) => p.clone().filled_from(self, &self.provider),
-            None => ProviderConfig::from_legacy(self).filled_from(self, &self.provider),
+        let mut provider = self
+            .providers
+            .get(&self.provider)
+            .cloned()
+            .unwrap_or_else(|| panic!("configured provider `{}` does not exist", self.provider));
+        if provider.auth_key.is_empty() {
+            provider.auth_key = self.provider.clone();
         }
+        if provider.auth.is_empty() {
+            provider.auth = if provider.is_azure() {
+                "api-key"
+            } else {
+                "bearer"
+            }
+            .into();
+        }
+        provider
     }
 
     pub fn model_for_mode(&self, mode: crate::modes::Mode) -> String {
         let p = self.resolve_active_provider();
         if !p.model.trim().is_empty() {
-            return p.model.clone();
+            return p.model;
         }
-        let m = p.models.for_mode(mode);
-        if !m.trim().is_empty() {
-            return m.to_string();
+        let model = p.models.for_mode(mode);
+        if model.trim().is_empty() {
+            panic!(
+                "provider `{}` has no model configured for {}",
+                self.provider,
+                mode.as_str()
+            );
         }
-        let top = self.models.for_mode(mode);
-        if !top.trim().is_empty() {
-            return top.to_string();
-        }
-        self.default_model.clone()
+        model.to_string()
     }
 
     pub fn limits_for_model(&self, model: &str) -> EffectiveLimits {
@@ -394,10 +349,10 @@ impl Config {
 }
 
 pub fn expand_tilde(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = p.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
     PathBuf::from(p)
 }

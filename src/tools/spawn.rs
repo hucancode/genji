@@ -1,5 +1,5 @@
-use anyhow::{bail, Result};
-use serde_json::{json, Value};
+use anyhow::{Result, bail};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 use super::{opt_str, req_str};
@@ -54,8 +54,8 @@ pub fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
         "--no-control".to_string(),
     ]
     .into_iter()
-    // Subagents inherit OCD so a build subagent can work the same tickets.
-    .chain(agent.ocd.then(|| "--ocd".to_string()))
+    // Subagents inherit Formal so a build subagent can work the same tickets.
+    .chain(agent.formal.then(|| "--formal".to_string()))
     .collect::<Vec<_>>();
 
     let cap = agent.cfg.tool_result_max_bytes.saturating_mul(2).max(16384);
@@ -91,10 +91,10 @@ pub fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
             continue;
         }
         parsed += 1;
-        if sub_instance.is_empty() {
-            if let Some(s) = event.get("instance").and_then(|s| s.as_str()) {
-                sub_instance = s.to_string();
-            }
+        if sub_instance.is_empty()
+            && let Some(s) = event.get("instance").and_then(|s| s.as_str())
+        {
+            sub_instance = s.to_string();
         }
         match event.get("type").and_then(|t| t.as_str()) {
             Some("instance_start") => start = Some(event.clone()),
@@ -196,10 +196,10 @@ fn bounded_events(
     const CLIP: usize = 2000;
     for ev in events.iter_mut() {
         for field in ["result", "content", "reasoning", "summary", "message"] {
-            if let Some(s) = ev.get(field).and_then(|v| v.as_str()) {
-                if s.len() > CLIP {
-                    ev[field] = json!(crate::llm::truncate(s.to_string(), CLIP));
-                }
+            if let Some(s) = ev.get(field).and_then(|v| v.as_str())
+                && s.len() > CLIP
+            {
+                ev[field] = json!(crate::llm::truncate(s.to_string(), CLIP));
             }
         }
     }
@@ -249,15 +249,14 @@ fn bounded_events(
         events[i]["report"] = json!(shrunk);
     }
     // Absolute last resort: keep only the report-bearing `instance_end`.
-    if size(&events) > budget {
-        if let Some(i) = events
+    if size(&events) > budget
+        && let Some(i) = events
             .iter()
             .rposition(|e| e.get("type").and_then(|t| t.as_str()) == Some("instance_end"))
-        {
-            let end = events.remove(i);
-            events.clear();
-            events.push(end);
-        }
+    {
+        let end = events.remove(i);
+        events.clear();
+        events.push(end);
     }
     events
 }

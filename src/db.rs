@@ -1,29 +1,12 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct Ticket {
-    pub id: i64,
-    pub title: String,
-    pub description: String,
-    pub status: String,
-    pub priority: i64,
-    pub parent_id: Option<i64>,
-    pub requirement_id: Option<i64>,
-    pub mode: Option<String>,
-    pub resolution: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-    pub resolved_at: Option<String>,
-    pub closed_at: Option<String>,
-}
-
 /// A partial edit to a ticket. `None` leaves a field untouched; for the two
 /// nullable links `Some(None)` clears the value.
+#[cfg(feature = "formal")]
 #[derive(Default)]
 pub struct TicketEdit {
     pub title: Option<String>,
@@ -31,21 +14,6 @@ pub struct TicketEdit {
     pub priority: Option<i64>,
     pub parent_id: Option<Option<i64>>,
     pub requirement_id: Option<Option<i64>>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct Requirement {
-    pub id: i64,
-    pub level: String,
-    pub title: String,
-    pub body: String,
-    pub status: String,
-    pub parent_id: Option<i64>,
-    pub source: String,
-    pub source_path: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 #[allow(dead_code)]
@@ -76,44 +44,6 @@ pub struct Db {
     pub conn: Connection,
 }
 
-fn t_row(r: &Row) -> rusqlite::Result<Ticket> {
-    Ok(Ticket {
-        id: r.get(0)?,
-        title: r.get(1)?,
-        description: r.get(2)?,
-        status: r.get(3)?,
-        priority: r.get(4)?,
-        parent_id: r.get(5)?,
-        requirement_id: r.get(6)?,
-        mode: r.get(7)?,
-        resolution: r.get(8)?,
-        created_at: r.get(9)?,
-        updated_at: r.get(10)?,
-        resolved_at: r.get(11)?,
-        closed_at: r.get(12)?,
-    })
-}
-
-const TICKET_COLS: &str = "id,title,description,status,priority,parent_id,requirement_id,mode,resolution,created_at,updated_at,resolved_at,closed_at";
-
-fn r_row(r: &Row) -> rusqlite::Result<Requirement> {
-    Ok(Requirement {
-        id: r.get(0)?,
-        level: r.get(1)?,
-        title: r.get(2)?,
-        body: r.get(3)?,
-        status: r.get(4)?,
-        parent_id: r.get(5)?,
-        source: r.get(6)?,
-        source_path: r.get(7)?,
-        created_at: r.get(8)?,
-        updated_at: r.get(9)?,
-    })
-}
-
-const REQ_COLS: &str =
-    "id,level,title,body,status,parent_id,source,source_path,created_at,updated_at";
-
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -129,44 +59,8 @@ impl Db {
     }
 
     pub fn init_schema(&self) -> Result<()> {
-        self.migrate_session_to_instance()?;
         self.conn.execute_batch(&format!(
             r#"
-CREATE TABLE IF NOT EXISTS tickets (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  title TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'open',
-  priority INTEGER NOT NULL DEFAULT 2,
-  parent_id INTEGER,
-  requirement_id INTEGER,
-  mode TEXT,
-  resolution TEXT,
-  created_at TEXT NOT NULL DEFAULT ({NOW}),
-  updated_at TEXT NOT NULL DEFAULT ({NOW}),
-  resolved_at TEXT,
-  closed_at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
-CREATE INDEX IF NOT EXISTS idx_tickets_req ON tickets(requirement_id);
-
-CREATE TABLE IF NOT EXISTS requirements (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  level TEXT NOT NULL CHECK(level IN ('stakeholder','system')),
-  title TEXT NOT NULL,
-  body TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'active',
-  parent_id INTEGER,
-  source TEXT NOT NULL DEFAULT 'agent',
-  source_path TEXT,
-  created_at TEXT NOT NULL DEFAULT ({NOW}),
-  updated_at TEXT NOT NULL DEFAULT ({NOW})
-);
-CREATE INDEX IF NOT EXISTS idx_req_status ON requirements(status);
-CREATE INDEX IF NOT EXISTS idx_req_level ON requirements(level);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_req_source_path ON requirements(source_path)
-  WHERE source_path IS NOT NULL;
-
 CREATE TABLE IF NOT EXISTS requirement_questions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   requirement_id INTEGER,
@@ -276,48 +170,6 @@ CREATE TABLE IF NOT EXISTS compactions (
         Ok(())
     }
 
-    /// Rename the legacy `sessions`/`session_id` schema to the unified
-    /// `instances`/`instance_id` schema. SQLite performs these renames in place,
-    /// so recorded history survives the upgrade. A fresh database is untouched.
-    fn migrate_session_to_instance(&self) -> Result<()> {
-        let has_column = |table: &str, col: &str| -> Result<bool> {
-            let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                if row.get::<_, String>(1)? == col {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        };
-
-        if self.has_table("sessions")? && !self.has_table("instances")? {
-            self.conn
-                .execute_batch("ALTER TABLE sessions RENAME TO instances;")?;
-        }
-        for (table, old_col, new_col) in [
-            ("instances", "parent_session", "parent_instance"),
-            ("messages", "session_id", "instance_id"),
-            ("tool_calls", "session_id", "instance_id"),
-            ("requirement_questions", "session_id", "instance_id"),
-            ("skill_loads", "session_id", "instance_id"),
-            ("compactions", "session_id", "instance_id"),
-        ] {
-            if self.has_table(table)? && has_column(table, old_col)? && !has_column(table, new_col)? {
-                self.conn.execute_batch(&format!(
-                    "ALTER TABLE {table} RENAME COLUMN {old_col} TO {new_col};"
-                ))?;
-            }
-        }
-        // The renamed indexes (SQLite keeps their names when a column is
-        // renamed) are superseded by the ones `init_schema` creates.
-        self.conn.execute_batch(
-            "DROP INDEX IF EXISTS idx_messages_session;\n\
-             DROP INDEX IF EXISTS idx_toolcalls_session;",
-        )?;
-        Ok(())
-    }
-
     // ------------------------------------------------------------- instances
 
     pub fn instance_start(
@@ -390,198 +242,7 @@ CREATE TABLE IF NOT EXISTS compactions (
         Ok(())
     }
 
-    // ---------------------------------------------------------------- tickets
-    //
-    // Actionable tickets (open/in_progress) live as markdown files under
-    // `.genji/tickets/` (see `ticketmd`). This table is the archive for
-    // resolved/closed tickets; `tools::tickets` moves rows between the two
-    // stores.
-
-    pub fn ticket_get(&self, id: i64) -> Result<Option<Ticket>> {
-        let sql = format!("SELECT {TICKET_COLS} FROM tickets WHERE id=?");
-        Ok(self.conn.query_row(&sql, params![id], t_row).optional()?)
-    }
-
-    pub fn ticket_list(
-        &self,
-        status: Option<&str>,
-        requirement_id: Option<i64>,
-    ) -> Result<Vec<Ticket>> {
-        let mut sql = format!("SELECT {TICKET_COLS} FROM tickets WHERE 1=1");
-        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(s) = status {
-            sql.push_str(" AND status=?");
-            args.push(Box::new(s.to_string()));
-        }
-        if let Some(r) = requirement_id {
-            sql.push_str(" AND requirement_id=?");
-            args.push(Box::new(r));
-        }
-        sql.push_str(" ORDER BY priority ASC, id ASC");
-        let mut stmt = self.conn.prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|b| b.as_ref()).collect();
-        let rows = stmt.query_map(refs.as_slice(), t_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    /// Transition a ticket. `status` is open|in_progress|resolved|closed.
-    pub fn ticket_set_status(
-        &self,
-        id: i64,
-        status: &str,
-        resolution: Option<&str>,
-    ) -> Result<bool> {
-        let n = self.conn.execute(
-            &format!(
-                "UPDATE tickets SET status=?, resolution=COALESCE(?,resolution), updated_at={NOW},
-                 resolved_at=CASE WHEN ?='resolved' THEN {NOW} ELSE resolved_at END,
-                 closed_at=CASE WHEN ?='closed' THEN {NOW} ELSE closed_at END
-                 WHERE id=?"
-            ),
-            params![status, resolution, status, status, id],
-        )?;
-        Ok(n > 0)
-    }
-
-    /// Apply a partial field edit. Returns false when the ticket does not
-    /// exist. Status/resolution transitions go through [`Self::ticket_set_status`].
-    pub fn ticket_update(&self, id: i64, e: &TicketEdit) -> Result<bool> {
-        let mut sets: Vec<&str> = Vec::new();
-        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(v) = &e.title {
-            sets.push("title=?");
-            args.push(Box::new(v.clone()));
-        }
-        if let Some(v) = &e.description {
-            sets.push("description=?");
-            args.push(Box::new(v.clone()));
-        }
-        if let Some(v) = e.priority {
-            sets.push("priority=?");
-            args.push(Box::new(v));
-        }
-        if let Some(v) = e.parent_id {
-            sets.push("parent_id=?");
-            args.push(Box::new(v));
-        }
-        if let Some(v) = e.requirement_id {
-            sets.push("requirement_id=?");
-            args.push(Box::new(v));
-        }
-        if sets.is_empty() {
-            return Ok(self.ticket_get(id)?.is_some());
-        }
-        let sql = format!(
-            "UPDATE tickets SET {}, updated_at={NOW} WHERE id=?",
-            sets.join(", ")
-        );
-        args.push(Box::new(id));
-        let refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|b| b.as_ref()).collect();
-        let n = self.conn.execute(&sql, refs.as_slice())?;
-        Ok(n > 0)
-    }
-
-    /// Highest ticket id currently recorded in the database, or 0 when empty.
-    /// Combined with the file store this allocates the next stable id.
-    pub fn ticket_max_id(&self) -> Result<i64> {
-        Ok(self
-            .conn
-            .query_row("SELECT COALESCE(MAX(id),0) FROM tickets", [], |r| r.get(0))?)
-    }
-
-    /// Remove a ticket row. Used when a resolved/closed ticket is reopened and
-    /// moves back to the file store.
-    pub fn ticket_delete(&self, id: i64) -> Result<bool> {
-        let n = self.conn.execute("DELETE FROM tickets WHERE id=?", params![id])?;
-        Ok(n > 0)
-    }
-
-    /// Move a file-backed ticket into the database with an explicit id,
-    /// preserving the fields the file carried. `created_at` is kept when the
-    /// file supplied one; `resolved_at`/`closed_at` are stamped for the
-    /// matching terminal status.
-    #[allow(clippy::too_many_arguments)]
-    pub fn ticket_insert(
-        &self,
-        id: i64,
-        title: &str,
-        description: &str,
-        status: &str,
-        priority: i64,
-        parent_id: Option<i64>,
-        requirement_id: Option<i64>,
-        mode: Option<&str>,
-        resolution: Option<&str>,
-        created_at: Option<&str>,
-    ) -> Result<()> {
-        self.conn.execute(
-            &format!(
-                "INSERT OR REPLACE INTO tickets\
-                 (id,title,description,status,priority,parent_id,requirement_id,mode,resolution,\
-                  created_at,updated_at,resolved_at,closed_at)\
-                 VALUES(?,?,?,?,?,?,?,?,?,COALESCE(?,{NOW}),{NOW},\
-                  CASE WHEN ?='resolved' THEN {NOW} END,\
-                  CASE WHEN ?='closed' THEN {NOW} END)"
-            ),
-            params![
-                id,
-                title,
-                description,
-                status,
-                priority,
-                parent_id,
-                requirement_id,
-                mode,
-                resolution,
-                created_at,
-                status,
-                status
-            ],
-        )?;
-        Ok(())
-    }
-
-    // ------------------------------------------------------------ requirements
-    //
-    // Requirements are persisted as markdown files under
-    // `.genji/requirements/` (see `reqmd`). The `requirements` table below is
-    // legacy: it is retained only so existing workspaces can be migrated into
-    // the file store once, on startup.
-
-    /// Whether `table` exists in the database (used for the legacy migration).
-    pub fn has_table(&self, table: &str) -> Result<bool> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
-            params![table],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
-    }
-
-    /// List legacy DB requirements, ordered stakeholder-first. Used only by the
-    /// one-time migration to markdown files.
-    pub fn requirement_list(
-        &self,
-        level: Option<&str>,
-        status: Option<&str>,
-    ) -> Result<Vec<Requirement>> {
-        let mut sql = format!("SELECT {REQ_COLS} FROM requirements WHERE 1=1");
-        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(l) = level {
-            sql.push_str(" AND level=?");
-            args.push(Box::new(l.to_string()));
-        }
-        if let Some(s) = status {
-            sql.push_str(" AND status=?");
-            args.push(Box::new(s.to_string()));
-        }
-        sql.push_str(" ORDER BY CASE level WHEN 'stakeholder' THEN 0 ELSE 1 END, id ASC");
-        let mut stmt = self.conn.prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|b| b.as_ref()).collect();
-        let rows = stmt.query_map(refs.as_slice(), r_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
+    #[cfg(feature = "formal")]
     pub fn question_ask(
         &self,
         requirement_id: Option<i64>,
@@ -804,70 +465,5 @@ CREATE TABLE IF NOT EXISTS compactions (
             params![instance_id, removed, before, after, summary],
         )?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Db, TicketEdit};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_db(tag: &str) -> (Db, std::path::PathBuf) {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("genji-db-{tag}-{nanos}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = Db::open(&dir.join("test.db")).unwrap();
-        db.init_schema().unwrap();
-        (db, dir)
-    }
-
-    #[test]
-    fn ticket_insert_update_archive() {
-        let (db, dir) = temp_db("tickets");
-        db.ticket_insert(
-            1,
-            "First",
-            "desc",
-            "open",
-            2,
-            None,
-            Some(3),
-            Some("plan"),
-            None,
-            None,
-        )
-        .unwrap();
-        let id = 1;
-        assert_eq!(db.ticket_max_id().unwrap(), 1);
-
-        let edit = TicketEdit {
-            title: Some("Renamed".into()),
-            description: Some("new desc".into()),
-            priority: Some(1),
-            parent_id: Some(Some(9)),
-            requirement_id: Some(None),
-        };
-        assert!(db.ticket_update(id, &edit).unwrap());
-        let t = db.ticket_get(id).unwrap().unwrap();
-        assert_eq!(t.title, "Renamed");
-        assert_eq!(t.description, "new desc");
-        assert_eq!(t.priority, 1);
-        assert_eq!(t.parent_id, Some(9));
-        assert_eq!(t.requirement_id, None);
-
-        db.ticket_set_status(id, "resolved", Some("done")).unwrap();
-        assert_eq!(db.ticket_get(id).unwrap().unwrap().status, "resolved");
-
-        assert!(db.ticket_delete(id).unwrap());
-        assert!(db.ticket_get(id).unwrap().is_none());
-        assert_eq!(db.ticket_max_id().unwrap(), 0);
-
-        assert!(!db.ticket_update(9999, &edit).unwrap());
-        assert!(!db.ticket_delete(9999).unwrap());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

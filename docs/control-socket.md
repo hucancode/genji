@@ -16,8 +16,13 @@ genji stop all       # every registered instance
 
 Stopping is **graceful**: it takes effect at the next safe point. A long-running
 `bash` command is not interrupted, but the agent will stop instead of making
-another model call once it returns. The socket is removed on exit; a stale socket
-left by a crash is detected and replaced automatically.
+another model call once it returns. The socket is created with mode `0600` and
+removed on exit; a stale socket left by a crash is detected and replaced
+automatically.
+
+Commands use one short-lived connection and receive one response line. The
+append-only event trace is the complete durable output; use its path from
+`genji inspect <id>` with `tail -f` to follow a live run.
 
 ## Interact via netcat
 
@@ -48,7 +53,7 @@ left by a crash is detected and replaced automatically.
 `/context` returns the live context the agent is about to send on its next
 model call: a JSON object with `context_window`, `last_prompt_tokens`, the
 `messages` array (system prompt first), and the `tools` array. It is a direct
-read of the composer — no token estimates and no cached copy. `genji context
+read of the composer — no cached copy. `genji context
 <id>` prints this snapshot, pretty-printed.
 
 `/context stats` additionally computes the token breakdown: `total_tokens`,

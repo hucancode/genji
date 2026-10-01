@@ -9,12 +9,14 @@ mod modes;
 mod proc;
 mod prompts;
 mod registry;
+#[cfg(feature = "formal")]
 mod reqmd;
+#[cfg(feature = "formal")]
 mod ticketmd;
 mod tools;
 mod util;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -51,8 +53,9 @@ struct Cli {
     quiet_startup: bool,
     /// Enable the requirements/tickets system and the automatic plan/build
     /// cycle. Without it genji is a plain coding agent.
+    #[cfg(feature = "formal")]
     #[arg(long, global = true)]
-    ocd: bool,
+    formal: bool,
     #[arg(long, global = true)]
     workspace: Option<String>,
     #[arg(long, global = true)]
@@ -122,20 +125,25 @@ enum Command {
     },
 }
 
-fn ensure_layout(cfg: &Config, workspace: &std::path::Path) -> Result<()> {
-    for d in [
-        cfg.requirements_path(workspace),
-        cfg.plans_path(workspace),
-        cfg.tickets_path(workspace),
-        cfg.skills_path(workspace),
-    ] {
+fn ensure_layout(cfg: &Config, workspace: &std::path::Path, formal: bool) -> Result<()> {
+    #[cfg(feature = "formal")]
+    let mut dirs = vec![cfg.plans_path(workspace), cfg.skills_path(workspace)];
+    #[cfg(not(feature = "formal"))]
+    let dirs = vec![cfg.plans_path(workspace), cfg.skills_path(workspace)];
+    #[cfg(feature = "formal")]
+    if formal {
+        dirs.push(cfg.requirements_path(workspace));
+        dirs.push(cfg.tickets_path(workspace));
+    }
+    #[cfg(not(feature = "formal"))]
+    let _ = formal;
+    for d in dirs {
         std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
     }
     Ok(())
 }
 
-const DEFAULT_TASK: &str =
-    "Satisfy the active requirements in .genji/requirements/. Derive system requirements and tickets as needed.";
+const DEFAULT_TASK: &str = "Satisfy the active requirements in .genji/requirements/. Derive system requirements and tickets as needed.";
 
 /// Read the instruction supplied on the command line. Returns `None` when the
 /// user gave neither a task nor a non-empty instructions file, in which case
@@ -148,10 +156,10 @@ fn read_task(instructions_file: Option<&str>, task: Option<&str>) -> Result<Opti
             return Ok(Some(text));
         }
     }
-    if let Some(t) = task {
-        if !t.trim().is_empty() {
-            return Ok(Some(t.to_string()));
-        }
+    if let Some(t) = task
+        && !t.trim().is_empty()
+    {
+        return Ok(Some(t.to_string()));
     }
     Ok(None)
 }
@@ -167,13 +175,17 @@ enum Startup {
 
 /// Decide how to start from the two inputs the user can provide: an explicit
 /// instruction and the presence of active requirements. An explicit instruction
-/// always wins; otherwise, with OCD on, active requirements are the work queue;
+/// always wins; otherwise, with Formal on, active requirements are the work queue;
 /// nothing was provided and we wait for an instruction.
-fn startup_action(explicit_task: Option<String>, active_requirements: i64, ocd: bool) -> Startup {
+fn startup_action(
+    explicit_task: Option<String>,
+    active_requirements: i64,
+    formal: bool,
+) -> Startup {
     if let Some(t) = explicit_task {
         return Startup::Run(t);
     }
-    if ocd && active_requirements > 0 {
+    if formal && active_requirements > 0 {
         return Startup::Run(DEFAULT_TASK.to_string());
     }
     Startup::Wait
@@ -207,6 +219,7 @@ fn wait_for_instruction(
     }
 }
 
+#[cfg(feature = "formal")]
 fn mode_switch_instruction(mode: Mode) -> String {
     match mode {
         Mode::Plan => "Now run in PLAN mode: assess progress against the requirements, update requirements/tickets, and stop when the plan is current.".into(),
@@ -225,7 +238,7 @@ struct RunRequest {
     instance_id: String,
     mode: Mode,
     task: String,
-    ocd: bool,
+    formal: bool,
     quiet: bool,
     control: Option<Arc<control::Control>>,
     context: Arc<RwLock<context::ContextComposer>>,
@@ -239,7 +252,7 @@ fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<Str
         instance_id,
         mode,
         task,
-        ocd,
+        formal,
         quiet,
         control,
         context,
@@ -263,7 +276,7 @@ fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<Str
         mode,
         depth,
         task: task.clone(),
-        ocd,
+        formal,
         control,
         context,
     })?;
@@ -274,6 +287,7 @@ fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<Str
     Ok(report)
 }
 
+#[cfg(feature = "formal")]
 fn run_cycle(req: RunRequest) -> Result<String> {
     let RunRequest {
         cfg,
@@ -282,7 +296,7 @@ fn run_cycle(req: RunRequest) -> Result<String> {
         instance_id,
         mode: start_mode,
         task,
-        ocd,
+        formal,
         quiet,
         control,
         context,
@@ -305,7 +319,7 @@ fn run_cycle(req: RunRequest) -> Result<String> {
         mode: start_mode,
         depth: 0,
         task: task.clone(),
-        ocd,
+        formal,
         control,
         context,
     })?;
@@ -410,6 +424,13 @@ fn query_status(socket: &str) -> String {
     }
 }
 
+/// `genji list` only shows live registry entries. Those are the top-level,
+/// controllable runs, so every listed row is a root instance and owns the
+/// workspace control socket.
+fn is_root_instance(_inst: &registry::Instance) -> bool {
+    true
+}
+
 /// `genji list` — running instances with their live status. stdout is machine
 /// output (JSON); the human table is written to stderr.
 fn cmd_list() -> Result<()> {
@@ -427,6 +448,7 @@ fn cmd_list() -> Result<()> {
         .map(|(inst, status)| {
             json!({
                 "id": inst.id,
+                "root": is_root_instance(inst),
                 "pid": inst.pid,
                 "uptime_secs": inst.uptime_secs(),
                 "workspace": inst.workspace,
@@ -443,13 +465,14 @@ fn cmd_list() -> Result<()> {
         return Ok(());
     }
     eprintln!(
-        "{:<8} {:<7} {:<8} {:<38} STATUS",
-        "ID", "PID", "UPTIME", "WORKSPACE"
+        "{:<8} {:<4} {:<7} {:<8} {:<38} STATUS",
+        "ID", "ROOT", "PID", "UPTIME", "WORKSPACE"
     );
     for (inst, status) in &rows {
         eprintln!(
-            "{:<8} {:<7} {:<8} {:<38} {}",
+            "{:<8} {:<4} {:<7} {:<8} {:<38} {}",
             inst.id,
+            if is_root_instance(inst) { "*" } else { "" },
             inst.pid,
             format_uptime(inst.uptime_secs()),
             inst.workspace,
@@ -581,8 +604,10 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
 fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
     let cfg = Config::load_or_create(workspace)?;
     let db_path = cfg.db_file(workspace);
-    let requirements_dir = cfg.requirements_path(workspace);
     let plans_dir = cfg.plans_path(workspace);
+    #[cfg(feature = "formal")]
+    let requirements_dir = cfg.requirements_path(workspace);
+    #[cfg(feature = "formal")]
     let tickets_dir = cfg.tickets_path(workspace);
 
     // Deleting the database out from under a live instance would split its
@@ -606,22 +631,33 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
         .into_iter()
         .filter(|p| p.exists())
         .collect();
+    #[cfg(feature = "formal")]
     let mut requirement_files = Vec::new();
+    #[cfg(feature = "formal")]
     collect_files(&requirements_dir, &mut requirement_files);
     let mut plan_files = Vec::new();
     collect_files(&plans_dir, &mut plan_files);
+    #[cfg(feature = "formal")]
     let mut ticket_files = Vec::new();
+    #[cfg(feature = "formal")]
     collect_files(&tickets_dir, &mut ticket_files);
-    let total = db_existing.len()
-        + requirement_files.len()
-        + plan_files.len()
-        + ticket_files.len();
+    let total = db_existing.len() + plan_files.len() + {
+        #[cfg(feature = "formal")]
+        {
+            requirement_files.len() + ticket_files.len()
+        }
+        #[cfg(not(feature = "formal"))]
+        {
+            0
+        }
+    };
 
     if total == 0 {
         eprintln!(
             "[reset] nothing to delete; database, plans, requirements and tickets are already empty"
         );
     } else {
+        #[cfg(feature = "formal")]
         eprintln!(
             "[reset] this will delete {total} file(s): {} database file(s), {} plan(s) in {}, {} requirement(s) in {}, {} open ticket(s) in {}",
             db_existing.len(),
@@ -632,11 +668,16 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
             ticket_files.len(),
             tickets_dir.display(),
         );
+        #[cfg(not(feature = "formal"))]
+        eprintln!(
+            "[reset] this will delete {total} file(s): {} database file(s), {} plan(s) in {}",
+            db_existing.len(),
+            plan_files.len(),
+            plans_dir.display(),
+        );
         if !assume_yes {
             if !std::io::stdin().is_terminal() {
-                bail!(
-                    "refusing to delete {total} file(s) without confirmation; re-run with --yes"
-                );
+                bail!("refusing to delete {total} file(s) without confirmation; re-run with --yes");
             }
             eprint!("Delete {total} file(s) and start over? [y/N] ");
             use std::io::Write;
@@ -651,6 +692,7 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
         for p in &db_existing {
             std::fs::remove_file(p).with_context(|| format!("deleting {}", p.display()))?;
         }
+        #[cfg(feature = "formal")]
         if requirements_dir.exists() {
             std::fs::remove_dir_all(&requirements_dir)
                 .with_context(|| format!("deleting {}", requirements_dir.display()))?;
@@ -659,6 +701,7 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
             std::fs::remove_dir_all(&plans_dir)
                 .with_context(|| format!("deleting {}", plans_dir.display()))?;
         }
+        #[cfg(feature = "formal")]
         if tickets_dir.exists() {
             std::fs::remove_dir_all(&tickets_dir)
                 .with_context(|| format!("deleting {}", tickets_dir.display()))?;
@@ -668,7 +711,10 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
 
     // Recreate the layout and a clean, ready database so the next run starts
     // from an empty workspace.
-    for d in [&requirements_dir, &plans_dir, &tickets_dir] {
+    std::fs::create_dir_all(&plans_dir)
+        .with_context(|| format!("creating {}", plans_dir.display()))?;
+    #[cfg(feature = "formal")]
+    for d in [&requirements_dir, &tickets_dir] {
         std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
     }
     let db = Db::open(&db_path)?;
@@ -679,11 +725,18 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
         db_path.display()
     );
 
+    #[cfg(feature = "formal")]
     let deleted: Vec<String> = db_existing
         .iter()
-        .chain(requirement_files.iter())
         .chain(plan_files.iter())
+        .chain(requirement_files.iter())
         .chain(ticket_files.iter())
+        .map(|p| p.display().to_string())
+        .collect();
+    #[cfg(not(feature = "formal"))]
+    let deleted: Vec<String> = db_existing
+        .iter()
+        .chain(plan_files.iter())
         .map(|p| p.display().to_string())
         .collect();
     println!(
@@ -721,10 +774,7 @@ fn cmd_setplan(id: &str, slug: &str) -> Result<()> {
         bail!("missing plan slug (usage: genji setplan <id> <slug>)");
     }
     let inst = registry::find(id)?;
-    let resp = control::send(
-        Path::new(&inst.control_socket),
-        &format!("/setplan {slug}"),
-    )?;
+    let resp = control::send(Path::new(&inst.control_socket), &format!("/setplan {slug}"))?;
     let message = status_text(&resp);
     println!(
         "{}",
@@ -970,19 +1020,24 @@ fn main() -> Result<()> {
     // Provider precedence: --provider > GENJI_PROVIDER > config.provider.
     if let Some(p) = &cli.provider {
         cfg.provider = p.clone();
-    } else if let Ok(p) = std::env::var("GENJI_PROVIDER") {
-        if !p.trim().is_empty() {
-            cfg.provider = p;
-        }
+    } else if let Ok(p) = std::env::var("GENJI_PROVIDER")
+        && !p.trim().is_empty()
+    {
+        cfg.provider = p;
     }
-    ensure_layout(&cfg, &workspace)?;
+    #[cfg(feature = "formal")]
+    let formal = cli.formal;
+    #[cfg(not(feature = "formal"))]
+    let formal = false;
+    ensure_layout(&cfg, &workspace, formal)?;
 
     let db = Db::open(&cfg.db_file(&workspace))?;
     db.init_schema()?;
 
     let synced = tools::skills::sync_skills(&db, &cfg.skills_path(&workspace)).unwrap_or(0);
-    if cfg.auto_ingest_requirements {
-        let total = reqmd::sync(&db, &cfg, &workspace)?;
+    #[cfg(feature = "formal")]
+    if formal && cfg.auto_ingest_requirements {
+        let total = reqmd::sync(&cfg, &workspace)?;
         if total > 0 && !cli.quiet_startup {
             eprintln!(
                 "[requirements] loaded {total} md file(s) from {}",
@@ -990,14 +1045,17 @@ fn main() -> Result<()> {
             );
         }
     }
-    ticketmd::sync(&db, &cfg, &workspace)?;
+    #[cfg(feature = "formal")]
+    if formal {
+        ticketmd::sync(&cfg, &workspace)?;
+    }
     prompts::seed_prompts(&db)?;
     if synced > 0 && !cli.quiet_startup {
         eprintln!("[skills] synced {synced} skill file(s)");
     }
 
     // With no mode subcommand we default to build mode. The requirements/tickets
-    // system (and the automatic plan/build cycle) is opt-in via `--ocd`.
+    // system (and the automatic plan/build cycle) is opt-in via `--formal`.
     let (start_mode, task_arg): (Mode, Option<&str>) = match &cli.command {
         Some(Command::Plan { task }) => (Mode::Plan, task.as_deref()),
         Some(Command::Build { task }) => (Mode::Build, task.as_deref()),
@@ -1006,9 +1064,7 @@ fn main() -> Result<()> {
         Some(_) => unreachable!("instance subcommand handled above"),
         None => (Mode::Build, cli.task.as_deref()),
     };
-    let ocd = cli.ocd;
-    // OCD always runs the auto plan/build cycle; a plain run is a single mode.
-    let cycle = ocd;
+    // Formal always runs the auto plan/build cycle; a plain run is a single mode.
     let explicit_task = read_task(cli.instructions_file.as_deref(), task_arg)?;
     let quiet = cli.quiet_startup || cli.subagent;
     // One id per run: the instance id. It names the registry record, the event
@@ -1044,7 +1100,7 @@ fn main() -> Result<()> {
 
     // Build the context before the control socket so both share one composer:
     // the agent writes to it, `/context` takes a read guard and measures it.
-    let context = agent::build_context(&cfg, &db, start_mode, ocd)?;
+    let context = agent::build_context(&cfg, &db, start_mode, formal)?;
 
     // Top-level runs open a control socket so instructions can be injected
     // mid-run; subagents never do. Controllable runs also register themselves so
@@ -1078,7 +1134,15 @@ fn main() -> Result<()> {
 
     // Start from an explicit instruction when given, else the active
     // requirements, else wait for an instruction on the control socket.
-    let task = match startup_action(explicit_task, reqmd::active_count(&cfg, &workspace)?, ocd) {
+    #[cfg(feature = "formal")]
+    let active_requirements = if formal {
+        reqmd::active_count(&cfg, &workspace)?
+    } else {
+        0
+    };
+    #[cfg(not(feature = "formal"))]
+    let active_requirements = 0;
+    let task = match startup_action(explicit_task, active_requirements, formal) {
         Startup::Run(t) => t,
         Startup::Wait => match &control {
             Some(c) => match wait_for_instruction(c, &instance_id, quiet)? {
@@ -1109,14 +1173,20 @@ fn main() -> Result<()> {
         instance_id,
         mode: start_mode,
         task,
-        ocd,
+        formal,
         quiet,
         control: control.clone(),
         context,
     };
-    let report = if cycle {
+    #[cfg(feature = "formal")]
+    let report = if formal {
         run_cycle(request)?
     } else {
+        let parent = cli.parent_instance.clone();
+        run_single(request, parent, cli.depth)?
+    };
+    #[cfg(not(feature = "formal"))]
+    let report = {
         let parent = cli.parent_instance.clone();
         run_single(request, parent, cli.depth)?
     };

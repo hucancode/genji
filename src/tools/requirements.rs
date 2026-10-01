@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -51,7 +51,9 @@ pub fn create(agent: &mut Agent, args: &Value) -> Result<String> {
     )?;
     Ok(format!(
         "created {level} requirement #{}: {} ({})",
-        r.id, r.title, r.display_path(&agent.workspace)
+        r.id,
+        r.title,
+        r.display_path(&agent.workspace)
     ))
 }
 
@@ -102,16 +104,17 @@ pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
 pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
     let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
     let status = opt_str(args, "status");
-    if let Some(s) = &status {
-        if !["active", "met", "removed"].contains(&s.as_str()) {
-            bail!("status must be active|met|removed");
-        }
+    if let Some(s) = &status
+        && !["active", "met", "removed"].contains(&s.as_str())
+    {
+        bail!("status must be active|met|removed");
     }
     let level = opt_str(args, "level");
-    if let Some(l) = &level {
-        if l != "stakeholder" && l != "system" {
-            bail!("level must be stakeholder|system");
-        }
+    if let Some(l) = &level
+        && l != "stakeholder"
+        && l != "system"
+    {
+        bail!("level must be stakeholder|system");
     }
     let parent_id = args.get("parent_id").map(|v| v.as_i64());
     if !reqmd::update(
@@ -290,12 +293,18 @@ mod tests {
 
         // By id: the full requirement body, with no filtering applied.
         let one = read_requirements(&cfg, &ws, Some(parent.id), None, None).unwrap();
-        assert!(one.contains("#1 [stakeholder:active] Cat Classifier"), "{one}");
+        assert!(
+            one.contains("#1 [stakeholder:active] Cat Classifier"),
+            "{one}"
+        );
         assert!(one.contains("Must classify cats."), "{one}");
 
         // No id: list everything.
         let all = read_requirements(&cfg, &ws, None, None, None).unwrap();
-        assert!(all.contains("#1 [stakeholder:active] Cat Classifier"), "{all}");
+        assert!(
+            all.contains("#1 [stakeholder:active] Cat Classifier"),
+            "{all}"
+        );
         assert!(all.contains("#2 [system:met] Accept URLs"), "{all}");
 
         // Filter by level.

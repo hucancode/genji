@@ -6,12 +6,7 @@ use crate::modes::Mode;
 pub fn seed_prompts(db: &Db) -> Result<()> {
     for mode in Mode::all().into_iter().filter(Mode::allows_extended) {
         if db.prompt_active(mode.as_str())?.is_none() {
-            db.prompt_add_version(
-                mode.as_str(),
-                "",
-                "default",
-                "initial seed",
-            )?;
+            db.prompt_add_version(mode.as_str(), "", "default", "initial seed")?;
         }
     }
     Ok(())

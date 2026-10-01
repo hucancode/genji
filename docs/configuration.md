@@ -6,18 +6,12 @@
 |-----|---------|---------|
 | `provider` | `local` | Active provider profile name (also the auth-file key when no profile matches) |
 | `providers` | `{ local }` | Named endpoint profiles — see [Providers](providers.md) |
-| `base_url` | `http://127.0.0.1:8080/v1` | Legacy fallback base URL |
-| `api_key` | `""` | Legacy fallback explicit key |
-| `api_key_env` | `""` | Legacy fallback env var |
-| `auth_file` | `""` | Legacy fallback auth file|
-| `default_model` | `qwen2.5-coder-7b` | Last-resort model when nothing else is set |
-| `models.plan` / `.build` / `.explore` / `.retro` | `qwen2.5-coder-7b` | **Per-mode model picking** |
-| `token_limit` | `2000000` | Fallback max tokens per run (prompt + completion); a provider or per-model limit overrides it |
+| `token_limit` | `4000000` | Fallback max tokens per run (prompt + completion); a provider or per-model limit overrides it |
 | `time_limit_secs` | `1800` | Max wall-clock time per run |
 | `compact_threshold` | `0.70` | Fraction of `context_window` that triggers compaction |
 | `compact_keep_recent` | `6` | Messages kept verbatim during compaction |
 | `context_window` | `32768` | Fallback model context size, used with the threshold |
-| `max_output_tokens` | `4096` | Fallback `max_tokens` sent to the API |
+| `max_output_tokens` | `8192` | Fallback `max_tokens` sent to the API |
 | `tool_result_max_bytes` | `24000` | Inline limit for tool results; larger results are spilled to `tmp_dir` and truncated with a pointer to the log |
 | `bash_timeout_secs` | `120` | Default `bash` timeout |
 | `spawn_timeout_secs` | `900` | Subagent timeout |
@@ -29,7 +23,7 @@
 | `tmp_dir` | `.genji/tmp` | Scratch space for bash/spawn output and spilled tool results |
 | `control_socket` | `.genji/control.sock` | Unix socket for mid-run steering |
 | `control_enabled` | `true` | Open the control socket for top-level runs |
-| `auto_ingest_requirements` | `true` | Load (and migrate legacy DB rows to) `.genji/requirements/**/*.md` on startup |
+| `auto_ingest_requirements` | `true` | Load `.genji/requirements/**/*.md` on Formal startup |
 
 CLI flag `--workspace <dir>` overrides config.
 Control subcommands `list`, `inspect <id>`, `instruct <id> <text>` and
@@ -44,9 +38,9 @@ Control subcommands `list`, `inspect <id>`, `instruct <id> <text>` and
 ```
 .genji/
   requirements/*.md        # requirements, level in frontmatter (ingested automatically)
-  tickets/*.md             # open tickets; resolved/closed tickets move into genji.db
+  tickets/*.md             # all formal-mode tickets, including closed tickets
   config.json              # runtime configuration (created on first run)
-  genji.db                 # SQLite: instances, resolved/closed tickets, prompts, history
+  genji.db                 # SQLite: instances, messages, prompts, and history
   plans/
     *.md                   # implementation plans written by plan mode
   skills/

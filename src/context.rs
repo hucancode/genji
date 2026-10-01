@@ -13,7 +13,7 @@
 //! strings: it clones nothing and keeps no counters to drift out of sync.
 
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::llm::{self, ChatMessage, LlmClient};
 use crate::tools::ToolSpec;
@@ -163,6 +163,7 @@ impl ContextComposer {
     }
 
     /// Switch the mode-dependent context: its tools, system prompt, and window.
+    #[cfg(feature = "formal")]
     pub fn switch_mode(&mut self, tools: Vec<ToolSpec>, system: String, context_window: i64) {
         self.tools = tools;
         self.context_window = context_window;

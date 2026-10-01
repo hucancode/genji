@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 use crate::config::{Config, ProviderConfig};
@@ -55,10 +55,10 @@ impl ChatMessage {
         let mut obj = serde_json::Map::new();
         obj.insert("role".into(), json!(self.role));
         obj.insert("content".into(), json!(self.content));
-        if let Some(rc) = &self.reasoning_content {
-            if !rc.is_empty() {
-                obj.insert("reasoning_content".into(), json!(rc));
-            }
+        if let Some(rc) = &self.reasoning_content
+            && !rc.is_empty()
+        {
+            obj.insert("reasoning_content".into(), json!(rc));
         }
         if !self.tool_calls.is_empty() {
             let calls: Vec<Value> = self
@@ -252,7 +252,7 @@ impl LlmClient {
             Err(e) => {
                 return Err(anyhow::Error::new(Retryable {
                     msg: format!("transport error: {e}"),
-                }))
+                }));
             }
         };
         parse_response(&value)

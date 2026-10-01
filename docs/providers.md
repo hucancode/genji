@@ -101,12 +101,11 @@ else through.
 | `extra_headers` / `extra_query` | `{}` | Extra request headers / query params |
 
 The field resolution order is: profile single `model` → profile per-mode
-`models` → top-level per-mode `models` → `default_model`. Any field a profile
-leaves empty is inherited from the legacy top-level fields, so a flat config
-(no `providers`) keeps working exactly as before.
+`models`. A provider profile must be present in `providers`; there is no flat
+configuration fallback.
 
 Limits (`token_limit`, `context_window`, `max_output_tokens`) follow the active
-model. They resolve as: top-level value → provider override → `model_limits`
+model. They resolve as: global limit → provider override → `model_limits`
 entry for the chosen model. Because the model can change per mode (and per
 plan/build cycle), the agent re-resolves the budget in `set_mode`, so each model
 carries its own token limit and context size. Give each model its own entry

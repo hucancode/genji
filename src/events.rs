@@ -1,23 +1,22 @@
 //! Machine-readable event stream.
 //!
-//! A web frontend consumes genji's run by reading newline-delimited JSON
-//! (JSONL) from **stdout**: one event object per line. Everything a human reads
-//! (progress narration, warnings, retries, budget notices, …) goes to
-//! **stderr**, so stdout stays a clean, parseable stream.
+//! A machine frontend can consume genji's run as newline-delimited JSON
+//! (JSONL) from **stdout** or the append-only per-instance event file.
+//! Everything a human reads (progress narration,
+//! warnings, retries, budget notices, …) goes to **stderr** and is cosmetic.
 //!
-//! Every event is also appended to a per-instance trace file so it can be
-//! inspected after the fact, including subagent runs whose events are not
-//! relayed into the parent's stream. See `genji inspect`.
+//! The event file is the durable complete output, including for subagent runs
+//! whose events are not relayed into the parent's stream. See `genji inspect`.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Writes a newline-delimited JSON event stream (one object per line, flushed
-/// after each event) to stdout and, when configured, to a trace file.
+/// after each event) to stdout and the event file.
 pub struct EventEmitter {
     instance: String,
     seq: AtomicU64,
@@ -26,9 +25,10 @@ pub struct EventEmitter {
 }
 
 impl EventEmitter {
-    /// Emit to stdout, tagged with `instance`, and append to `trace_path` when
-    /// given so the full event trace can be inspected later.
-    pub fn new(instance: impl Into<String>, trace_path: Option<PathBuf>) -> Self {
+    /// Emit to stdout, tagged with `instance`, and append to `trace_path`.
+    /// Event-file creation is fail-fast: a run must not start without its
+    /// durable output.
+    pub fn new(instance: impl Into<String>, trace_path: Option<PathBuf>) -> io::Result<Self> {
         Self::with_writer_and_trace(instance, Box::new(io::stdout()), trace_path)
     }
 
@@ -36,29 +36,34 @@ impl EventEmitter {
     #[cfg(test)]
     pub fn with_writer(instance: impl Into<String>, out: Box<dyn Write + Send>) -> Self {
         Self::with_writer_and_trace(instance, out, None)
+            .expect("an emitter without a trace file cannot fail to initialize")
     }
 
     fn with_writer_and_trace(
         instance: impl Into<String>,
         out: Box<dyn Write + Send>,
         trace_path: Option<PathBuf>,
-    ) -> Self {
-        let trace = trace_path.and_then(|p| {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
+    ) -> io::Result<Self> {
+        let trace = match trace_path {
+            Some(p) => {
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                Some(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&p)?,
+                )
             }
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&p)
-                .ok()
-        });
-        Self {
+            None => None,
+        };
+        Ok(Self {
             instance: instance.into(),
             seq: AtomicU64::new(0),
             out: Mutex::new(out),
             trace: Mutex::new(trace),
-        }
+        })
     }
 
     fn now_ms() -> u64 {
@@ -82,15 +87,17 @@ impl EventEmitter {
         let Ok(line) = serde_json::to_string(&event) else {
             return;
         };
+        // Persist first: stdout and socket delivery are live conveniences, but
+        // the append-only event file is the durable output for the run.
+        if let Ok(mut trace) = self.trace.lock()
+            && let Some(f) = trace.as_mut()
+            && writeln!(f, "{line}").and_then(|_| f.flush()).is_err()
+        {
+            eprintln!("[events] failed to append to the event file");
+        }
         if let Ok(mut out) = self.out.lock() {
             let _ = writeln!(out, "{line}");
             let _ = out.flush();
-        }
-        if let Ok(mut trace) = self.trace.lock() {
-            if let Some(f) = trace.as_mut() {
-                let _ = writeln!(f, "{line}");
-                let _ = f.flush();
-            }
         }
     }
 
@@ -169,6 +176,7 @@ impl EventEmitter {
         self.emit(json!({ "type": "status", "status": status }));
     }
 
+    #[cfg(feature = "formal")]
     pub fn mode(&self, mode: &str, model: &str) {
         self.emit(json!({ "type": "mode", "mode": mode, "model": model }));
     }
@@ -183,6 +191,7 @@ impl EventEmitter {
         }));
     }
 
+    #[cfg(feature = "formal")]
     pub fn cycle(&self, cycle: usize, max: usize, mode: &str, active_requirements: i64) {
         self.emit(json!({
             "type": "cycle",
@@ -267,6 +276,20 @@ mod tests {
     }
 
     #[test]
+    fn event_file_creation_is_fail_fast() {
+        let parent = std::env::temp_dir().join(format!(
+            "genji-events-blocked-{}-{}",
+            std::process::id(),
+            super::EventEmitter::now_ms()
+        ));
+        let _ = std::fs::remove_file(&parent);
+        std::fs::write(&parent, "not a directory").unwrap();
+        let result = EventEmitter::new("sess-fail", Some(parent.join("events.jsonl")));
+        assert!(result.is_err());
+        let _ = std::fs::remove_file(&parent);
+    }
+
+    #[test]
     fn events_are_appended_to_the_trace_file() {
         let path = std::env::temp_dir().join(format!(
             "genji-events-test-{}-{}.jsonl",
@@ -274,7 +297,7 @@ mod tests {
             super::EventEmitter::now_ms()
         ));
         let _ = std::fs::remove_file(&path);
-        let e = EventEmitter::new("sess-trace", Some(path.clone()));
+        let e = EventEmitter::new("sess-trace", Some(path.clone())).unwrap();
         e.user("one");
         e.instance_end("done", 3, "report text");
         let text = std::fs::read_to_string(&path).unwrap();

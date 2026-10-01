@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use rusqlite::params;
 use serde_json::Value;
 
@@ -63,13 +63,14 @@ pub fn instance(agent: &mut Agent, args: &Value) -> Result<String> {
         let (seq, role, content, tc) = row?;
         let snippet: String = content.chars().take(500).collect();
         out.push_str(&format!("#{seq} [{role}] {snippet}\n"));
-        if let Some(tc) = tc {
-            if tc != "null" && !tc.is_empty() {
-                out.push_str(&format!(
-                    "    tool_calls: {}\n",
-                    tc.chars().take(200).collect::<String>()
-                ));
-            }
+        if let Some(tc) = tc
+            && tc != "null"
+            && !tc.is_empty()
+        {
+            out.push_str(&format!(
+                "    tool_calls: {}\n",
+                tc.chars().take(200).collect::<String>()
+            ));
         }
     }
     if out.is_empty() {

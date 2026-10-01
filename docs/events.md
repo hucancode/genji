@@ -1,11 +1,15 @@
 # Trace events
 
-genji's output is split by stream:
+genji exposes the same structured run events through two machine-facing
+outputs:
 
-- **stdout** is machine output: a stream of newline-delimited JSON (JSONL)
-  events, one object per line, flushed as the run happens.
-- **stderr** is human output: startup banners, tool progress, retries,
-  budget/timeout notices, warnings, and a final `[report] …` line.
+- **Event file** is the complete, durable, append-only JSONL output, flushed per
+  event.
+- **stdout** mirrors the JSONL stream for process-based integrations.
+
+**stderr** is cosmetic human output: startup banners, tool progress, retries,
+budget/timeout notices, warnings, and a final `[report] …` line. A machine
+frontend must not depend on stderr.
 
 Nothing structured ever goes to stderr and nothing unstructured ever goes to
 stdout, so a UI (or another agent) can parse stdout line by line with no
@@ -65,12 +69,23 @@ to that file:
 genji inspect <subagent_instance>
 ```
 
-## Event traces
+## Event files
 
 Each instance writes its events to `<registry>/events/<instance>.jsonl` (by
-default `~/.genji/events/`), append-only and flushed per event. This covers runs
-whose events never appeared on the parent stream — most importantly subagents —
-and survives after the process exits.
+default `~/.genji/events/`), append-only and flushed per event. The process
+fails to start if this file cannot be opened. It covers runs whose events never
+appeared on the parent stream — most importantly subagents — and survives after
+the process exits.
+
+To follow a live run, tail its trace file. Obtain the trace path with
+`genji inspect <id>`:
+
+```bash
+tail -f ~/.genji/events/<instance>.jsonl
+```
+
+Events emitted before attaching remain available because the trace is the
+complete durable record.
 
 ## Example
 
@@ -93,8 +108,8 @@ stderr.
 
 ```bash
 genji list
-# stdout: [{"id":"…","pid":1234,"status":"idle"},…]
-# stderr: the usual ID/PID/UPTIME/WORKSPACE table
+# stdout: [{"id":"…","root":true,"pid":1234,"status":"idle"},…]
+# stderr: the usual ID/ROOT/PID/UPTIME/WORKSPACE table (`*` = root/control owner)
 
 genji stop <id>
 # stdout: [{"id":"…","ok":true,"message":"stopping"}]

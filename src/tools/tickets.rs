@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde_json::Value;
 use std::path::Path;
 
@@ -7,69 +7,14 @@ use crate::agent::Agent;
 use crate::db::TicketEdit;
 use crate::ticketmd::{self, Ticket};
 
-/// Adapt a database row (a resolved/closed ticket) to the unified ticket type
-/// used by the tools. DB tickets have no backing file.
-fn from_db(t: crate::db::Ticket) -> Ticket {
-    Ticket {
-        id: t.id,
-        title: t.title,
-        description: t.description,
-        status: t.status,
-        priority: t.priority,
-        parent_id: t.parent_id,
-        requirement_id: t.requirement_id,
-        mode: t.mode,
-        resolution: t.resolution,
-        created_at: t.created_at,
-        updated_at: t.updated_at,
-        path: None,
-    }
-}
-
-/// Look up a ticket by id across the file store (open/in_progress) and the
-/// database (resolved/closed).
 fn find(agent: &Agent, id: i64) -> Result<Option<Ticket>> {
-    if let Some(t) = ticketmd::load_by_id(&agent.cfg, &agent.workspace, id)? {
-        return Ok(Some(t));
-    }
-    Ok(agent.db.ticket_get(id)?.map(from_db))
+    ticketmd::load_by_id(&agent.cfg, &agent.workspace, id)
 }
 
-/// Every ticket, file-backed and archived, ordered by priority then id.
 pub fn list_all(agent: &Agent) -> Result<Vec<Ticket>> {
     let mut all = ticketmd::load_all(&agent.cfg, &agent.workspace)?;
-    for t in agent.db.ticket_list(None, None)? {
-        all.push(from_db(t));
-    }
     all.sort_by_key(|t| (t.priority, t.id));
     Ok(all)
-}
-
-/// Move a file-backed ticket into the database (resolve/close), stamping the
-/// terminal status and dropping the file.
-fn move_to_db(
-    agent: &Agent,
-    t: &Ticket,
-    status: &str,
-    resolution: Option<&str>,
-) -> Result<()> {
-    let res = resolution.or(t.resolution.as_deref());
-    agent.db.ticket_insert(
-        t.id,
-        &t.title,
-        &t.description,
-        status,
-        t.priority,
-        t.parent_id,
-        t.requirement_id,
-        t.mode.as_deref(),
-        res,
-        Some(&t.created_at),
-    )?;
-    if let Some(path) = &t.path {
-        let _ = std::fs::remove_file(path);
-    }
-    Ok(())
 }
 
 /// Format one ticket for tool output.
@@ -107,7 +52,6 @@ pub fn create(agent: &mut Agent, args: &Value) -> Result<String> {
     let requirement_id = opt_i64(args, "requirement_id");
     let mode = agent.mode.as_str().to_string();
     let t = ticketmd::create(
-        &agent.db,
         &agent.cfg,
         &agent.workspace,
         &title,
@@ -155,9 +99,9 @@ pub fn claim(agent: &mut Agent, args: &Value) -> Result<String> {
     let requirement_id = opt_i64(args, "requirement_id");
     let ticket = match id {
         Some(id) => find(agent, id)?,
-        None => list_all(agent)?
-            .into_iter()
-            .find(|t| t.status == "open" && requirement_id.is_none_or(|r| t.requirement_id == Some(r))),
+        None => list_all(agent)?.into_iter().find(|t| {
+            t.status == "open" && requirement_id.is_none_or(|r| t.requirement_id == Some(r))
+        }),
     };
     let Some(t) = ticket else {
         return Ok(match id {
@@ -175,19 +119,24 @@ pub fn claim(agent: &mut Agent, args: &Value) -> Result<String> {
         &TicketEdit::default(),
         Some("in_progress"),
         None,
-    )? else {
+    )?
+    else {
         bail!("ticket #{} is archived and cannot be claimed", t.id);
     };
-    Ok(format!("claimed ticket #{}\n\n{}", t.id, fmt_ticket(&t, &agent.workspace)))
+    Ok(format!(
+        "claimed ticket #{}\n\n{}",
+        t.id,
+        fmt_ticket(&t, &agent.workspace)
+    ))
 }
 
 pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
     let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
     let status = opt_str(args, "status");
-    if let Some(s) = &status {
-        if !["open", "in_progress", "resolved", "closed"].contains(&s.as_str()) {
-            bail!("status must be open|in_progress|resolved|closed");
-        }
+    if let Some(s) = &status
+        && !["open", "in_progress", "resolved", "closed"].contains(&s.as_str())
+    {
+        bail!("status must be open|in_progress|resolved|closed");
     }
     let edit = TicketEdit {
         title: opt_str(args, "title"),
@@ -197,54 +146,34 @@ pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
         requirement_id: args.get("requirement_id").map(|v| v.as_i64()),
     };
     let resolution = opt_str(args, "resolution");
-    let Some(t) = find(agent, id)? else {
+    let Some(_t) = find(agent, id)? else {
         bail!("ticket #{id} not found");
     };
-    if t.path.is_some() {
-        let updated = ticketmd::update(
-            &agent.cfg,
-            &agent.workspace,
-            id,
-            &edit,
-            status.as_deref(),
-            resolution.as_deref(),
-        )?
-        .expect("ticket disappeared during update");
-        if matches!(updated.status.as_str(), "resolved" | "closed") {
-            let s = updated.status.clone();
-            move_to_db(agent, &updated, &s, updated.resolution.as_deref())?;
-        }
-    } else {
-        if let Some(s) = &status {
-            if matches!(s.as_str(), "open" | "in_progress") {
-                bail!("ticket #{id} is archived and cannot be reopened");
-            }
-        }
-        agent.db.ticket_update(id, &edit)?;
-        match &status {
-            Some(s) => {
-                agent.db.ticket_set_status(id, s, resolution.as_deref())?;
-            }
-            None => {
-                if let Some(r) = resolution {
-                    agent.db.ticket_set_status(id, &t.status, Some(&r))?;
-                }
-            }
-        }
-    }
+    ticketmd::update(
+        &agent.cfg,
+        &agent.workspace,
+        id,
+        &edit,
+        status.as_deref(),
+        resolution.as_deref(),
+    )?
+    .ok_or_else(|| anyhow::anyhow!("ticket #{id} disappeared during update"))?;
     Ok(format!("updated ticket #{id}"))
 }
 
 pub fn close(agent: &mut Agent, args: &Value) -> Result<String> {
     let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
     let reason = opt_str(args, "reason");
-    let Some(t) = find(agent, id)? else {
+    let Some(_t) = find(agent, id)? else {
         bail!("ticket #{id} not found");
     };
-    if t.path.is_some() {
-        move_to_db(agent, &t, "closed", reason.as_deref())?;
-    } else {
-        agent.db.ticket_set_status(id, "closed", reason.as_deref())?;
-    }
+    ticketmd::update(
+        &agent.cfg,
+        &agent.workspace,
+        id,
+        &TicketEdit::default(),
+        Some("closed"),
+        reason.as_deref(),
+    )?;
     Ok(format!("ticket #{id} closed"))
 }

@@ -3,7 +3,7 @@
 ## Composition and budget
 
 The prompt sent to the model has three parts: the **system prompt** (shared +
-mode + OCD + extended guidance, plus any active plan), the **system tools** (the
+mode + Formal + extended guidance, plus any active plan), the **system tools** (the
 tool definitions for the mode), and the **turn messages** (the conversation).
 `ContextComposer` owns all three and the operations that shape them: pushing
 messages and tool results, switching mode, compaction, and stats.

@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::path::Path;
 
@@ -11,19 +11,19 @@ pub fn parse_skill(text: &str, fallback_name: &str) -> (String, String, String) 
     let mut name = fallback_name.to_string();
     let mut description = String::new();
     let body;
-    if let Some(rest) = text.strip_prefix("---\n") {
-        if let Some(idx) = rest.find("\n---") {
-            let front = &rest[..idx];
-            for line in front.lines() {
-                if let Some(v) = line.strip_prefix("name:") {
-                    name = v.trim().trim_matches('"').to_string();
-                } else if let Some(v) = line.strip_prefix("description:") {
-                    description = v.trim().trim_matches('"').to_string();
-                }
+    if let Some(rest) = text.strip_prefix("---\n")
+        && let Some(idx) = rest.find("\n---")
+    {
+        let front = &rest[..idx];
+        for line in front.lines() {
+            if let Some(v) = line.strip_prefix("name:") {
+                name = v.trim().trim_matches('"').to_string();
+            } else if let Some(v) = line.strip_prefix("description:") {
+                description = v.trim().trim_matches('"').to_string();
             }
-            body = rest[idx + 4..].trim_start_matches('\n').to_string();
-            return (name, description, body);
         }
+        body = rest[idx + 4..].trim_start_matches('\n').to_string();
+        return (name, description, body);
     }
     body = text.to_string();
     (name, description, body)

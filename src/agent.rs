@@ -1,17 +1,18 @@
 use anyhow::Result;
+#[cfg(feature = "formal")]
 use rusqlite::params;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::config::{expand_tilde, Config};
+use crate::config::{Config, expand_tilde};
 use crate::context::ContextComposer;
 use crate::control::{Control, ControlPoll};
 use crate::db::Db;
 use crate::events::EventEmitter;
 use crate::llm::{self, ChatMessage, LlmClient};
-use crate::modes::{shared_preamble, Mode};
+use crate::modes::{Mode, shared_preamble};
 use crate::prompts;
 use crate::registry;
 use crate::tools;
@@ -24,6 +25,7 @@ pub struct Agent {
     pub db: Db,
     pub instance_id: String,
     pub mode: Mode,
+    #[cfg(feature = "formal")]
     pub model: String,
     pub llm: LlmClient,
     /// Owns the system prompt, conversation turns, tool definitions, and the
@@ -36,9 +38,9 @@ pub struct Agent {
     pub deadline: Instant,
     pub depth: u32,
     pub seq: i64,
-    /// OCD flag: enables the requirements/tickets tools and the auto plan/build
+    /// Formal flag: enables the requirements/tickets tools and the auto plan/build
     /// cycle. Off means a plain coding agent with no ticket system.
-    pub ocd: bool,
+    pub formal: bool,
     /// Plan slug selected by the user via the control socket (`/setplan`).
     /// Surfaced in the system prompt so the model follows it; plan mode also
     /// refines it.
@@ -60,7 +62,7 @@ pub struct AgentParams {
     pub mode: Mode,
     pub depth: u32,
     pub task: String,
-    pub ocd: bool,
+    pub formal: bool,
     pub control: Option<Arc<Control>>,
     /// The shared, live context. Built before the control socket so `/context`
     /// can read it directly; the agent writes to it as the conversation grows.
@@ -74,13 +76,13 @@ pub fn build_context(
     cfg: &Config,
     db: &Db,
     mode: Mode,
-    ocd: bool,
+    formal: bool,
 ) -> Result<Arc<RwLock<ContextComposer>>> {
     let model = cfg.model_for_mode(mode);
     let window = cfg.limits_for_model(&model).context_window;
-    let system = build_system(db, mode, ocd)?;
+    let system = build_system(db, mode, formal)?;
     let has_skills = !db.skill_list()?.is_empty();
-    let tools = tools::specs_for(mode, ocd, has_skills);
+    let tools = tools::specs_for(mode, formal, has_skills);
     Ok(Arc::new(RwLock::new(ContextComposer::new(
         system, tools, window,
     ))))
@@ -97,7 +99,7 @@ impl Agent {
             mode,
             depth,
             task,
-            ocd,
+            formal,
             control,
             context,
         } = params;
@@ -106,6 +108,12 @@ impl Agent {
         let model = cfg.model_for_mode(mode);
         let limits = cfg.limits_for_model(&model);
         let llm = LlmClient::new(&cfg, &model)?;
+        // Open the durable event file before recording the run as started. The
+        // same events also go to stdout.
+        let events = Arc::new(EventEmitter::new(
+            instance_id.clone(),
+            Some(registry::events_path(&instance_id)),
+        )?);
         db.instance_start(
             &instance_id,
             mode.as_str(),
@@ -114,13 +122,6 @@ impl Agent {
             &model,
             depth,
         )?;
-        // stdout is the machine event stream; the same events are appended to a
-        // per-instance trace file for `genji inspect`. Owning the emitter here
-        // keeps the trace path written in exactly one place.
-        let events = Arc::new(EventEmitter::new(
-            instance_id.clone(),
-            Some(registry::events_path(&instance_id)),
-        ));
         events.instance_start(
             &workspace.display().to_string(),
             mode.as_str(),
@@ -136,6 +137,7 @@ impl Agent {
             db,
             instance_id,
             mode,
+            #[cfg(feature = "formal")]
             model,
             llm,
             context,
@@ -145,7 +147,7 @@ impl Agent {
             deadline,
             depth,
             seq: 0,
-            ocd,
+            formal,
             active_plan: None,
             control,
             events,
@@ -175,12 +177,12 @@ impl Agent {
         Ok(())
     }
 
-    /// The full system prompt: shared + core + OCD guidance + extended prompt,
+    /// The full system prompt: shared + core + Formal guidance + extended prompt,
     /// plus a section for the user-selected plan when one is active. Works in
     /// every mode; in build mode the model follows the plan rather than editing
     /// it (`plan_write` is plan-only).
     fn compose_system(&self) -> Result<String> {
-        let mut system = build_system(&self.db, self.mode, self.ocd)?;
+        let mut system = build_system(&self.db, self.mode, self.formal)?;
         if let Some(slug) = &self.active_plan {
             let file = self
                 .cfg
@@ -214,6 +216,7 @@ impl Agent {
         Ok(system)
     }
 
+    #[cfg(feature = "formal")]
     pub fn set_mode(&mut self, mode: Mode) -> Result<()> {
         self.mode = mode;
         self.model = self.cfg.model_for_mode(mode);
@@ -221,7 +224,7 @@ impl Agent {
         self.token_limit = limits.token_limit;
         self.llm = LlmClient::new(&self.cfg, &self.model)?;
         // The composer swaps tools, system prompt, and window together.
-        let tools = tools::specs_for(mode, self.ocd, !self.db.skill_list()?.is_empty());
+        let tools = tools::specs_for(mode, self.formal, !self.db.skill_list()?.is_empty());
         let system = self.compose_system()?;
         self.context
             .write()
@@ -347,11 +350,13 @@ impl Agent {
             }
             self.maybe_compact()?;
 
-            let result = {
+            // Never hold the shared context lock across blocking network I/O:
+            // `/context` must remain responsive while the provider is working.
+            let (messages, tools_json) = {
                 let ctx = self.context.read().unwrap();
-                let tools_json = ctx.tools_json();
-                self.llm.chat(ctx.messages(), &tools_json)
+                (ctx.messages().to_vec(), ctx.tools_json())
             };
+            let result = self.llm.chat(&messages, &tools_json);
             let resp = match result {
                 Ok(r) => r,
                 Err(e) => return Ok(self.fail(format!("LLM request failed: {e:#}"))),
@@ -410,9 +415,11 @@ impl Agent {
             let msg_seq = self.seq - 1;
 
             for tc in tool_calls {
-                let args: Value = serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({}));
                 let start = Instant::now();
-                let (result, is_error) = tools::dispatch(self, &tc.name, &args);
+                let (result, is_error) = match serde_json::from_str::<Value>(&tc.arguments) {
+                    Ok(args) => tools::dispatch(self, &tc.name, &args),
+                    Err(e) => (format!("ERROR: invalid JSON tool arguments: {e}"), true),
+                };
                 let dur = start.elapsed().as_millis() as i64;
                 self.db.tool_call_add(
                     &self.instance_id,
@@ -460,11 +467,7 @@ impl Agent {
 
     /// Run outcome to record with [`Agent::finish`].
     pub fn status(&self) -> &'static str {
-        if self.failed {
-            "failed"
-        } else {
-            "done"
-        }
+        if self.failed { "failed" } else { "done" }
     }
 
     fn poll_control(&mut self) -> Result<ControlPoll> {
@@ -525,10 +528,10 @@ impl Agent {
     }
 }
 
-pub fn build_system(db: &Db, mode: Mode, ocd: bool) -> Result<String> {
+pub fn build_system(db: &Db, mode: Mode, formal: bool) -> Result<String> {
     let mut base = format!("{}\n{}", shared_preamble(), mode.core_prompt());
-    if ocd {
-        let guidance = mode.ocd_guidance();
+    if formal {
+        let guidance = mode.formal_guidance();
         if !guidance.trim().is_empty() {
             base.push('\n');
             base.push_str(guidance);
