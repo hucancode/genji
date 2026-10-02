@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::config::{Config, expand_tilde};
-use crate::llm::{self, ChatMessage, LlmClient};
+use crate::config::Config;
+use crate::llm::{self, ChatMessage, LlmClient, Role};
 use crate::socket::{Control, ControlPoll};
 use crate::storage::context::ContextComposer;
 use crate::storage::db::Db;
@@ -62,10 +62,10 @@ pub fn build_context(
     mode: Mode,
     formal: bool,
 ) -> Result<Arc<RwLock<ContextComposer>>> {
-    let model = cfg.model_for_mode(mode);
-    let window = cfg.limits_for_model(&model).context_window;
+    let runtime = cfg.runtime_for_mode(mode)?;
+    let window = runtime.limits.context_window;
     let system = build_system(db, mode, formal)?;
-    let has_skills = !db.skill_list()?.is_empty();
+    let has_skills = db.has_skills()?;
     let tools = tools::specs_for(mode, formal, has_skills);
     Ok(Arc::new(RwLock::new(ContextComposer::new(
         system, tools, window,
@@ -87,9 +87,10 @@ impl Agent {
             control,
             context,
         } = params;
-        let model = cfg.model_for_mode(mode);
-        let limits = cfg.limits_for_model(&model);
-        let llm = LlmClient::new(&cfg, &model)?;
+        let runtime = cfg.runtime_for_mode(mode)?;
+        let model = runtime.model.clone();
+        let limits = runtime.limits;
+        let llm = LlmClient::from_runtime(&cfg, runtime);
         let events = Arc::new(EventEmitter::new(
             instance_id.clone(),
             Some(registry::events_path(&instance_id)),
@@ -135,20 +136,12 @@ impl Agent {
         })
     }
 
-    pub fn resolve_path(&self, p: &str) -> PathBuf {
-        let expanded = expand_tilde(p);
-        if expanded.is_absolute() {
-            expanded
-        } else {
-            self.workspace.join(expanded)
-        }
+    pub fn resolve_path(&self, path: &str) -> PathBuf {
+        crate::storage::util::resolve_path(&self.workspace, path)
     }
 
-    pub fn display_path(&self, p: &Path) -> String {
-        p.strip_prefix(&self.workspace)
-            .unwrap_or(p)
-            .to_string_lossy()
-            .to_string()
+    pub fn display_path(&self, path: &Path) -> String {
+        crate::storage::util::relative_path(&self.workspace, path)
     }
 
     pub fn refresh_system_prompt(&mut self) -> Result<()> {
@@ -165,9 +158,7 @@ impl Agent {
                 .plans_path(&self.workspace)
                 .join(format!("{slug}.md"));
             let path = self.display_path(&file);
-            let exists = std::fs::read_to_string(&file)
-                .map(|c| !c.trim().is_empty())
-                .unwrap_or(false);
+            let exists = std::fs::read_to_string(&file).is_ok_and(|c| !c.trim().is_empty());
             let guidance = if exists {
                 if self.mode == Mode::Plan {
                     "read it before acting, update it with `plan_write` when the approach \
@@ -195,11 +186,12 @@ impl Agent {
     #[cfg(feature = "formal")]
     pub fn set_mode(&mut self, mode: Mode) -> Result<()> {
         self.mode = mode;
-        self.model = self.cfg.model_for_mode(mode);
-        let limits = self.cfg.limits_for_model(&self.model);
+        let runtime = self.cfg.runtime_for_mode(mode)?;
+        self.model = runtime.model.clone();
+        let limits = runtime.limits;
         self.token_limit = limits.token_limit;
-        self.llm = LlmClient::new(&self.cfg, &self.model)?;
-        let tools = tools::specs_for(mode, self.formal, !self.db.skill_list()?.is_empty());
+        self.llm = LlmClient::from_runtime(&self.cfg, runtime);
+        let tools = tools::specs_for(mode, self.formal, self.db.has_skills()?);
         let system = self.compose_system()?;
         self.context
             .write()
@@ -214,16 +206,16 @@ impl Agent {
     }
 
     fn persist(&mut self, msg: &ChatMessage) -> Result<()> {
-        match msg.role.as_str() {
-            "user" => self.events.user(&msg.content),
-            "assistant" => {
+        match msg.role {
+            Role::User => self.events.user(&msg.content),
+            Role::Assistant => {
                 self.events
                     .assistant(&msg.content, msg.reasoning_content.as_deref());
                 for c in &msg.tool_calls {
                     self.events.tool_call(&c.id, &c.name, &c.arguments);
                 }
             }
-            _ => {}
+            Role::System | Role::Tool => {}
         }
         let tool_calls_json = if msg.tool_calls.is_empty() {
             None
@@ -238,7 +230,7 @@ impl Agent {
         self.db.message_add(
             &self.instance_id,
             self.seq,
-            &msg.role,
+            msg.role.as_str(),
             &msg.content,
             tool_calls_json.as_deref(),
             msg.tool_call_id.as_deref(),
@@ -259,13 +251,7 @@ impl Agent {
         tool_call_id: &str,
         content: impl Into<String>,
     ) -> Result<()> {
-        let msg = ChatMessage::tool_result(tool_call_id, content);
-        self.persist(&msg)?;
-        self.context
-            .write()
-            .unwrap()
-            .push_tool_result(tool_call_id, msg.content);
-        Ok(())
+        self.log(ChatMessage::tool_result(tool_call_id, content))
     }
 
     pub fn add_user(&mut self, text: &str) -> Result<()> {
@@ -321,24 +307,20 @@ impl Agent {
             self.maybe_compact()?;
             let (messages, tools_json) = {
                 let ctx = self.context.read().unwrap();
-                (ctx.messages().to_vec(), ctx.tools_json())
+                (ctx.messages().to_vec(), ctx.tools().to_vec())
             };
             let result = self.llm.chat(&messages, &tools_json);
             let resp = match result {
                 Ok(r) => r,
                 Err(e) => return Ok(self.fail(format!("LLM request failed: {e:#}"))),
             };
-            self.tokens_used += resp.prompt_tokens + resp.completion_tokens;
+            self.record_usage(resp.prompt_tokens, resp.completion_tokens);
             self.context
                 .write()
                 .unwrap()
                 .set_last_prompt_tokens(resp.prompt_tokens);
             self.events
                 .tokens(self.tokens_used, resp.prompt_tokens, resp.completion_tokens);
-            let _ = self
-                .db
-                .instance_set_tokens(&self.instance_id, self.tokens_used);
-
             if resp.is_truncated() {
                 if llm_retries >= MAX_LLM_RETRIES {
                     return Ok(self.fail(format!(
@@ -378,35 +360,7 @@ impl Agent {
             self.log(assistant)?;
             let msg_seq = self.seq - 1;
 
-            for tc in tool_calls {
-                let start = Instant::now();
-                let (result, is_error) = match serde_json::from_str::<Value>(&tc.arguments) {
-                    Ok(args) => tools::dispatch(self, &tc.name, &args),
-                    Err(e) => (format!("ERROR: invalid JSON tool arguments: {e}"), true),
-                };
-                let dur = start.elapsed().as_millis() as i64;
-                self.db.tool_call_add(
-                    &self.instance_id,
-                    msg_seq,
-                    &tc.name,
-                    &tc.arguments,
-                    &result,
-                    is_error,
-                    dur,
-                )?;
-                self.events
-                    .tool_result(&tc.id, &tc.name, is_error, dur, &result);
-                if is_error {
-                    eprintln!(
-                        "[tool] {}({}) -> {} ({}ms)",
-                        tc.name,
-                        llm::truncate(tc.arguments.clone(), 120),
-                        if is_error { "ERROR" } else { "ok" },
-                        dur
-                    );
-                }
-                self.log_tool_result(&tc.id, result)?;
-            }
+            self.execute_tool_calls(&tool_calls, msg_seq)?;
 
             iterations += 1;
             if iterations >= self.cfg.max_tool_iterations {
@@ -419,6 +373,38 @@ impl Agent {
                 return Ok(msg);
             }
         }
+    }
+
+    fn execute_tool_calls(&mut self, calls: &[llm::ToolCall], msg_seq: i64) -> Result<()> {
+        for tc in calls {
+            let start = Instant::now();
+            let (result, is_error) = match serde_json::from_str::<Value>(&tc.arguments) {
+                Ok(args) => tools::dispatch(self, &tc.name, &args),
+                Err(e) => (format!("ERROR: invalid JSON tool arguments: {e}"), true),
+            };
+            let duration = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+            self.db.tool_call_add(
+                &self.instance_id,
+                msg_seq,
+                &tc.name,
+                &tc.arguments,
+                &result,
+                is_error,
+                duration,
+            )?;
+            self.events
+                .tool_result(&tc.id, &tc.name, is_error, duration, &result);
+            if is_error {
+                eprintln!(
+                    "[tool] {}({}) -> ERROR ({}ms)",
+                    tc.name,
+                    llm::truncate(&tc.arguments, 120),
+                    duration
+                );
+            }
+            self.log_tool_result(&tc.id, result)?;
+        }
+        Ok(())
     }
 
     fn fail(&mut self, msg: String) -> String {
@@ -450,7 +436,7 @@ impl Agent {
         for ins in ctrl.drain() {
             eprintln!(
                 "[control] injecting instruction: {}",
-                llm::truncate(ins.clone(), 160)
+                llm::truncate(&ins, 160)
             );
             let _ = self.log(ChatMessage::user(format!("[instruction from user]\n{ins}")));
             out.injected += 1;
@@ -459,6 +445,13 @@ impl Agent {
             out.stop = true;
         }
         Ok(out)
+    }
+
+    fn record_usage(&mut self, prompt: i64, completion: i64) {
+        self.tokens_used += prompt + completion;
+        let _ = self
+            .db
+            .instance_set_tokens(&self.instance_id, self.tokens_used);
     }
 
     fn maybe_compact(&mut self) -> Result<()> {
@@ -470,7 +463,7 @@ impl Agent {
         let Some(c) = compacted else {
             return Ok(());
         };
-        self.tokens_used += c.prompt_tokens + c.completion_tokens;
+        self.record_usage(c.prompt_tokens, c.completion_tokens);
         self.db
             .compaction_add(&self.instance_id, c.removed, c.before, c.after, &c.summary)?;
         eprintln!(

@@ -1,16 +1,54 @@
 use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
+use std::borrow::Cow;
+use std::fmt;
+use std::fmt::Write as _;
 use std::time::Duration;
 
-use crate::config::{Config, ProviderConfig};
+use crate::config::{Config, ModelRuntime, ProviderConfig};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    System,
+    User,
+    #[default]
+    Assistant,
+    Tool,
+}
+
+impl Role {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ChatMessage {
-    pub role: String,
+    pub role: Role,
     pub content: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "reasoning_is_empty")]
     pub reasoning_content: Option<String>,
+}
+
+fn reasoning_is_empty(value: &Option<String>) -> bool {
+    value.as_deref().is_none_or(str::is_empty)
 }
 
 #[derive(Debug, Clone)]
@@ -20,31 +58,102 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+impl Serialize for ToolCall {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::Serialize;
+        #[derive(Serialize)]
+        struct Function<'a> {
+            name: &'a str,
+            arguments: &'a str,
+        }
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            id: &'a str,
+            #[serde(rename = "type")]
+            kind: &'static str,
+            function: Function<'a>,
+        }
+        Wire {
+            id: &self.id,
+            kind: "function",
+            function: Function {
+                name: &self.name,
+                arguments: &self.arguments,
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseChoice {
+    #[serde(default)]
+    message: WireMessage,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WireMessage {
+    #[serde(default)]
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<WireToolCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireToolCall {
+    id: Option<String>,
+    function: WireFunction,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WireFunction {
+    name: Option<String>,
+    arguments: Option<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Usage {
+    prompt_tokens: i64,
+    completion_tokens: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireResponse {
+    choices: Vec<ResponseChoice>,
+    #[serde(default)]
+    usage: Usage,
+}
+
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
-            role: "system".into(),
+            role: Role::System,
             content: content.into(),
             ..Default::default()
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
         Self {
-            role: "user".into(),
+            role: Role::User,
             content: content.into(),
             ..Default::default()
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
-            role: "assistant".into(),
+            role: Role::Assistant,
             content: content.into(),
             ..Default::default()
         }
     }
     pub fn tool_result(tool_call_id: &str, content: impl Into<String>) -> Self {
         Self {
-            role: "tool".into(),
+            role: Role::Tool,
             content: content.into(),
             tool_call_id: Some(tool_call_id.to_string()),
             ..Default::default()
@@ -52,44 +161,28 @@ impl ChatMessage {
     }
 
     pub fn to_json(&self) -> Value {
-        let mut obj = serde_json::Map::new();
-        obj.insert("role".into(), json!(self.role));
-        obj.insert("content".into(), json!(self.content));
-        if let Some(rc) = &self.reasoning_content
-            && !rc.is_empty()
-        {
-            obj.insert("reasoning_content".into(), json!(rc));
-        }
-        if !self.tool_calls.is_empty() {
-            let calls: Vec<Value> = self
-                .tool_calls
-                .iter()
-                .map(|c| {
-                    json!({
-                        "id": c.id,
-                        "type": "function",
-                        "function": { "name": c.name, "arguments": c.arguments }
-                    })
-                })
-                .collect();
-            obj.insert("tool_calls".into(), json!(calls));
-        }
-        if let Some(id) = &self.tool_call_id {
-            obj.insert("tool_call_id".into(), json!(id));
-        }
-        Value::Object(obj)
+        serde_json::to_value(self).expect("ChatMessage is serializable")
     }
 
     pub fn est_tokens(&self) -> i64 {
-        let mut n = self.content.chars().count();
-        if let Some(r) = &self.reasoning_content {
-            n += r.chars().count();
+        let mut chars = self.content.chars().count();
+        if let Some(reasoning) = &self.reasoning_content {
+            chars = chars.saturating_add(reasoning.chars().count());
         }
-        for c in &self.tool_calls {
-            n += c.name.chars().count() + c.arguments.chars().count() + 16;
+        for call in &self.tool_calls {
+            chars = chars
+                .saturating_add(call.name.chars().count())
+                .saturating_add(call.arguments.chars().count())
+                .saturating_add(16);
         }
-        ((n / 4) + 4) as i64
+        estimate_chars(chars)
     }
+}
+
+pub fn estimate_chars(chars: usize) -> i64 {
+    i64::try_from(chars / 4)
+        .unwrap_or(i64::MAX)
+        .saturating_add(4)
 }
 
 #[derive(Debug, Clone)]
@@ -107,33 +200,35 @@ impl LlmResponse {
 }
 
 pub fn estimate_messages(messages: &[ChatMessage]) -> i64 {
-    messages.iter().map(|m| m.est_tokens()).sum::<i64>() + 8
+    messages.iter().map(ChatMessage::est_tokens).sum::<i64>() + 8
 }
 
 pub struct LlmClient {
     provider: ProviderConfig,
     pub model: String,
     max_tokens: i64,
+    api_key: String,
     agent: ureq::Agent,
 }
 
 impl LlmClient {
-    pub fn new(cfg: &Config, model: &str) -> Result<Self> {
-        let provider = cfg.resolve_active_provider();
+    pub fn from_runtime(cfg: &Config, runtime: ModelRuntime) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(cfg.time_limit_secs.max(60) + 120))
             .build();
-        Ok(Self {
-            provider,
-            model: model.to_string(),
-            max_tokens: cfg.limits_for_model(model).max_output_tokens,
+        let api_key = runtime.provider.resolve_api_key();
+        Self {
+            provider: runtime.provider,
+            model: runtime.model,
+            max_tokens: runtime.limits.max_output_tokens,
+            api_key,
             agent,
-        })
+        }
     }
 
     /// Build the endpoint URL for this provider kind.
     ///
-    /// * openai-compatible (llama.cpp, DeepSeek, OpenAI, …): `{base}/chat/completions`
+    /// * openai-compatible (llama.cpp, `DeepSeek`, `OpenAI`, …): `{base}/chat/completions`
     /// * azure: `{base}/openai/deployments/{deployment}/chat/completions?api-version=…`
     fn url(&self) -> String {
         let base = self.provider.base_url.trim_end_matches('/');
@@ -168,7 +263,7 @@ impl LlmClient {
     }
 
     pub fn chat(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<LlmResponse> {
-        let msgs: Vec<Value> = messages.iter().map(|m| m.to_json()).collect();
+        let msgs: Vec<Value> = messages.iter().map(ChatMessage::to_json).collect();
         let mut body = json!({
             "model": self.model,
             "messages": msgs,
@@ -213,12 +308,11 @@ impl LlmClient {
 
     fn post_once(&self, url: &str, body: &Value) -> Result<LlmResponse> {
         let mut req = self.agent.post(url).set("Content-Type", "application/json");
-        let key = self.provider.resolve_api_key();
-        if !key.is_empty() {
+        if !self.api_key.is_empty() {
             if self.provider.auth == "api-key" {
-                req = req.set("api-key", &key);
+                req = req.set("api-key", &self.api_key);
             } else {
-                req = req.set("Authorization", &format!("Bearer {key}"));
+                req = req.set("Authorization", &format!("Bearer {}", self.api_key));
             }
         }
         for (k, v) in &self.provider.extra_headers {
@@ -269,9 +363,11 @@ fn url_encode(s: &str) -> String {
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
+                out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out
@@ -282,100 +378,79 @@ fn is_retryable(e: &anyhow::Error) -> bool {
 }
 
 fn parse_response(value: &Value) -> Result<LlmResponse> {
-    let choice = value.get("choices").and_then(|c| c.get(0)).ok_or_else(|| {
+    let parsed: WireResponse =
+        serde_json::from_value(value.clone()).context("parsing llm response")?;
+    let choice = parsed.choices.into_iter().next().ok_or_else(|| {
         anyhow!(
             "llm response has no choices: {}",
-            truncate(value.to_string(), 400)
+            truncate(&value.to_string(), 400)
         )
     })?;
-    let msg = choice.get("message").cloned().unwrap_or(Value::Null);
-    let content = msg
-        .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
-    let reasoning = msg
-        .get("reasoning_content")
-        .and_then(|c| c.as_str())
-        .map(|s| s.to_string());
-    let mut tool_calls = Vec::new();
-    if let Some(calls) = msg.get("tool_calls").and_then(|c| c.as_array()) {
-        for (i, c) in calls.iter().enumerate() {
-            let id = c
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("call_{i}"));
-            let f = c.get("function").cloned().unwrap_or(Value::Null);
-            let name = f
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let arguments = match f.get("arguments") {
-                Some(Value::String(s)) => s.clone(),
-                Some(v) => v.to_string(),
-                None => "{}".into(),
-            };
-            tool_calls.push(ToolCall {
-                id,
-                name,
+    let tool_calls = choice
+        .message
+        .tool_calls
+        .into_iter()
+        .enumerate()
+        .map(|(i, call)| {
+            let arguments = call.function.arguments.map_or_else(
+                || "{}".to_string(),
+                |value| {
+                    value
+                        .as_str()
+                        .map_or_else(|| value.to_string(), ToString::to_string)
+                },
+            );
+            ToolCall {
+                id: call.id.unwrap_or_else(|| format!("call_{i}")),
+                name: call.function.name.unwrap_or_default(),
                 arguments,
-            });
-        }
-    }
-    let usage = value.get("usage").cloned().unwrap_or(Value::Null);
-    let prompt_tokens = usage
-        .get("prompt_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let completion_tokens = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+            }
+        })
+        .collect();
     Ok(LlmResponse {
         message: ChatMessage {
-            role: "assistant".into(),
-            content,
+            role: Role::Assistant,
+            content: choice.message.content.unwrap_or_default(),
             tool_calls,
             tool_call_id: None,
-            reasoning_content: reasoning,
+            reasoning_content: choice.message.reasoning_content,
         },
-        prompt_tokens,
-        completion_tokens,
-        finish_reason: choice
-            .get("finish_reason")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        prompt_tokens: parsed.usage.prompt_tokens,
+        completion_tokens: parsed.usage.completion_tokens,
+        finish_reason: choice.finish_reason,
     })
 }
 
-pub fn truncate(s: String, max: usize) -> String {
+pub fn truncate(s: &str, max: usize) -> Cow<'_, str> {
     if s.len() <= max {
-        return s;
+        return Cow::Borrowed(s);
     }
     let mut end = max;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}… [{} bytes truncated]", &s[..end], s.len() - end)
+    Cow::Owned(format!(
+        "{}… [{} bytes truncated]",
+        &s[..end],
+        s.len() - end
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate, url_encode};
+    use super::{ChatMessage, truncate, url_encode};
 
     #[test]
     fn truncates_on_char_boundary() {
         let s = "é".repeat(50);
-        let out = truncate(s, 11);
+        let out = truncate(&s, 11);
         assert!(out.contains("truncated"));
         assert!(out.len() < 50 * 2 + 40);
     }
 
     #[test]
     fn keeps_short_strings() {
-        assert_eq!(truncate("hi".into(), 10), "hi");
+        assert_eq!(truncate("hi", 10), "hi");
     }
 
     #[test]
@@ -387,7 +462,7 @@ mod tests {
     #[test]
     fn detects_truncation() {
         let mut resp = super::LlmResponse {
-            message: Default::default(),
+            message: ChatMessage::default(),
             prompt_tokens: 0,
             completion_tokens: 0,
             finish_reason: Some("length".into()),

@@ -14,7 +14,7 @@ pub struct ModelsConfig {
 
 impl ModelsConfig {
     pub fn for_mode(&self, mode: crate::storage::modes::Mode) -> &str {
-        use crate::storage::modes::Mode::*;
+        use crate::storage::modes::Mode::{Build, Explore, Plan, Retro};
         match mode {
             Plan => &self.plan,
             Build => &self.build,
@@ -42,17 +42,39 @@ pub struct EffectiveLimits {
     pub max_output_tokens: i64,
 }
 
+impl EffectiveLimits {
+    fn overlay(&mut self, overrides: &ModelLimits) {
+        if let Some(value) = overrides.token_limit {
+            self.token_limit = value;
+        }
+        if let Some(value) = overrides.context_window {
+            self.context_window = value;
+        }
+        if let Some(value) = overrides.max_output_tokens {
+            self.max_output_tokens = value;
+        }
+    }
+}
+
+/// Fully resolved provider, model, and limits for one agent mode.
+#[derive(Debug, Clone)]
+pub struct ModelRuntime {
+    pub provider: ProviderConfig,
+    pub model: String,
+    pub limits: EffectiveLimits,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderConfig {
-    /// "openai" (llama.cpp, DeepSeek, OpenAI, OpenRouter, …) or "azure".
+    /// "openai" (llama.cpp, `DeepSeek`, `OpenAI`, `OpenRouter`, …) or "azure".
     pub kind: String,
     pub base_url: String,
     /// Explicit key (highest priority). May be empty for local servers.
     pub api_key: String,
     /// Env var consulted when `api_key` is empty.
     pub api_key_env: String,
-    /// auth file fallback: { "<auth_key>": { "key": "..." } }.
+    /// auth file fallback: { "<`auth_key>"`: { "key": "..." } }.
     pub auth_file: String,
     pub auth_key: String,
     /// "bearer" (Authorization) or "api-key" (Azure). Empty = derive from kind.
@@ -63,7 +85,7 @@ pub struct ProviderConfig {
     pub model: String,
     /// Per-mode model/deployment names.
     pub models: ModelsConfig,
-    /// "max_tokens" (default) or "max_completion_tokens" (some Azure/OpenAI reasoning models).
+    /// "`max_tokens`" (default) or "`max_completion_tokens`" (some Azure/OpenAI reasoning models).
     pub max_tokens_field: String,
     /// Override the top-level context window for this provider.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,46 +271,39 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn workspace_path(&self, workspace: &Path, rel: &str) -> PathBuf {
-        let p = PathBuf::from(rel);
-        if p.is_absolute() {
-            p
-        } else {
-            workspace.join(p)
-        }
+    pub fn workspace_path(workspace: &Path, rel: &str) -> PathBuf {
+        crate::storage::util::resolve_path(workspace, rel)
     }
 
     pub fn db_file(&self, workspace: &Path) -> PathBuf {
-        self.workspace_path(workspace, &self.db_path)
+        Self::workspace_path(workspace, &self.db_path)
     }
 
     #[cfg(feature = "formal")]
     pub fn requirements_path(&self, workspace: &Path) -> PathBuf {
-        self.workspace_path(workspace, &self.requirements_dir)
+        Self::workspace_path(workspace, &self.requirements_dir)
     }
     pub fn plans_path(&self, workspace: &Path) -> PathBuf {
-        self.workspace_path(workspace, &self.plans_dir)
+        Self::workspace_path(workspace, &self.plans_dir)
     }
     #[cfg(feature = "formal")]
     pub fn tickets_path(&self, workspace: &Path) -> PathBuf {
-        self.workspace_path(workspace, &self.tickets_dir)
+        Self::workspace_path(workspace, &self.tickets_dir)
     }
     pub fn skills_path(&self, workspace: &Path) -> PathBuf {
-        self.workspace_path(workspace, &self.skills_dir)
+        Self::workspace_path(workspace, &self.skills_dir)
     }
     pub fn tmp_path(&self, workspace: &Path) -> PathBuf {
-        self.workspace_path(workspace, &self.tmp_dir)
+        Self::workspace_path(workspace, &self.tmp_dir)
     }
     pub fn control_path(&self, workspace: &Path) -> PathBuf {
-        self.workspace_path(workspace, &self.control_socket)
+        Self::workspace_path(workspace, &self.control_socket)
     }
 
-    pub fn resolve_active_provider(&self) -> ProviderConfig {
-        let mut provider = self
-            .providers
-            .get(&self.provider)
-            .cloned()
-            .unwrap_or_else(|| panic!("configured provider `{}` does not exist", self.provider));
+    pub fn resolve_active_provider(&self) -> Result<ProviderConfig> {
+        let mut provider = self.providers.get(&self.provider).cloned().ok_or_else(|| {
+            anyhow::anyhow!("configured provider `{}` does not exist", self.provider)
+        })?;
         if provider.auth_key.is_empty() {
             provider.auth_key = self.provider.clone();
         }
@@ -300,52 +315,51 @@ impl Config {
             }
             .into();
         }
-        provider
+        Ok(provider)
     }
 
-    pub fn model_for_mode(&self, mode: crate::storage::modes::Mode) -> String {
-        let p = self.resolve_active_provider();
-        if !p.model.trim().is_empty() {
-            return p.model;
-        }
-        let model = p.models.for_mode(mode);
-        if model.trim().is_empty() {
-            panic!(
-                "provider `{}` has no model configured for {}",
-                self.provider,
-                mode.as_str()
-            );
-        }
-        model.to_string()
+    pub fn runtime_for_mode(&self, mode: crate::storage::modes::Mode) -> Result<ModelRuntime> {
+        let provider = self.resolve_active_provider()?;
+        let model = if provider.model.trim().is_empty() {
+            let model = provider.models.for_mode(mode);
+            if model.trim().is_empty() {
+                anyhow::bail!(
+                    "provider `{}` has no model configured for {}",
+                    self.provider,
+                    mode.as_str()
+                );
+            }
+            model.to_string()
+        } else {
+            provider.model.clone()
+        };
+        let limits = self.limits_for(&provider, &model);
+        Ok(ModelRuntime {
+            provider,
+            model,
+            limits,
+        })
     }
 
-    pub fn limits_for_model(&self, model: &str) -> EffectiveLimits {
-        let p = self.resolve_active_provider();
+    /// Resolve only the model name. Prefer [`Self::runtime_for_mode`] where the
+    /// provider and limits are also needed.
+    pub fn model_for_mode(&self, mode: crate::storage::modes::Mode) -> Result<String> {
+        Ok(self.runtime_for_mode(mode)?.model)
+    }
+
+    fn limits_for(&self, p: &ProviderConfig, model: &str) -> EffectiveLimits {
         let mut limits = EffectiveLimits {
             token_limit: p.token_limit.unwrap_or(self.token_limit),
             context_window: p.context_window.unwrap_or(self.context_window),
             max_output_tokens: p.max_output_tokens.unwrap_or(self.max_output_tokens),
         };
-        if let Some(m) = p.model_limits.get(model) {
-            if let Some(v) = m.token_limit {
-                limits.token_limit = v;
-            }
-            if let Some(v) = m.context_window {
-                limits.context_window = v;
-            }
-            if let Some(v) = m.max_output_tokens {
-                limits.max_output_tokens = v;
-            }
+        if let Some(model_limits) = p.model_limits.get(model) {
+            limits.overlay(model_limits);
         }
         limits
     }
 }
 
 pub fn expand_tilde(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return PathBuf::from(home).join(rest);
-    }
-    PathBuf::from(p)
+    crate::storage::util::expand_home(p)
 }

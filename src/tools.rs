@@ -12,19 +12,36 @@ use std::path::Path;
 
 pub mod basic {
     use anyhow::{Context, Result, anyhow, bail};
+    use serde::Deserialize;
     use serde_json::Value;
+    use std::fmt::Write as _;
     use std::time::Duration;
 
     use super::{opt_bool, opt_i64, opt_str, req_str};
     use crate::agent::Agent;
     use crate::storage::proc;
 
+    #[derive(Debug, Deserialize)]
+    struct ReadArgs {
+        path: String,
+        offset: Option<i64>,
+        limit: Option<i64>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WriteArgs {
+        path: String,
+        content: String,
+    }
+
     pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
-        let path = agent.resolve_path(&req_str(args, "path")?);
+        let parsed: ReadArgs =
+            serde_json::from_value(args.clone()).context("invalid read arguments")?;
+        let path = agent.resolve_path(&parsed.path);
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let offset = opt_i64(args, "offset").unwrap_or(1).max(1) as usize;
-        let limit = opt_i64(args, "limit").unwrap_or(2000).max(1) as usize;
+        let offset = usize::try_from(parsed.offset.unwrap_or(1).max(1))?;
+        let limit = usize::try_from(parsed.limit.unwrap_or(2000).max(1))?;
 
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
@@ -35,22 +52,19 @@ pub mod basic {
         let end = (start + limit).min(total);
         let mut out = String::new();
         for (i, line) in lines[start..end].iter().enumerate() {
-            out.push_str(&format!("{:>6}\t{}\n", start + i + 1, line));
+            writeln!(out, "{:>6}\t{}", start + i + 1, line)?;
         }
         if end < total {
-            out.push_str(&format!(
-                "\n[showing lines {}-{} of {}]\n",
-                start + 1,
-                end,
-                total
-            ));
+            writeln!(out, "\n[showing lines {}-{} of {}]", start + 1, end, total)?;
         }
         Ok(out)
     }
 
     pub fn write(agent: &mut Agent, args: &Value) -> Result<String> {
-        let path = agent.resolve_path(&req_str(args, "path")?);
-        let content = req_str(args, "content")?;
+        let parsed: WriteArgs =
+            serde_json::from_value(args.clone()).context("invalid write arguments")?;
+        let path = agent.resolve_path(&parsed.path);
+        let content = parsed.content;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -93,8 +107,6 @@ pub mod basic {
             }
             return Ok(content.replace(old.as_str(), new.as_str()));
         }
-        // Locate each edit in the original content, verify uniqueness, then check
-        // the ranges do not overlap.
         let mut ranges: Vec<(usize, usize, String)> = Vec::new();
         for (old, new) in edits {
             let start = find_unique(content, old)?;
@@ -162,8 +174,6 @@ pub mod basic {
             bail!("path does not exist: {}", root.display());
         }
         let show_hidden = opt_bool(args, "show_hidden").unwrap_or(false);
-        // max_depth is the number of recursion levels below `path`; 0 means
-        // non-recursive (list only immediate children).
         let max_depth = opt_i64(args, "max_depth").unwrap_or(0).max(0);
 
         let mut builder = ignore::WalkBuilder::new(&root);
@@ -175,16 +185,13 @@ pub mod basic {
             .ignore(true)
             .parents(false)
             .require_git(false)
-            .max_depth(Some((max_depth + 1) as usize));
+            .max_depth(Some(usize::try_from(max_depth + 1)?));
 
         let mut lines: Vec<String> = Vec::new();
         let mut dirs = 0usize;
         let mut files = 0usize;
         for entry in builder.build() {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+            let Ok(entry) = entry else { continue };
             if entry.depth() == 0 {
                 continue; // skip the root itself
             }
@@ -194,10 +201,7 @@ pub mod basic {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .to_string();
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            let Ok(meta) = entry.metadata() else { continue };
             if meta.is_dir() {
                 dirs += 1;
                 lines.push(format!("d        {rel_path}/"));
@@ -215,26 +219,41 @@ pub mod basic {
         Ok(out)
     }
 
+    #[derive(Debug, Deserialize)]
+    struct BashArgs {
+        command: String,
+        cwd: Option<String>,
+        timeout_secs: Option<i64>,
+    }
+
     pub fn bash(agent: &mut Agent, args: &Value) -> Result<String> {
-        let command = req_str(args, "command")?;
-        let cwd = match opt_str(args, "cwd") {
+        let parsed: BashArgs =
+            serde_json::from_value(args.clone()).context("invalid bash arguments")?;
+        let command = parsed.command;
+        let cwd = match parsed.cwd {
             Some(c) => agent.resolve_path(&c),
             None => agent.workspace.clone(),
         };
         let timeout = Duration::from_secs(
-            opt_i64(args, "timeout_secs")
-                .map(|v| v.max(1) as u64)
-                .unwrap_or(agent.cfg.bash_timeout_secs),
+            parsed
+                .timeout_secs
+                .map_or(agent.cfg.bash_timeout_secs, |v| {
+                    u64::try_from(v.max(1)).unwrap_or(agent.cfg.bash_timeout_secs)
+                }),
         );
         let cap = agent.cfg.tool_result_max_bytes.saturating_mul(2).max(8192);
-        let res = proc::run_bash(&command, &cwd, timeout, cap)
-            .with_context(|| format!("running command: {command}"))?;
+        let res = proc::run_bash(
+            &command,
+            &cwd,
+            &agent.cfg.tmp_path(&agent.workspace),
+            timeout,
+            cap,
+        )
+        .with_context(|| format!("running command: {command}"))?;
         let mut out = String::new();
         out.push_str(&format!(
             "exit_code: {}\n",
-            res.code
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "none".into())
+            res.code.map_or_else(|| "none".into(), |c| c.to_string())
         ));
         if res.timed_out {
             out.push_str(&format!("[timed out after {}s]\n", timeout.as_secs()));
@@ -311,17 +330,9 @@ pub mod plans {
 
     use super::{opt_str, req_str};
     use crate::agent::Agent;
-    use crate::config::{Config, expand_tilde};
+    use crate::config::Config;
     use crate::storage::util::slugify;
 
-    /// Persist a plan and return the path it was written to. Split out from the
-    /// tool handler so it can be tested without constructing a full [`Agent`].
-    ///
-    /// The title drives the default file name (`plans_dir/<slug>.md`) and, when the
-    /// content has no `# Heading` of its own, the heading. Plans live under
-    /// `plans_dir` (default `.genji/plans/`) so the plan outlives the run and can be
-    /// reviewed or versioned with the code. Passing the same title again refines an
-    /// existing plan in place; `path` overrides the location entirely.
     pub fn write_plan(
         cfg: &Config,
         workspace: &Path,
@@ -337,18 +348,11 @@ pub mod plans {
                 slugify(title, "plan")
             ),
         };
-        let expanded = expand_tilde(&rel);
-        let path = if expanded.is_absolute() {
-            expanded
-        } else {
-            workspace.join(expanded)
-        };
+        let path = crate::storage::util::resolve_path(workspace, &rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        // Guarantee a top-level heading so the file reads as a plan even when the
-        // model did not include one.
         let body = if content.trim_start().starts_with("# ") {
             content.to_string()
         } else {
@@ -358,7 +362,6 @@ pub mod plans {
         Ok(path)
     }
 
-    /// `plan_write` — persist an implementation plan as a markdown file.
     pub fn write(agent: &mut Agent, args: &Value) -> Result<String> {
         let title = req_str(args, "title")?;
         let content = req_str(args, "content")?;
@@ -382,8 +385,7 @@ pub mod plans {
         fn temp_workspace(tag: &str) -> std::path::PathBuf {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_nanos());
             let dir = std::env::temp_dir().join(format!("genji-plans-{tag}-{nanos}"));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
@@ -432,7 +434,8 @@ pub mod requirements {
     use super::{opt_i64, opt_str, req_str};
     use crate::agent::Agent;
     use crate::config::Config;
-    use crate::storage::reqmd::{self, Requirement};
+    use crate::storage::db::FieldPatch;
+    use crate::storage::reqmd::{self, Requirement, RequirementLevel, RequirementStatus};
 
     fn fmt_req(r: &Requirement, workspace: &Path, full: bool) -> String {
         let mut s = format!("#{} [{}:{}] {}\n", r.id, r.level, r.status, r.title);
@@ -458,18 +461,27 @@ pub mod requirements {
         s
     }
 
+    fn parse_level_arg(level: &str) -> Result<RequirementLevel> {
+        level
+            .parse()
+            .map_err(|_| anyhow::anyhow!("level must be `stakeholder` or `system`"))
+    }
+
+    fn parse_status_arg(status: &str) -> Result<RequirementStatus> {
+        status
+            .parse()
+            .map_err(|_| anyhow::anyhow!("status must be active|met|removed"))
+    }
+
     pub fn create(agent: &mut Agent, args: &Value) -> Result<String> {
-        let level = req_str(args, "level")?;
-        if level != "stakeholder" && level != "system" {
-            bail!("level must be `stakeholder` or `system`");
-        }
+        let level = parse_level_arg(&req_str(args, "level")?)?;
         let title = req_str(args, "title")?;
         let body = req_str(args, "body")?;
         let parent_id = opt_i64(args, "parent_id");
         let r = reqmd::create(
             &agent.cfg,
             &agent.workspace,
-            &level,
+            level,
             &title,
             &body,
             parent_id,
@@ -483,14 +495,12 @@ pub mod requirements {
         ))
     }
 
-    /// Render a `requirement_read`: an exact requirement when `id` is set,
-    /// otherwise the requirements filtered by `level` and/or `status`.
     fn read_requirements(
         cfg: &Config,
         workspace: &Path,
         id: Option<i64>,
-        level: Option<&str>,
-        status: Option<&str>,
+        level: Option<RequirementLevel>,
+        status: Option<RequirementStatus>,
     ) -> Result<String> {
         if let Some(id) = id {
             return match reqmd::load_by_id(cfg, workspace, id)? {
@@ -506,8 +516,6 @@ pub mod requirements {
         if reqs.is_empty() {
             return Ok("(no requirements)".into());
         }
-        // A single hit is shown in full; a list is truncated per requirement so it
-        // stays scannable.
         let full = reqs.len() == 1;
         let mut out = String::new();
         for r in &reqs {
@@ -518,39 +526,41 @@ pub mod requirements {
     }
 
     pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
+        let level = opt_str(args, "level")
+            .map(|level| parse_level_arg(&level))
+            .transpose()?;
+        let status = opt_str(args, "status")
+            .map(|status| parse_status_arg(&status))
+            .transpose()?;
         read_requirements(
             &agent.cfg,
             &agent.workspace,
             opt_i64(args, "id"),
-            opt_str(args, "level").as_deref(),
-            opt_str(args, "status").as_deref(),
+            level,
+            status,
         )
     }
 
     pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
         let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
-        let status = opt_str(args, "status");
-        if let Some(s) = &status
-            && !["active", "met", "removed"].contains(&s.as_str())
-        {
-            bail!("status must be active|met|removed");
-        }
-        let level = opt_str(args, "level");
-        if let Some(l) = &level
-            && l != "stakeholder"
-            && l != "system"
-        {
-            bail!("level must be stakeholder|system");
-        }
-        let parent_id = args.get("parent_id").map(|v| v.as_i64());
+        let status = opt_str(args, "status")
+            .map(|status| parse_status_arg(&status))
+            .transpose()?;
+        let level = opt_str(args, "level")
+            .map(|level| parse_level_arg(&level))
+            .transpose()?;
+        let parent_id = args
+            .get("parent_id")
+            .map(|v| v.as_i64().map_or(FieldPatch::Clear, FieldPatch::Set))
+            .unwrap_or(FieldPatch::Keep);
         if !reqmd::update(
             &agent.cfg,
             &agent.workspace,
             id,
             opt_str(args, "title").as_deref(),
             opt_str(args, "body").as_deref(),
-            status.as_deref(),
-            level.as_deref(),
+            status,
+            level,
             parent_id,
         )? {
             bail!("requirement #{id} not found");
@@ -560,7 +570,7 @@ pub mod requirements {
 
     pub fn remove(agent: &mut Agent, args: &Value) -> Result<String> {
         let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
-        let hard = args.get("hard").and_then(|v| v.as_bool()).unwrap_or(false);
+        let hard = args.get("hard").and_then(Value::as_bool).unwrap_or(false);
         if !reqmd::remove(&agent.cfg, &agent.workspace, id, hard)? {
             bail!("requirement #{id} not found");
         }
@@ -571,25 +581,26 @@ pub mod requirements {
     }
 
     pub fn tree(agent: &mut Agent, args: &Value) -> Result<String> {
-        let filter = opt_str(args, "status");
+        let filter = opt_str(args, "status")
+            .map(|status| parse_status_arg(&status))
+            .transpose()?;
         let reqs: Vec<Requirement> = reqmd::load_all(&agent.cfg, &agent.workspace)?
             .into_iter()
-            .filter(|r| filter.as_deref().is_none_or(|s| r.status == s))
+            .filter(|r| filter.is_none_or(|s| r.status == s))
             .collect();
         if reqs.is_empty() {
             return Ok("(no requirements)".into());
         }
 
-        // Ticket coverage per requirement id, across open files and archived rows.
         let tickets = super::tickets::list_all(agent)?;
         let mut open: BTreeMap<i64, i64> = BTreeMap::new();
         let mut done: BTreeMap<i64, i64> = BTreeMap::new();
         for t in &tickets {
             if let Some(rid) = t.requirement_id {
-                match t.status.as_str() {
-                    "open" | "in_progress" => *open.entry(rid).or_default() += 1,
-                    "resolved" | "closed" => *done.entry(rid).or_default() += 1,
-                    _ => {}
+                if t.status.is_open() {
+                    *open.entry(rid).or_default() += 1;
+                } else if t.status.is_done() {
+                    *done.entry(rid).or_default() += 1;
                 }
             }
         }
@@ -597,7 +608,6 @@ pub mod requirements {
         let ids: BTreeSet<i64> = reqs.iter().map(|r| r.id).collect();
         let mut children: BTreeMap<Option<i64>, Vec<&Requirement>> = BTreeMap::new();
         for r in &reqs {
-            // Treat a missing parent as a root so nothing disappears from the tree.
             let parent = match r.parent_id {
                 Some(p) if ids.contains(&p) => Some(p),
                 _ => None,
@@ -608,16 +618,12 @@ pub mod requirements {
         let mut out = String::new();
         out.push_str(&format!(
             "requirements: {} active / {} total, tickets: {} open / {} done\n\n",
-            reqs.iter().filter(|r| r.status == "active").count(),
+            reqs.iter()
+                .filter(|r| r.status == RequirementStatus::Active)
+                .count(),
             reqs.len(),
-            tickets
-                .iter()
-                .filter(|t| matches!(t.status.as_str(), "open" | "in_progress"))
-                .count(),
-            tickets
-                .iter()
-                .filter(|t| matches!(t.status.as_str(), "resolved" | "closed"))
-                .count(),
+            tickets.iter().filter(|t| t.status.is_open()).count(),
+            tickets.iter().filter(|t| t.status.is_done()).count(),
         ));
         let mut visited = BTreeSet::new();
         if let Some(roots) = children.get(&None) {
@@ -634,7 +640,6 @@ pub mod requirements {
         Ok(out)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_tree<'a>(
         req: &'a Requirement,
         children: &BTreeMap<Option<i64>, Vec<&'a Requirement>>,
@@ -666,7 +671,7 @@ pub mod requirements {
         let requirement_id = opt_i64(args, "requirement_id");
         let qid = agent
             .db
-            .question_ask(requirement_id, &agent.instance_id.clone(), &question)?;
+            .question_ask(requirement_id, &agent.instance_id, &question)?;
 
         Ok(format!(
             "recorded question #{qid}: {question}\n(no interactive user available; relay this question to the user)"
@@ -677,14 +682,14 @@ pub mod requirements {
     mod tests {
         use super::read_requirements;
         use crate::config::Config;
-        use crate::storage::reqmd;
+        use crate::storage::db::FieldPatch;
+        use crate::storage::reqmd::{self, RequirementLevel, RequirementStatus};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         fn temp_workspace(tag: &str) -> std::path::PathBuf {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_nanos());
             let dir = std::env::temp_dir().join(format!("genji-reqtools-{tag}-{nanos}"));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
@@ -698,7 +703,7 @@ pub mod requirements {
             let parent = reqmd::create(
                 &cfg,
                 &ws,
-                "stakeholder",
+                RequirementLevel::Stakeholder,
                 "Cat Classifier",
                 "Must classify cats.",
                 None,
@@ -708,14 +713,24 @@ pub mod requirements {
             let child = reqmd::create(
                 &cfg,
                 &ws,
-                "system",
+                RequirementLevel::System,
                 "Accept URLs",
                 "Accept image URLs.",
                 Some(parent.id),
                 "agent",
             )
             .unwrap();
-            reqmd::update(&cfg, &ws, child.id, None, None, Some("met"), None, None).unwrap();
+            reqmd::update(
+                &cfg,
+                &ws,
+                child.id,
+                None,
+                None,
+                Some(RequirementStatus::Met),
+                None,
+                FieldPatch::Keep,
+            )
+            .unwrap();
 
             // By id: the full requirement body, with no filtering applied.
             let one = read_requirements(&cfg, &ws, Some(parent.id), None, None).unwrap();
@@ -734,17 +749,20 @@ pub mod requirements {
             assert!(all.contains("#2 [system:met] Accept URLs"), "{all}");
 
             // Filter by level.
-            let sys = read_requirements(&cfg, &ws, None, Some("system"), None).unwrap();
+            let sys =
+                read_requirements(&cfg, &ws, None, Some(RequirementLevel::System), None).unwrap();
             assert!(sys.contains("#2 "), "{sys}");
             assert!(!sys.contains("#1 "), "{sys}");
 
             // Filter by status.
-            let met = read_requirements(&cfg, &ws, None, None, Some("met")).unwrap();
+            let met =
+                read_requirements(&cfg, &ws, None, None, Some(RequirementStatus::Met)).unwrap();
             assert!(met.contains("#2 "), "{met}");
             assert!(!met.contains("#1 "), "{met}");
 
             // A filter with no matches is an empty list, not an error.
-            let none = read_requirements(&cfg, &ws, None, None, Some("removed")).unwrap();
+            let none =
+                read_requirements(&cfg, &ws, None, None, Some(RequirementStatus::Removed)).unwrap();
             assert_eq!(none, "(no requirements)");
 
             // A missing id is an error, not an empty list.
@@ -767,20 +785,10 @@ pub mod retro {
     pub fn instances(agent: &mut Agent, args: &Value) -> Result<String> {
         let limit = opt_i64(args, "limit").unwrap_or(20).clamp(1, 500);
         let mode = opt_str(args, "mode");
-        let mut sql = String::from(
-            "SELECT id,mode,parent_instance,depth,status,tokens_used,started_at,substr(COALESCE(task,''),1,80) FROM instances WHERE 1=1",
-        );
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(m) = mode {
-            sql.push_str(" AND mode=?");
-            params_vec.push(Box::new(m));
-        }
-        sql.push_str(" ORDER BY started_at DESC LIMIT ?");
-        params_vec.push(Box::new(limit));
-        let mut stmt = agent.db.conn.prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|b| b.as_ref()).collect();
-        let rows = stmt.query_map(refs.as_slice(), |r| {
+        let mut stmt = agent.db.conn.prepare(
+            "SELECT id,mode,parent_instance,depth,status,tokens_used,started_at,substr(COALESCE(task,''),1,80) FROM instances WHERE (?1 IS NULL OR mode = ?1) ORDER BY started_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![mode, limit], |r| {
             Ok(format!(
                 "{}\t{}\tdepth={}\t{}\ttokens={}\t{}\t{}\n",
                 r.get::<_, String>(0)?,
@@ -839,27 +847,13 @@ pub mod retro {
 
     pub fn messages(agent: &mut Agent, args: &Value) -> Result<String> {
         let limit = opt_i64(args, "limit").unwrap_or(50).clamp(1, 500);
-        let mut sql = String::from(
-            "SELECT instance_id,seq,role,substr(content,1,400),created_at FROM messages WHERE 1=1",
-        );
-        let mut p: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(s) = opt_str(args, "instance_id") {
-            sql.push_str(" AND instance_id=?");
-            p.push(Box::new(s));
-        }
-        if let Some(r) = opt_str(args, "role") {
-            sql.push_str(" AND role=?");
-            p.push(Box::new(r));
-        }
-        if let Some(q) = opt_str(args, "search") {
-            sql.push_str(" AND content LIKE ?");
-            p.push(Box::new(format!("%{q}%")));
-        }
-        sql.push_str(" ORDER BY id DESC LIMIT ?");
-        p.push(Box::new(limit));
-        let mut stmt = agent.db.conn.prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::types::ToSql> = p.iter().map(|b| b.as_ref()).collect();
-        let rows = stmt.query_map(refs.as_slice(), |r| {
+        let instance_id = opt_str(args, "instance_id");
+        let role = opt_str(args, "role");
+        let search = opt_str(args, "search").map(|q| format!("%{q}%"));
+        let mut stmt = agent.db.conn.prepare(
+            "SELECT instance_id,seq,role,substr(content,1,400),created_at FROM messages WHERE (?1 IS NULL OR instance_id = ?1) AND (?2 IS NULL OR role = ?2) AND (?3 IS NULL OR content LIKE ?3) ORDER BY id DESC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![instance_id, role, search, limit], |r| {
             Ok(format!(
                 "{}\t#{} [{}]\t{}\t{}\n",
                 r.get::<_, String>(0)?,
@@ -881,26 +875,13 @@ pub mod retro {
 
     pub fn tool_calls(agent: &mut Agent, args: &Value) -> Result<String> {
         let limit = opt_i64(args, "limit").unwrap_or(50).clamp(1, 500);
-        let mut sql = String::from(
-            "SELECT instance_id,name,is_error,duration_ms,substr(args,1,160),substr(result,1,300),created_at FROM tool_calls WHERE 1=1",
-        );
-        let mut p: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(s) = opt_str(args, "instance_id") {
-            sql.push_str(" AND instance_id=?");
-            p.push(Box::new(s));
-        }
-        if let Some(n) = opt_str(args, "name") {
-            sql.push_str(" AND name=?");
-            p.push(Box::new(n));
-        }
-        if opt_bool(args, "errors_only").unwrap_or(false) {
-            sql.push_str(" AND is_error=1");
-        }
-        sql.push_str(" ORDER BY id DESC LIMIT ?");
-        p.push(Box::new(limit));
-        let mut stmt = agent.db.conn.prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::types::ToSql> = p.iter().map(|b| b.as_ref()).collect();
-        let rows = stmt.query_map(refs.as_slice(), |r| {
+        let instance_id = opt_str(args, "instance_id");
+        let name = opt_str(args, "name");
+        let errors_only = opt_bool(args, "errors_only").unwrap_or(false);
+        let mut stmt = agent.db.conn.prepare(
+            "SELECT instance_id,name,is_error,duration_ms,substr(args,1,160),substr(result,1,300),created_at FROM tool_calls WHERE (?1 IS NULL OR instance_id = ?1) AND (?2 IS NULL OR name = ?2) AND (?3 = 0 OR is_error = 1) ORDER BY id DESC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![instance_id, name, errors_only, limit], |r| {
             Ok(format!(
                 "{}\t{}\terr={}\t{}ms\t{}\n  args: {}\n  result: {}\n",
                 r.get::<_, String>(0)?,
@@ -986,8 +967,6 @@ pub mod retro {
         Ok(out)
     }
 
-    // ------------------------------------------------------------------- prompts
-
     fn parse_mode(s: &str) -> Result<Mode> {
         let mode = Mode::parse(s)?;
         if !mode.allows_extended() {
@@ -1053,12 +1032,8 @@ pub mod retro {
     pub fn prompt_rollback(agent: &mut Agent, args: &Value) -> Result<String> {
         let mode = parse_mode(&req_str(args, "mode")?)?;
         let version = opt_i64(args, "version").ok_or_else(|| anyhow::anyhow!("missing version"))?;
-        let versions = agent.db.prompt_versions(mode.as_str())?;
-        if !versions.iter().any(|v| v.version == version) {
-            bail!("mode {} has no version {}", mode.as_str(), version);
-        }
         if !agent.db.prompt_activate(mode.as_str(), version)? {
-            bail!("could not activate version {version}");
+            bail!("mode {} has no version {}", mode.as_str(), version);
         }
         agent.refresh_system_prompt()?;
         Ok(format!(
@@ -1076,7 +1051,6 @@ pub mod skills {
     use crate::agent::Agent;
     use crate::storage::db::Db;
 
-    /// Parse an optional YAML-ish frontmatter block. Returns (name, description, body).
     pub fn parse_skill(text: &str, fallback_name: &str) -> (String, String, String) {
         let mut name = fallback_name.to_string();
         let mut description = String::new();
@@ -1107,8 +1081,6 @@ pub mod skills {
         )
     }
 
-    /// Scan the skills directory and sync markdown files into the database,
-    /// recording a version whenever content changes.
     pub fn sync_skills(db: &Db, dir: &Path) -> Result<usize> {
         if !dir.exists() {
             return Ok(0);
@@ -1173,27 +1145,22 @@ pub mod skills {
     pub fn load(agent: &mut Agent, args: &Value) -> Result<String> {
         let name = req_str(args, "name")?;
         let skill = agent.db.skill_get(&name)?;
-        let instance_id = agent.instance_id.clone();
-        match skill {
-            Some(s) => {
-                agent.db.skill_record_load(&instance_id, &name)?;
-                Ok(format!(
-                    "# Skill: {}\n{}\n\n{}",
-                    s.name, s.description, s.content
-                ))
-            }
-            None => {
-                let names: Vec<String> =
-                    agent.db.skill_list()?.into_iter().map(|s| s.name).collect();
-                bail!(
-                    "skill `{name}` not found. available: {}",
-                    if names.is_empty() {
-                        "(none)".into()
-                    } else {
-                        names.join(", ")
-                    }
-                )
-            }
+        if let Some(s) = skill {
+            agent.db.skill_record_load(&agent.instance_id, &name)?;
+            Ok(format!(
+                "# Skill: {}\n{}\n\n{}",
+                s.name, s.description, s.content
+            ))
+        } else {
+            let names: Vec<String> = agent.db.skill_list()?.into_iter().map(|s| s.name).collect();
+            bail!(
+                "skill `{name}` not found. available: {}",
+                if names.is_empty() {
+                    "(none)".into()
+                } else {
+                    names.join(", ")
+                }
+            )
         }
     }
 
@@ -1342,17 +1309,13 @@ pub mod skills {
 pub mod spawn {
     use anyhow::{Result, bail};
     use serde_json::{Value, json};
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use super::{opt_str, req_str};
     use crate::agent::Agent;
     use crate::storage::proc;
 
-    /// Spawn the same executable as a subagent in a given mode. The subagent runs a
-    /// single mode (never cycles). Agent-to-agent communication is machine form:
-    /// the subagent emits its JSONL event stream on stdout, we relay every event
-    /// into our own stream, and return those events to the model. The subagent's
-    /// final report is the `report` field of the `instance_end` event.
     pub fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
         let mode = req_str(args, "mode")?;
         if !["plan", "build", "explore"].contains(&mode.as_str()) {
@@ -1369,90 +1332,36 @@ pub mod spawn {
         let task = opt_str(args, "task").unwrap_or_else(|| format!("subagent:{mode}"));
 
         let exe = std::env::current_exe().unwrap_or_else(|_| "genji".into());
-        let tmpdir = agent.workspace.join(".genji").join("tmp");
-        std::fs::create_dir_all(&tmpdir)?;
-        let inst_path = tmpdir.join(format!(
-            "subagent-{}-{}.md",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::write(&inst_path, &instructions)?;
-
-        let cmd_args = vec![
-            mode.clone(),
-            "--subagent".to_string(),
-            "--parent-instance".to_string(),
-            agent.instance_id.clone(),
-            "--instructions-file".to_string(),
-            inst_path.to_string_lossy().to_string(),
-            "--label".to_string(),
-            task.clone(),
-            "--depth".to_string(),
-            (agent.depth + 1).to_string(),
-            "--quiet-startup".to_string(),
-            "--no-control".to_string(),
-        ]
-        .into_iter()
-        // Subagents inherit Formal so a build subagent can work the same tickets.
-        .chain(agent.formal.then(|| "--formal".to_string()))
-        .collect::<Vec<_>>();
+        let instruction_file = InstructionFile::create(&agent.workspace, &instructions)?;
+        let cmd_args = build_subagent_args(
+            &mode,
+            &agent.instance_id,
+            instruction_file.path(),
+            &task,
+            agent.depth,
+            agent.formal,
+        );
 
         let cap = agent.cfg.tool_result_max_bytes.saturating_mul(2).max(16384);
         let res = proc::run_capture(
             &exe.to_string_lossy(),
             &cmd_args,
             &agent.workspace,
+            &agent.cfg.tmp_path(&agent.workspace),
             Duration::from_secs(agent.cfg.spawn_timeout_secs),
             cap,
         )?;
-        let _ = std::fs::remove_file(&inst_path);
 
-        // Parse the child's JSONL event stream and hand its events back to the
-        // model. The subagent's final report lives in its `instance_end` event. The
-        // child's events are NOT relayed into our stdout stream; the user can read
-        // the full trace with `genji inspect <subagent_instance>`.
-        let mut parsed = 0usize;
-        let mut sub_instance = String::new();
-        let mut saw_end = false;
-        let mut start: Option<Value> = None;
-        let mut end: Option<Value> = None;
-        let mut errors: Vec<Value> = Vec::new();
-        let mut tools: Vec<Value> = Vec::new();
-        for line in res.stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(event) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if event.get("type").is_none() {
-                continue;
-            }
-            parsed += 1;
-            if sub_instance.is_empty()
-                && let Some(s) = event.get("instance").and_then(|s| s.as_str())
-            {
-                sub_instance = s.to_string();
-            }
-            match event.get("type").and_then(|t| t.as_str()) {
-                Some("instance_start") => start = Some(event.clone()),
-                Some("instance_end") => {
-                    saw_end = true;
-                    end = Some(event.clone());
-                }
-                Some("error") => errors.push(event.clone()),
-                Some("tool_call") | Some("tool_result") => tools.push(event.clone()),
-                _ => {}
-            }
-        }
+        let ParsedEvents {
+            parsed,
+            sub_instance,
+            saw_end,
+            start,
+            mut end,
+            mut errors,
+            tools,
+        } = parse_subagent_events(&res.stdout);
 
-        // Fallback for a subagent that produced no event stream (for example an
-        // older binary): synthesise an `instance_end` from the raw text so the report
-        // is still discoverable in the events.
         if parsed == 0 {
             let text = if res.stdout.trim().is_empty() {
                 res.stderr.trim().to_string()
@@ -1508,16 +1417,121 @@ pub mod spawn {
             "exit_code": res.code,
             "timed_out": res.timed_out,
             "duration_ms": res.duration_ms as u64,
-            // The report is the `report` field of the `instance_end` event.
             "events": events,
         })
         .to_string())
     }
 
-    /// Assemble the subagent events handed to the parent model, bounded so the
-    /// tool-result cap can never cut off the trailing `instance_end` (and therefore
-    /// the report). `instance_start`, `error`, and `instance_end` survive; tool detail
-    /// is clipped and then dropped as needed.
+    struct InstructionFile {
+        path: PathBuf,
+    }
+
+    impl InstructionFile {
+        fn create(workspace: &Path, instructions: &str) -> Result<Self> {
+            let dir = workspace.join(".genji").join("tmp");
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join(format!(
+                "subagent-{}-{}.md",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+            std::fs::write(&path, instructions)?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for InstructionFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn build_subagent_args(
+        mode: &str,
+        parent_instance: &str,
+        instructions: &Path,
+        task: &str,
+        depth: u32,
+        formal: bool,
+    ) -> Vec<String> {
+        let mut args = vec![
+            mode.to_string(),
+            "--subagent".to_string(),
+            "--parent-instance".to_string(),
+            parent_instance.to_string(),
+            "--instructions-file".to_string(),
+            instructions.to_string_lossy().into_owned(),
+            "--label".to_string(),
+            task.to_string(),
+            "--depth".to_string(),
+            (depth + 1).to_string(),
+            "--quiet-startup".to_string(),
+            "--no-control".to_string(),
+        ];
+        // Subagents inherit Formal so a build subagent can work the same tickets.
+        if formal {
+            args.push("--formal".to_string());
+        }
+        args
+    }
+
+    struct ParsedEvents {
+        parsed: usize,
+        sub_instance: String,
+        saw_end: bool,
+        start: Option<Value>,
+        end: Option<Value>,
+        errors: Vec<Value>,
+        tools: Vec<Value>,
+    }
+
+    fn parse_subagent_events(stdout: &str) -> ParsedEvents {
+        let mut result = ParsedEvents {
+            parsed: 0,
+            sub_instance: String::new(),
+            saw_end: false,
+            start: None,
+            end: None,
+            errors: Vec::new(),
+            tools: Vec::new(),
+        };
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if event.get("type").is_none() {
+                continue;
+            }
+            result.parsed += 1;
+            if result.sub_instance.is_empty()
+                && let Some(s) = event.get("instance").and_then(|s| s.as_str())
+            {
+                result.sub_instance = s.to_string();
+            }
+            match event.get("type").and_then(|t| t.as_str()) {
+                Some("instance_start") => result.start = Some(event),
+                Some("instance_end") => {
+                    result.saw_end = true;
+                    result.end = Some(event);
+                }
+                Some("error") => result.errors.push(event),
+                Some("tool_call" | "tool_result") => result.tools.push(event),
+                _ => {}
+            }
+        }
+        result
+    }
+
     fn bounded_events(
         start: Option<Value>,
         tools: Vec<Value>,
@@ -1536,27 +1550,23 @@ pub mod spawn {
 
         // Clip bulky string fields.
         const CLIP: usize = 2000;
-        for ev in events.iter_mut() {
+        for ev in &mut events {
             for field in ["result", "content", "reasoning", "summary", "message"] {
                 if let Some(s) = ev.get(field).and_then(|v| v.as_str())
                     && s.len() > CLIP
                 {
-                    ev[field] = json!(crate::llm::truncate(s.to_string(), CLIP));
+                    ev[field] = json!(crate::llm::truncate(s, CLIP));
                 }
             }
         }
 
-        let size = |evs: &[Value]| {
-            serde_json::to_string(evs)
-                .map(|s| s.len())
-                .unwrap_or(usize::MAX)
-        };
+        let size = |evs: &[Value]| serde_json::to_string(evs).map_or(usize::MAX, |s| s.len());
         // Drop tool detail (oldest first) while keeping start/errors/end.
         while size(&events) > budget {
             let idx = events.iter().position(|e| {
                 matches!(
                     e.get("type").and_then(|t| t.as_str()),
-                    Some("tool_call") | Some("tool_result")
+                    Some("tool_call" | "tool_result")
                 )
             });
             match idx {
@@ -1577,8 +1587,7 @@ pub mod spawn {
             let report_len = events[i]
                 .get("report")
                 .and_then(|v| v.as_str())
-                .map(|s| s.len())
-                .unwrap_or(0);
+                .map_or(0, str::len);
             if report_len <= 64 {
                 break;
             }
@@ -1587,10 +1596,10 @@ pub mod spawn {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let shrunk = crate::llm::truncate(current, report_len / 2);
+            let shrunk = crate::llm::truncate(&current, report_len / 2);
             events[i]["report"] = json!(shrunk);
         }
-        // Absolute last resort: keep only the report-bearing `instance_end`.
+        // Absolute last resort: keep only `instance_end`.
         if size(&events) > budget
             && let Some(i) = events
                 .iter()
@@ -1611,20 +1620,17 @@ pub mod tickets {
 
     use super::{opt_i64, opt_str, req_str};
     use crate::agent::Agent;
-    use crate::storage::db::TicketEdit;
-    use crate::storage::ticketmd::{self, Ticket};
+    use crate::storage::db::{FieldPatch, TicketEdit};
+    use crate::storage::ticketmd::{self, Ticket, TicketStatus};
 
     fn find(agent: &Agent, id: i64) -> Result<Option<Ticket>> {
         ticketmd::load_by_id(&agent.cfg, &agent.workspace, id)
     }
 
     pub fn list_all(agent: &Agent) -> Result<Vec<Ticket>> {
-        let mut all = ticketmd::load_all(&agent.cfg, &agent.workspace)?;
-        all.sort_by_key(|t| (t.priority, t.id));
-        Ok(all)
+        ticketmd::load_all(&agent.cfg, &agent.workspace)
     }
 
-    /// Format one ticket for tool output.
     fn fmt_ticket(t: &Ticket, workspace: &Path) -> String {
         let mut s = format!("#{} [{}] {}\n", t.id, t.status, t.title);
         if t.priority != 2 {
@@ -1636,9 +1642,7 @@ pub mod tickets {
         if let Some(p) = t.parent_id {
             s.push_str(&format!("parent: #{p}\n"));
         }
-        if let Some(path) = t.display_path(workspace) {
-            s.push_str(&format!("path: {path}\n"));
-        }
+        s.push_str(&format!("path: {}\n", t.display_path(workspace)));
         s.push_str(&format!("created: {}\n", t.created_at));
         if let Some(r) = &t.resolution {
             s.push_str(&format!("resolution: {r}\n"));
@@ -1678,16 +1682,13 @@ pub mod tickets {
                 None => bail!("ticket #{id} not found"),
             };
         }
-        let status = opt_str(args, "status");
+        let status = opt_str(args, "status")
+            .map(|status| parse_ticket_status(&status))
+            .transpose()?;
         let requirement_id = opt_i64(args, "requirement_id");
-        // `ticket_read` owns listing: with no id it lists the actionable,
-        // file-backed (open/in_progress) tickets. Archived tickets are still
-        // reachable by id above.
-        let mut tickets = ticketmd::load_all(&agent.cfg, &agent.workspace)?;
-        tickets.sort_by_key(|t| (t.priority, t.id));
-        let tickets: Vec<Ticket> = tickets
+        let tickets: Vec<Ticket> = ticketmd::load_all(&agent.cfg, &agent.workspace)?
             .into_iter()
-            .filter(|t| status.as_deref().is_none_or(|s| t.status == s))
+            .filter(|t| status.is_none_or(|s| t.status == s))
             .filter(|t| requirement_id.is_none_or(|r| t.requirement_id == Some(r)))
             .collect();
         if tickets.is_empty() {
@@ -1707,7 +1708,8 @@ pub mod tickets {
         let ticket = match id {
             Some(id) => find(agent, id)?,
             None => list_all(agent)?.into_iter().find(|t| {
-                t.status == "open" && requirement_id.is_none_or(|r| t.requirement_id == Some(r))
+                t.status == TicketStatus::Open
+                    && requirement_id.is_none_or(|r| t.requirement_id == Some(r))
             }),
         };
         let Some(t) = ticket else {
@@ -1716,7 +1718,7 @@ pub mod tickets {
                 None => "(no open tickets to claim)".to_string(),
             });
         };
-        if !matches!(t.status.as_str(), "open" | "in_progress") {
+        if !t.status.is_open() {
             bail!("ticket #{} is {} and cannot be claimed", t.id, t.status);
         }
         let Some(t) = ticketmd::update(
@@ -1724,7 +1726,7 @@ pub mod tickets {
             &agent.workspace,
             t.id,
             &TicketEdit::default(),
-            Some("in_progress"),
+            Some(TicketStatus::InProgress),
             None,
         )?
         else {
@@ -1737,63 +1739,74 @@ pub mod tickets {
         ))
     }
 
+    fn parse_ticket_status(status: &str) -> Result<TicketStatus> {
+        status
+            .parse()
+            .map_err(|_| anyhow::anyhow!("status must be open|in_progress|resolved|closed"))
+    }
+
     pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
         let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
-        let status = opt_str(args, "status");
-        if let Some(s) = &status
-            && !["open", "in_progress", "resolved", "closed"].contains(&s.as_str())
-        {
-            bail!("status must be open|in_progress|resolved|closed");
-        }
+        let status = opt_str(args, "status")
+            .map(|status| parse_ticket_status(&status))
+            .transpose()?;
         let edit = TicketEdit {
             title: opt_str(args, "title"),
             description: opt_str(args, "description"),
             priority: opt_i64(args, "priority").map(|p| p.clamp(1, 3)),
-            parent_id: args.get("parent_id").map(|v| v.as_i64()),
-            requirement_id: args.get("requirement_id").map(|v| v.as_i64()),
+            parent_id: args
+                .get("parent_id")
+                .map(|v| v.as_i64().map_or(FieldPatch::Clear, FieldPatch::Set))
+                .unwrap_or_default(),
+            requirement_id: args
+                .get("requirement_id")
+                .map(|v| v.as_i64().map_or(FieldPatch::Clear, FieldPatch::Set))
+                .unwrap_or_default(),
         };
         let resolution = opt_str(args, "resolution");
-        let Some(_t) = find(agent, id)? else {
-            bail!("ticket #{id} not found");
-        };
         ticketmd::update(
             &agent.cfg,
             &agent.workspace,
             id,
             &edit,
-            status.as_deref(),
+            status,
             resolution.as_deref(),
         )?
-        .ok_or_else(|| anyhow::anyhow!("ticket #{id} disappeared during update"))?;
+        .ok_or_else(|| anyhow::anyhow!("ticket #{id} not found"))?;
         Ok(format!("updated ticket #{id}"))
     }
 
     pub fn close(agent: &mut Agent, args: &Value) -> Result<String> {
         let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
         let reason = opt_str(args, "reason");
-        let Some(_t) = find(agent, id)? else {
-            bail!("ticket #{id} not found");
-        };
         ticketmd::update(
             &agent.cfg,
             &agent.workspace,
             id,
             &TicketEdit::default(),
-            Some("closed"),
+            Some(TicketStatus::Closed),
             reason.as_deref(),
-        )?;
+        )?
+        .ok_or_else(|| anyhow::anyhow!("ticket #{id} not found"))?;
         Ok(format!("ticket #{id} closed"))
     }
 }
 
+type ToolGate = u8;
+const GATE_FORMAL: ToolGate = 1 << 0;
+const GATE_SKILLS: ToolGate = 1 << 1;
+
 #[derive(Debug, Clone)]
-pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub parameters: Value,
+pub struct Tool {
+    name: &'static str,
+    description: &'static str,
+    parameters: Value,
+    modes: &'static [Mode],
+    gate: ToolGate,
+    handler: fn(&mut Agent, &Value) -> Result<String>,
 }
 
-impl ToolSpec {
+impl Tool {
     pub fn to_json(&self) -> Value {
         json!({
             "type": "function",
@@ -1804,38 +1817,11 @@ impl ToolSpec {
             }
         })
     }
-}
-
-/// A tool is defined exactly once: its name, description, JSON schema, the
-/// modes it is available in, and its handler. The model-facing spec and the
-/// dispatch table are both derived from this, so they cannot drift apart.
-struct Tool {
-    name: &'static str,
-    description: &'static str,
-    parameters: Value,
-    modes: &'static [Mode],
-    /// When true the tool is only exposed while the Formal flag is enabled. This
-    /// is how the requirements/tickets system stays out of the default agent.
-    requires_formal: bool,
-    /// When true the tool is only exposed while at least one skill exists. This
-    /// keeps `skill_load` out of the schema when there is nothing to load.
-    requires_skills: bool,
-    handler: fn(&mut Agent, &Value) -> Result<String>,
-}
-
-impl Tool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: self.name,
-            description: self.description,
-            parameters: self.parameters.clone(),
-        }
-    }
 
     fn available(&self, mode: Mode, formal: bool, has_skills: bool) -> bool {
-        self.modes.contains(&mode)
-            && (!self.requires_formal || formal)
-            && (!self.requires_skills || has_skills)
+        let capabilities =
+            if formal { GATE_FORMAL } else { 0 } | if has_skills { GATE_SKILLS } else { 0 };
+        self.modes.contains(&mode) && capabilities & self.gate == self.gate
     }
 }
 
@@ -1846,9 +1832,10 @@ const PLAN_BUILD: &[Mode] = &[Mode::Plan, Mode::Build];
 const PLAN_BUILD_EXPLORE: &[Mode] = &[Mode::Plan, Mode::Build, Mode::Explore];
 const RETRO: &[Mode] = &[Mode::Retro];
 
-fn tool(
+fn gated_tool(
     name: &'static str,
     modes: &'static [Mode],
+    gate: ToolGate,
     description: &'static str,
     parameters: Value,
     handler: fn(&mut Agent, &Value) -> Result<String>,
@@ -1858,13 +1845,26 @@ fn tool(
         description,
         parameters,
         modes,
-        requires_formal: false,
-        requires_skills: false,
+        gate,
         handler,
     }
 }
 
-/// Like [`tool`], but only exposed while the Formal flag is enabled.
+fn tool(
+    name: &'static str,
+    modes: &'static [Mode],
+    description: &'static str,
+    parameters: Value,
+    handler: fn(&mut Agent, &Value) -> Result<String>,
+) -> Tool {
+    gated_tool(name, modes, 0, description, parameters, handler)
+}
+
+#[cfg(test)]
+pub(crate) fn test_tool(name: &'static str, parameters: Value) -> Tool {
+    tool(name, ALL_MODES, "d", parameters, basic::read)
+}
+
 #[cfg(feature = "formal")]
 fn formal_tool(
     name: &'static str,
@@ -1873,18 +1873,9 @@ fn formal_tool(
     parameters: Value,
     handler: fn(&mut Agent, &Value) -> Result<String>,
 ) -> Tool {
-    Tool {
-        name,
-        description,
-        parameters,
-        modes,
-        requires_formal: true,
-        requires_skills: false,
-        handler,
-    }
+    gated_tool(name, modes, GATE_FORMAL, description, parameters, handler)
 }
 
-/// Like [`tool`], but only exposed while at least one skill is available.
 fn skill_tool(
     name: &'static str,
     modes: &'static [Mode],
@@ -1892,18 +1883,9 @@ fn skill_tool(
     parameters: Value,
     handler: fn(&mut Agent, &Value) -> Result<String>,
 ) -> Tool {
-    Tool {
-        name,
-        description,
-        parameters,
-        modes,
-        requires_formal: false,
-        requires_skills: true,
-        handler,
-    }
+    gated_tool(name, modes, GATE_SKILLS, description, parameters, handler)
 }
 
-/// The full registry. Built once, then shared by `specs_for` and `dispatch`.
 fn registry() -> &'static [Tool] {
     static TOOLS: OnceLock<Vec<Tool>> = OnceLock::new();
     TOOLS.get_or_init(|| {
@@ -1952,7 +1934,6 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["command"]
             }), basic::bash),
-            // ---- plans ----
             tool("plan_write", PLAN, "Persist an implementation plan as markdown under the plans directory (default .genji/plans/). Reuse the same title to refine an existing plan.", json!({
                 "type":"object",
                 "properties":{
@@ -1962,7 +1943,6 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["title","content"]
             }), plans::write),
-            // ---- tickets (Formal only) ----
             #[cfg(feature = "formal")]
             formal_tool("ticket_create", PLAN, "Create a work ticket.", json!({
                 "type":"object",
@@ -2013,7 +1993,6 @@ fn registry() -> &'static [Tool] {
                 "properties":{"id":{"type":"integer"},"reason":{"type":"string"}},
                 "required":["id"]
             }), tickets::close),
-            // ---- requirements (Formal only) ----
             #[cfg(feature = "formal")]
             formal_tool("requirement_create", PLAN, "Create a stakeholder or system requirement.", json!({
                 "type":"object",
@@ -2069,13 +2048,11 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["question"]
             }), requirements::ask),
-            // ---- skills ----
             skill_tool("skill_load", ALL_MODES, "Load a skill's instructions by name.", json!({
                 "type":"object",
                 "properties":{"name":{"type":"string"}},
                 "required":["name"]
             }), skills::load),
-            // ---- spawn ----
             tool("spawn", PLAN_BUILD_EXPLORE, "Spawn a subagent in a given mode that only reports back.", json!({
                 "type":"object",
                 "properties":{
@@ -2085,7 +2062,6 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["mode","instructions"]
             }), spawn::spawn),
-            // ---- retro ----
             tool("query_instances", RETRO, "List past agent instances.", json!({
                 "type":"object",
                 "properties":{
@@ -2179,24 +2155,21 @@ fn registry() -> &'static [Tool] {
     })
 }
 
-pub fn specs_for(mode: Mode, formal: bool, has_skills: bool) -> Vec<ToolSpec> {
+pub fn specs_for(mode: Mode, formal: bool, has_skills: bool) -> Vec<Tool> {
     registry()
         .iter()
         .filter(|t| t.available(mode, formal, has_skills))
-        .map(|t| t.spec())
+        .cloned()
         .collect()
 }
 
-/// Execute a tool. Returns (result_text, is_error). Result is bounded here so
-/// every caller gets content that fits the context window; oversized results are
-/// spilled to `.genji/tmp/*.log` and the returned text points at the file.
 pub fn dispatch(agent: &mut Agent, name: &str, args: &Value) -> (String, bool) {
     let res: Result<String> = (|| {
         let t = registry()
             .iter()
             .find(|t| t.name == name)
             .ok_or_else(|| anyhow!("unknown tool `{name}`"))?;
-        let has_skills = !t.requires_skills || !agent.db.skill_list()?.is_empty();
+        let has_skills = t.gate & GATE_SKILLS == 0 || agent.db.has_skills()?;
         if !t.available(agent.mode, agent.formal, has_skills) {
             return Err(anyhow!("tool `{name}` is unavailable in the current mode"));
         }
@@ -2211,10 +2184,6 @@ pub fn dispatch(agent: &mut Agent, name: &str, args: &Value) -> (String, bool) {
     }
 }
 
-/// Bound a tool result to `tool_result_max_bytes`. When the result is larger it
-/// is written verbatim to a log file under `tmp_dir` and the inline text is
-/// truncated with a pointer to that file, so the model can page through the
-/// full output instead of losing it.
 fn bounded_result(cfg: &Config, workspace: &Path, name: &str, text: String) -> String {
     let max = cfg.tool_result_max_bytes;
     let total = text.len();
@@ -2229,23 +2198,21 @@ fn bounded_result(cfg: &Config, workspace: &Path, name: &str, text: String) -> S
                 .to_string_lossy();
             format!(
                 "{}\n[full result ({total} bytes) written to {shown}; read it with the read tool]",
-                crate::llm::truncate(text, max),
+                crate::llm::truncate(&text, max),
             )
         }
-        Err(_) => crate::llm::truncate(text, max),
+        Err(_) => crate::llm::truncate(&text, max).into_owned(),
     }
 }
 
 static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Write a full tool result to `tmp_dir/tool-<name>-<ts>-<seq>.log`.
 fn spill_to_log(cfg: &Config, workspace: &Path, name: &str, text: &str) -> Result<PathBuf> {
     let dir = cfg.tmp_path(workspace);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis());
     let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
     let safe: String = name
         .chars()
@@ -2262,27 +2229,25 @@ fn spill_to_log(cfg: &Config, workspace: &Path, name: &str, text: &str) -> Resul
     Ok(path)
 }
 
-// ------------------------------------------------------------------ arg helpers
-
 pub fn req_str(args: &Value, key: &str) -> Result<String> {
     args.get(key)
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .ok_or_else(|| anyhow!("missing required string argument `{key}`"))
 }
 
 pub fn opt_str(args: &Value, key: &str) -> Option<String> {
     args.get(key)
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 pub fn opt_i64(args: &Value, key: &str) -> Option<i64> {
-    args.get(key).and_then(|v| v.as_i64())
+    args.get(key).and_then(Value::as_i64)
 }
 
 pub fn opt_bool(args: &Value, key: &str) -> Option<bool> {
-    args.get(key).and_then(|v| v.as_bool())
+    args.get(key).and_then(Value::as_bool)
 }
 
 #[cfg(test)]
@@ -2295,8 +2260,7 @@ mod tests {
     fn temp_workspace(tag: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         let dir = std::env::temp_dir().join(format!("genji-tools-{tag}-{nanos}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2342,6 +2306,21 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn tool_gate_requires_all_selected_capabilities() {
+        let gated = super::gated_tool(
+            "test",
+            super::ALL_MODES,
+            super::GATE_FORMAL | super::GATE_SKILLS,
+            "test",
+            serde_json::json!({}),
+            super::basic::read,
+        );
+        assert!(!gated.available(Mode::Build, false, true));
+        assert!(!gated.available(Mode::Build, true, false));
+        assert!(gated.available(Mode::Build, true, true));
+    }
+
     fn names_without_skills(mode: Mode, formal: bool) -> Vec<String> {
         specs_for(mode, formal, false)
             .into_iter()
@@ -2362,7 +2341,6 @@ mod tests {
                 "{mode:?} exposed plan_write"
             );
         }
-        // Formal does not change plan tool availability.
         assert!(names(Mode::Plan, true).iter().any(|n| n == "plan_write"));
     }
 
@@ -2389,7 +2367,6 @@ mod tests {
         let build = names(Mode::Build, true);
         assert!(build.iter().any(|n| n == "ticket_claim"));
         assert!(build.iter().any(|n| n == "ticket_update"));
-        // Build still cannot create requirements.
         assert!(!build.iter().any(|n| n == "requirement_create"));
     }
 

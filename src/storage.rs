@@ -2,16 +2,17 @@ pub mod context {
     use anyhow::Result;
     use serde_json::{Value, json};
 
-    use crate::llm::{self, ChatMessage, LlmClient};
-    use crate::tools::ToolSpec;
+    use crate::llm::{self, ChatMessage, LlmClient, Role};
+    use crate::tools::Tool;
 
-    /// Approximate token cost of the tool definitions sent with every request.
     pub fn estimate_tools(tools: &[Value]) -> i64 {
-        let chars: usize = tools.iter().map(|t| t.to_string().chars().count()).sum();
-        ((chars / 4) + 4) as i64
+        let chars = tools
+            .iter()
+            .map(|tool| tool.to_string().chars().count())
+            .fold(0usize, usize::saturating_add);
+        llm::estimate_chars(chars)
     }
 
-    /// Estimated token cost of each part of the prompt.
     #[derive(Debug, Clone, Copy, Default)]
     pub struct ContextInfo {
         pub system_prompt_tokens: i64,
@@ -22,11 +23,15 @@ pub mod context {
     }
 
     impl ContextInfo {
-        /// Measure a context. Read-only: it borrows the existing strings and does
-        /// not allocate or clone them.
         pub fn compute(messages: &[ChatMessage], tools: &[Value], context_window: i64) -> Self {
-            let system_prompt_tokens = messages.first().map(|m| m.est_tokens()).unwrap_or(0);
-            let turn_messages_tokens = messages.iter().skip(1).map(|m| m.est_tokens()).sum();
+            let system_prompt_tokens = messages
+                .first()
+                .map_or(0, super::super::llm::ChatMessage::est_tokens);
+            let turn_messages_tokens = messages
+                .iter()
+                .skip(1)
+                .map(super::super::llm::ChatMessage::est_tokens)
+                .sum();
             let system_tools_tokens = estimate_tools(tools);
             Self {
                 system_prompt_tokens,
@@ -37,9 +42,8 @@ pub mod context {
             }
         }
 
-        /// Rebuild from a JSON form (see [`ContextInfo::to_json`]).
         pub fn from_json(v: &Value) -> Self {
-            let get = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+            let get = |k: &str| v.get(k).and_then(serde_json::Value::as_i64).unwrap_or(0);
             Self {
                 system_prompt_tokens: get("system_prompt_tokens"),
                 system_tools_tokens: get("system_tools_tokens"),
@@ -64,7 +68,6 @@ pub mod context {
             })
         }
 
-        /// Human-readable size block shared by `/context` and `genji inspect`.
         pub fn summary(&self) -> String {
             let p = |tokens: i64| percent_of(tokens, self.context_window);
             format!(
@@ -82,8 +85,6 @@ pub mod context {
         }
     }
 
-    /// Record of one compaction, returned to the agent so it can persist and emit
-    /// the outcome (the composer only owns the in-memory conversation).
     #[derive(Debug, Clone)]
     pub struct Compaction {
         pub removed: i64,
@@ -94,20 +95,18 @@ pub mod context {
         pub completion_tokens: i64,
     }
 
-    /// Owns the model-facing context and the operations that shape it.
     pub struct ContextComposer {
         messages: Vec<ChatMessage>,
-        tools: Vec<ToolSpec>,
+        tools: Vec<Value>,
         context_window: i64,
         last_prompt_tokens: i64,
     }
 
     impl ContextComposer {
-        /// Start a conversation with a system prompt and the mode's tools.
-        pub fn new(system: String, tools: Vec<ToolSpec>, context_window: i64) -> Self {
+        pub fn new(system: String, tools: Vec<Tool>, context_window: i64) -> Self {
             Self {
                 messages: vec![ChatMessage::system(system)],
-                tools,
+                tools: tools.into_iter().map(|t| t.to_json()).collect(),
                 context_window,
                 last_prompt_tokens: 0,
             }
@@ -117,61 +116,47 @@ pub mod context {
             &self.messages
         }
 
-        /// The mode's tool definitions, ready to send to the provider.
-        pub fn tools_json(&self) -> Vec<Value> {
-            self.tools.iter().map(|t| t.to_json()).collect()
+        pub fn tools(&self) -> &[Value] {
+            &self.tools
         }
 
         pub fn set_last_prompt_tokens(&mut self, tokens: i64) {
             self.last_prompt_tokens = tokens;
         }
 
-        /// Append a message to the conversation.
         pub fn push(&mut self, msg: ChatMessage) {
             self.messages.push(msg);
         }
 
-        /// Append a tool result, pairing it with the call being answered.
-        pub fn push_tool_result(&mut self, tool_call_id: &str, content: impl Into<String>) {
-            self.messages
-                .push(ChatMessage::tool_result(tool_call_id, content));
-        }
-
-        /// Replace the system prompt in place, preserving the turns.
         pub fn set_system(&mut self, system: String) {
             if let Some(first) = self.messages.first_mut() {
-                first.role = "system".into();
+                first.role = Role::System;
                 first.content = system;
             } else {
                 self.messages.push(ChatMessage::system(system));
             }
         }
 
-        /// Switch the mode-dependent context: its tools, system prompt, and window.
-        pub fn switch_mode(&mut self, tools: Vec<ToolSpec>, system: String, context_window: i64) {
-            self.tools = tools;
+        #[cfg(any(feature = "formal", test))]
+        pub fn switch_mode(&mut self, tools: Vec<Tool>, system: String, context_window: i64) {
+            self.tools = tools.into_iter().map(|t| t.to_json()).collect();
             self.context_window = context_window;
             self.set_system(system);
         }
 
-        /// Measure the current context. Called only when someone asks (via
-        /// `/context` or `genji inspect`); it reads the existing strings and
-        /// allocates nothing beyond the tool JSON it must serialize.
         pub fn stats(&self) -> ContextInfo {
-            ContextInfo::compute(&self.messages, &self.tools_json(), self.context_window)
+            ContextInfo::compute(&self.messages, self.tools(), self.context_window)
         }
 
         pub fn snapshot(&self) -> Value {
             json!({
                 "context_window": self.context_window,
                 "last_prompt_tokens": self.last_prompt_tokens,
-                "messages": self.messages.iter().map(|m| m.to_json()).collect::<Vec<_>>(),
-                "tools": self.tools_json(),
+                "messages": self.messages.iter().map(super::super::llm::ChatMessage::to_json).collect::<Vec<_>>(),
+                "tools": self.tools(),
             })
         }
 
-        /// Compact when the estimated prompt size reaches `threshold_fraction` of
-        /// the context window. Returns the compaction outcome when one happened.
         pub fn maybe_compact(
             &mut self,
             threshold_fraction: f64,
@@ -191,17 +176,13 @@ pub mod context {
             }
         }
 
-        /// Summarize the middle of the conversation and replace it with a single
-        /// summary message, keeping the system prompt and the most recent turns.
-        /// Tool-call/result pairs are never split.
         pub fn compact(&mut self, keep: usize, llm: &LlmClient) -> Result<Option<Compaction>> {
             let keep = keep.max(2);
             if self.messages.len() <= keep + 2 {
                 return Ok(None);
             }
             let mut split = self.messages.len() - keep;
-            // Never start the kept window with an orphaned tool result.
-            while split < self.messages.len() && self.messages[split].role == "tool" {
+            while split < self.messages.len() && self.messages[split].role == Role::Tool {
                 split += 1;
             }
             if split <= 1 {
@@ -209,7 +190,8 @@ pub mod context {
             }
             let before = llm::estimate_messages(&self.messages);
             let middle: Vec<ChatMessage> = self.messages[1..split].to_vec();
-            let rendered = llm::truncate(render_messages(&middle), 120_000);
+            let rendered_source = render_messages(&middle);
+            let rendered = llm::truncate(&rendered_source, 120_000);
             let summary_req = vec![
                 ChatMessage::system(
                     "You compress agent running history. Preserve decisions, key clues, open problems. Be dense and factual.",
@@ -223,7 +205,7 @@ pub mod context {
 
             let system = self.messages[0].clone();
             let recent: Vec<ChatMessage> = self.messages[split..].to_vec();
-            let removed = (split - 1) as i64;
+            let removed = i64::try_from(split - 1).unwrap_or(i64::MAX);
             let mut new_msgs = vec![system];
             new_msgs.push(ChatMessage::user(format!(
                 "[compacted summary of earlier conversation]\n{summary}"
@@ -258,7 +240,7 @@ pub mod context {
                 let calls: Vec<String> = m
                     .tool_calls
                     .iter()
-                    .map(|c| format!("{}({})", c.name, llm::truncate(c.arguments.clone(), 200)))
+                    .map(|c| format!("{}({})", c.name, llm::truncate(&c.arguments, 200)))
                     .collect();
                 out.push_str(&format!("\n  calls: {}", calls.join(", ")));
             }
@@ -273,16 +255,12 @@ pub mod context {
     #[cfg(test)]
     mod tests {
         use super::{ContextComposer, ContextInfo, estimate_tools};
-        use crate::llm::ChatMessage;
-        use crate::tools::ToolSpec;
+        use crate::llm::{ChatMessage, Role};
+        use crate::tools::Tool;
         use serde_json::json;
 
-        fn tool(name: &'static str) -> ToolSpec {
-            ToolSpec {
-                name,
-                description: "d",
-                parameters: json!({"type": "object"}),
-            }
+        fn tool(name: &'static str) -> Tool {
+            crate::tools::test_tool(name, json!({"type": "object"}))
         }
 
         #[test]
@@ -339,9 +317,9 @@ pub mod context {
             assert_eq!(base.turn_messages_tokens, 0);
 
             ctx.push(ChatMessage::user("hello"));
-            ctx.push_tool_result("call_1", "result");
+            ctx.push(ChatMessage::tool_result("call_1", "result"));
             assert_eq!(ctx.messages().len(), 3);
-            assert_eq!(ctx.messages()[2].role, "tool");
+            assert_eq!(ctx.messages()[2].role, Role::Tool);
 
             let stats = ctx.stats();
             assert!(stats.turn_messages_tokens > 0);
@@ -365,7 +343,6 @@ pub mod context {
             assert_eq!(snap["messages"][0]["content"], "you are genji");
             assert_eq!(snap["messages"][1]["role"], "user");
             assert_eq!(snap["tools"][0]["function"]["name"], "read");
-            // No token math is part of the snapshot.
             assert!(snap.get("total_tokens").is_none());
         }
 
@@ -377,7 +354,7 @@ pub mod context {
             ctx.switch_mode(vec![tool("bash")], "new".to_string(), 2000);
             assert_eq!(ctx.messages()[0].content, "new");
             assert_eq!(ctx.messages()[1].content, "keep me");
-            assert_eq!(ctx.tools_json()[0]["function"]["name"], "bash");
+            assert_eq!(ctx.tools()[0]["function"]["name"], "bash");
             let stats = ctx.stats();
             assert_eq!(stats.context_window, 2000);
             assert_eq!(stats.turn_messages_tokens, turns);
@@ -391,19 +368,36 @@ pub mod db {
 
     const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 
-    /// A partial edit to a ticket. `None` leaves a field untouched; for the two
-    /// nullable links `Some(None)` clears the value.
+    #[cfg(feature = "formal")]
+    #[derive(Debug, Clone, Default)]
+    pub enum FieldPatch<T> {
+        #[default]
+        Keep,
+        Set(T),
+        Clear,
+    }
+
+    #[cfg(feature = "formal")]
+    impl<T: Clone> FieldPatch<T> {
+        pub fn apply_to(&self, slot: &mut Option<T>) {
+            match self {
+                Self::Keep => {}
+                Self::Set(value) => *slot = Some(value.clone()),
+                Self::Clear => *slot = None,
+            }
+        }
+    }
+
     #[cfg(feature = "formal")]
     #[derive(Default)]
     pub struct TicketEdit {
         pub title: Option<String>,
         pub description: Option<String>,
         pub priority: Option<i64>,
-        pub parent_id: Option<Option<i64>>,
-        pub requirement_id: Option<Option<i64>>,
+        pub parent_id: FieldPatch<i64>,
+        pub requirement_id: FieldPatch<i64>,
     }
 
-    #[allow(dead_code)]
     #[derive(Debug, Clone)]
     pub struct SkillRow {
         pub id: i64,
@@ -414,7 +408,6 @@ pub mod db {
         pub uses: i64,
     }
 
-    #[allow(dead_code)]
     #[derive(Debug, Clone)]
     pub struct PromptVersionRow {
         pub id: i64,
@@ -450,8 +443,6 @@ pub mod db {
             Ok(())
         }
 
-        // ------------------------------------------------------------- instances
-
         pub fn instance_start(
             &self,
             id: &str,
@@ -463,7 +454,7 @@ pub mod db {
         ) -> Result<()> {
             self.conn.execute(
             "INSERT INTO instances(id,mode,parent_instance,task,model,depth,status) VALUES(?,?,?,?,?,?,'running')",
-            params![id, mode, parent, task, model, depth as i64],
+            params![id, mode, parent, task, model, i64::from(depth)],
         )?;
             Ok(())
         }
@@ -523,7 +514,7 @@ pub mod db {
         ) -> Result<()> {
             self.conn.execute(
             "INSERT INTO tool_calls(instance_id,message_seq,name,args,result,is_error,duration_ms) VALUES(?,?,?,?,?,?,?)",
-            params![instance_id, message_seq, name, args, result, is_error as i64, duration_ms],
+            params![instance_id, message_seq, name, args, result, i64::from(is_error), duration_ms],
         )?;
             Ok(())
         }
@@ -541,8 +532,6 @@ pub mod db {
         )?;
             Ok(self.conn.last_insert_rowid())
         }
-
-        // ---------------------------------------------------------------- skills
 
         pub fn skill_upsert(
             &self,
@@ -585,6 +574,12 @@ pub mod db {
                     },
                 )
                 .optional()?)
+        }
+
+        pub fn has_skills(&self) -> Result<bool> {
+            Ok(self
+                .conn
+                .query_row("SELECT EXISTS(SELECT 1 FROM skills)", [], |row| row.get(0))?)
         }
 
         pub fn skill_list(&self) -> Result<Vec<SkillRow>> {
@@ -648,8 +643,6 @@ pub mod db {
             )
             .optional()?)
         }
-
-        // --------------------------------------------------------- prompts
 
         pub fn prompt_active(&self, mode: &str) -> Result<Option<PromptVersionRow>> {
             Ok(self
@@ -740,8 +733,6 @@ pub mod db {
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         }
 
-        // --------------------------------------------------------- compaction log
-
         pub fn compaction_add(
             &self,
             instance_id: &str,
@@ -760,24 +751,12 @@ pub mod db {
 }
 pub mod events {
     //! Machine-readable event stream.
-    //!
-    //! A machine frontend can consume genji's run as newline-delimited JSON
-    //! (JSONL) from **stdout** or the append-only per-instance event file.
-    //! Everything a human reads (progress narration,
-    //! warnings, retries, budget notices, …) goes to **stderr** and is cosmetic.
-    //!
-    //! The event file is the durable complete output, including for subagent runs
-    //! whose events are not relayed into the parent's stream. See `genji inspect`.
 
     use serde_json::{Value, json};
     use std::io::{self, Write};
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    /// Writes a newline-delimited JSON event stream (one object per line, flushed
-    /// after each event) to stdout and the event file.
     pub struct EventEmitter {
         instance: String,
         seq: AtomicU64,
@@ -786,14 +765,10 @@ pub mod events {
     }
 
     impl EventEmitter {
-        /// Emit to stdout, tagged with `instance`, and append to `trace_path`.
-        /// Event-file creation is fail-fast: a run must not start without its
-        /// durable output.
         pub fn new(instance: impl Into<String>, trace_path: Option<PathBuf>) -> io::Result<Self> {
             Self::with_writer_and_trace(instance, Box::new(io::stdout()), trace_path)
         }
 
-        /// Construct an emitter writing only to a custom sink (used by tests).
         #[cfg(test)]
         pub fn with_writer(instance: impl Into<String>, out: Box<dyn Write + Send>) -> Self {
             Self::with_writer_and_trace(instance, out, None)
@@ -828,14 +803,9 @@ pub mod events {
         }
 
         fn now_ms() -> u64 {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
+            crate::storage::util::unix_millis()
         }
 
-        /// Emit one event. Adds `seq`/`ts` (and `instance`, when non-empty and not
-        /// already present) so consumers can order and group events.
         pub fn emit(&self, mut event: Value) {
             if let Some(obj) = event.as_object_mut() {
                 let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
@@ -848,11 +818,9 @@ pub mod events {
             let Ok(line) = serde_json::to_string(&event) else {
                 return;
             };
-            // Persist first: stdout and socket delivery are live conveniences, but
-            // the append-only event file is the durable output for the run.
             if let Ok(mut trace) = self.trace.lock()
                 && let Some(f) = trace.as_mut()
-                && writeln!(f, "{line}").and_then(|_| f.flush()).is_err()
+                && writeln!(f, "{line}").and_then(|()| f.flush()).is_err()
             {
                 eprintln!("[events] failed to append to the event file");
             }
@@ -895,9 +863,6 @@ pub mod events {
         }
 
         pub fn tool_call(&self, id: &str, name: &str, arguments: &str) {
-            // Tool arguments arrive as a JSON-encoded string. Emit them parsed in
-            // the common case and fall back to the raw string only when they are
-            // not valid JSON, so the event stays terse.
             let mut event = json!({ "type": "tool_call", "id": id, "name": name });
             match serde_json::from_str::<Value>(arguments) {
                 Ok(args) => event["arguments"] = args,
@@ -1075,8 +1040,13 @@ pub mod events {
 }
 pub mod modes {
     use anyhow::{Result, bail};
+    use clap::ValueEnum;
+    use serde::{Deserialize, Serialize};
+    use std::fmt;
+    use std::str::FromStr;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+    #[serde(rename_all = "lowercase")]
     pub enum Mode {
         Plan,
         Build,
@@ -1085,7 +1055,7 @@ pub mod modes {
     }
 
     impl Mode {
-        pub fn as_str(&self) -> &'static str {
+        pub const fn as_str(self) -> &'static str {
             match self {
                 Mode::Plan => "plan",
                 Mode::Build => "build",
@@ -1104,8 +1074,7 @@ pub mod modes {
             }
         }
 
-        /// Minimal, non-editable core system prompt for the mode.
-        pub fn core_prompt(&self) -> &'static str {
+        pub const fn core_prompt(self) -> &'static str {
             match self {
                 Mode::Plan => include_str!("prompts/plan.md"),
                 Mode::Build => include_str!("prompts/build.md"),
@@ -1114,16 +1083,11 @@ pub mod modes {
             }
         }
 
-        /// Whether this mode has a user-editable extended prompt. RETRO is
-        /// intentionally fixed: it must not be able to extend or rewrite its own
-        /// instructions, directly or via a spawned agent.
-        pub fn allows_extended(&self) -> bool {
+        pub const fn allows_extended(self) -> bool {
             !matches!(self, Mode::Retro)
         }
 
-        /// Extra system-prompt guidance appended when the Formal flag is on. Empty for
-        /// modes that never touch the requirements/tickets system.
-        pub fn formal_guidance(&self) -> &'static str {
+        pub const fn formal_guidance(self) -> &'static str {
             match self {
                 Mode::Plan => include_str!("prompts/formal-plan.md"),
                 Mode::Build => include_str!("prompts/formal-build.md"),
@@ -1133,6 +1097,20 @@ pub mod modes {
 
         pub fn all() -> [Mode; 4] {
             [Mode::Plan, Mode::Build, Mode::Explore, Mode::Retro]
+        }
+    }
+
+    impl fmt::Display for Mode {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+
+    impl FromStr for Mode {
+        type Err = anyhow::Error;
+
+        fn from_str(s: &str) -> Result<Self> {
+            Self::parse(s)
         }
     }
 
@@ -1191,19 +1169,17 @@ pub mod proc {
         String::from_utf8_lossy(&buf).to_string()
     }
 
-    /// Run a program, capturing stdout/stderr to temp files and enforcing a
-    /// timeout. This avoids pipe-buffer deadlocks and bounds memory.
     pub fn run_capture(
         program: &str,
         args: &[String],
         cwd: &Path,
+        tmpdir: &Path,
         timeout: Duration,
         max_read_bytes: usize,
     ) -> Result<ProcResult> {
-        let tmpdir = cwd.join(".genji").join("tmp");
-        std::fs::create_dir_all(&tmpdir).ok();
-        let out_path = tmp_path(&tmpdir, "out");
-        let err_path = tmp_path(&tmpdir, "err");
+        std::fs::create_dir_all(tmpdir).ok();
+        let out_path = tmp_path(tmpdir, "out");
+        let err_path = tmp_path(tmpdir, "err");
         let out_file = File::create(&out_path).context("creating stdout temp")?;
         let err_file = File::create(&err_path).context("creating stderr temp")?;
 
@@ -1246,10 +1222,10 @@ pub mod proc {
         })
     }
 
-    /// Convenience for running a shell command string via `bash -c`.
     pub fn run_bash(
         command: &str,
         cwd: &Path,
+        tmpdir: &Path,
         timeout: Duration,
         max_read_bytes: usize,
     ) -> Result<ProcResult> {
@@ -1257,6 +1233,7 @@ pub mod proc {
             "bash",
             &["-c".to_string(), command.to_string()],
             cwd,
+            tmpdir,
             timeout,
             max_read_bytes,
         )
@@ -1264,14 +1241,6 @@ pub mod proc {
 }
 pub mod registry {
     //! A lightweight registry of running genji instances.
-    //!
-    //! Every top-level run that opens a control socket writes a small JSON record
-    //! to a per-user directory. `genji list` / `stop` / `instruct` / `inspect` read
-    //! those records to find and steer instances, even from another workspace.
-    //!
-    //! Records are best-effort: a crashed process may leave a stale file behind,
-    //! which is detected by probing the control socket and cleaned up on the next
-    //! listing.
 
     use anyhow::{Context, Result, bail};
     use serde::{Deserialize, Serialize};
@@ -1280,8 +1249,6 @@ pub mod registry {
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Instance {
-        /// The single id for this run. It names the registry record, the event trace
-        /// in [`events_dir`], the DB record and every event's `instance` field.
         pub id: String,
         pub pid: u32,
         pub workspace: String,
@@ -1311,16 +1278,12 @@ pub mod registry {
             now_secs().saturating_sub(self.started_at)
         }
 
-        /// True while the instance's control socket still accepts connections.
         pub fn is_live(&self) -> bool {
             crate::socket::send(Path::new(&self.control_socket), "/ping")
-                .map(|r| !r.trim().is_empty())
-                .unwrap_or(false)
+                .is_ok_and(|r| !r.trim().is_empty())
         }
     }
 
-    /// Directory holding instance records. `GENJI_REGISTRY_DIR` overrides it
-    /// (handy for tests); otherwise it lives under the user's home directory.
     pub fn dir() -> PathBuf {
         if let Ok(d) = std::env::var("GENJI_REGISTRY_DIR")
             && !d.trim().is_empty()
@@ -1335,24 +1298,16 @@ pub mod registry {
         std::env::temp_dir().join("genji-instances")
     }
 
-    /// Directory holding per-instance event traces (`<instance>.jsonl`). These live
-    /// alongside the instance records so any run — including a finished subagent
-    /// whose events were never relayed — can be inspected from anywhere.
     pub fn events_dir() -> PathBuf {
         dir().join("events")
     }
 
-    /// Trace file for one instance. The id → path mapping lives here so every
-    /// caller (run setup, `inspect`, subagent relay) agrees on it.
     pub fn events_path(id: &str) -> PathBuf {
         events_dir().join(format!("{id}.jsonl"))
     }
 
     pub fn now_secs() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+        crate::storage::util::unix_secs()
     }
 
     fn candidate(seed: u64) -> u64 {
@@ -1371,9 +1326,8 @@ pub mod registry {
     pub fn new_id() -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let mut x = candidate(nanos ^ ((std::process::id() as u64) << 21));
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        let mut x = candidate(nanos ^ (u64::from(std::process::id()) << 21));
         let d = dir();
         for _ in 0..64 {
             let id = format!("{:06x}", x & 0x00ff_ffff);
@@ -1382,11 +1336,12 @@ pub mod registry {
             }
             x = candidate(x);
         }
-        format!("{:08x}", (nanos as u32) ^ std::process::id())
+        format!(
+            "{:08x}",
+            (nanos ^ u64::from(std::process::id())) & u64::from(u32::MAX)
+        )
     }
 
-    /// Parse every valid record on disk (invalid files are dropped). Does not probe
-    /// liveness.
     pub fn load_all() -> Vec<Instance> {
         let d = dir();
         let mut out = Vec::new();
@@ -1412,7 +1367,6 @@ pub mod registry {
         out
     }
 
-    /// Live instances, pruning stale records as a side effect.
     pub fn list_live() -> Vec<Instance> {
         let mut out = Vec::new();
         for inst in load_all() {
@@ -1425,17 +1379,8 @@ pub mod registry {
         out
     }
 
-    /// Resolve an instance id against the live pool, leniently.
-    ///
-    /// An exact id always wins. Otherwise a unique id prefix is accepted, so
-    /// `genji instruct abc` resolves `abc123` when it is the only live instance
-    /// starting with `abc`. An ambiguous prefix reports the candidates instead of
-    /// guessing, and a prefix that matches nothing is treated as unknown.
     pub fn find(id: &str) -> Result<Instance> {
         let id = id.trim();
-
-        // `list_live` prunes stale records as a side effect; it is the single
-        // source of liveness, so reuse it rather than probing again here.
         let live = list_live();
 
         if let Some(inst) = live.iter().find(|i| i.id == id) {
@@ -1465,11 +1410,208 @@ pub mod registry {
     }
 }
 pub mod util {
-    //! Small shared helpers.
+    //! Small shared filesystem helpers.
 
-    /// Lowercase ASCII slug: runs of non-alphanumerics collapse to a single `-`,
-    /// trimmed at both ends and capped at 60 chars. `fallback` is used when the
-    /// result would otherwise be empty (for example a title of `"!!!"`).
+    #[cfg(feature = "formal")]
+    use anyhow::{Context, Result};
+    #[cfg(feature = "formal")]
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub fn expand_home(path: &str) -> PathBuf {
+        path.strip_prefix("~/").map_or_else(
+            || PathBuf::from(path),
+            |rest| {
+                std::env::var_os("HOME").map_or_else(
+                    || PathBuf::from(path),
+                    |home| PathBuf::from(home).join(rest),
+                )
+            },
+        )
+    }
+
+    pub fn unix_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs())
+    }
+
+    pub fn unix_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            })
+    }
+
+    /// Expand a leading `~/`, then resolve relative paths against `workspace`.
+    pub fn resolve_path(workspace: &Path, path: &str) -> PathBuf {
+        let expanded = expand_home(path);
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            workspace.join(expanded)
+        }
+    }
+
+    pub fn relative_path(workspace: &Path, path: &Path) -> String {
+        path.strip_prefix(workspace)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[cfg(feature = "formal")]
+    pub struct MarkdownDocument {
+        pub meta: BTreeMap<String, String>,
+        pub heading: Option<String>,
+        pub body: String,
+        pub path: PathBuf,
+    }
+
+    #[cfg(feature = "formal")]
+    pub fn parse_markdown(path: PathBuf, text: &str) -> MarkdownDocument {
+        let (meta, markdown) = split_frontmatter(text);
+        let (heading, body) = split_heading(&markdown);
+        MarkdownDocument {
+            meta,
+            heading,
+            body,
+            path,
+        }
+    }
+
+    #[cfg(feature = "formal")]
+    pub fn nonempty_meta(meta: &BTreeMap<String, String>, key: &str) -> Option<String> {
+        meta.get(key)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+
+    #[cfg(feature = "formal")]
+    pub fn meta_i64(meta: &BTreeMap<String, String>, key: &str) -> Option<i64> {
+        meta.get(key).and_then(|v| v.parse::<i64>().ok())
+    }
+
+    #[cfg(feature = "formal")]
+    pub fn assign_missing_ids(raws: &mut [MarkdownDocument]) -> Vec<bool> {
+        let mut next_id = raws
+            .iter()
+            .filter_map(|raw| meta_i64(&raw.meta, "id"))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        raws.iter_mut()
+            .map(|raw| {
+                if meta_i64(&raw.meta, "id").is_some() {
+                    false
+                } else {
+                    raw.meta.insert("id".into(), next_id.to_string());
+                    next_id += 1;
+                    true
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "formal")]
+    pub fn write_markdown(path: &Path, text: &str) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
+    #[cfg(feature = "formal")]
+    pub fn replace_backing_file(old_path: &Path, new_path: &Path, text: &str) -> Result<()> {
+        write_markdown(new_path, text)?;
+        if new_path != old_path && old_path.exists() {
+            let _ = std::fs::remove_file(old_path);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "formal")]
+    pub fn load_markdown_dir(root: &Path) -> Result<Vec<MarkdownDocument>> {
+        fn walk(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+            if !dir.exists() {
+                return Ok(());
+            }
+            for entry in
+                std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?
+            {
+                let path = entry?.path();
+                if path.is_dir() {
+                    walk(&path, files)?;
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+                    files.push(path);
+                }
+            }
+            Ok(())
+        }
+
+        let mut files = Vec::new();
+        walk(root, &mut files)?;
+        files.sort();
+        files
+            .into_iter()
+            .filter_map(|path| match std::fs::read_to_string(&path) {
+                Ok(text) if text.trim().is_empty() => None,
+                result => Some((path, result)),
+            })
+            .map(|(path, text)| {
+                let text = text.with_context(|| format!("reading {}", path.display()))?;
+                Ok(parse_markdown(path, &text))
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "formal")]
+    fn split_frontmatter(text: &str) -> (BTreeMap<String, String>, String) {
+        let mut meta = BTreeMap::new();
+        if let Some(rest) = text.strip_prefix("---\n")
+            && let Some(index) = rest.find("\n---")
+        {
+            for line in rest[..index].lines() {
+                if let Some((key, value)) = line.split_once(':') {
+                    meta.insert(
+                        key.trim().to_owned(),
+                        value.trim().trim_matches('"').to_owned(),
+                    );
+                }
+            }
+            let body = &rest[index + 4..];
+            return (meta, body.strip_prefix('\n').unwrap_or(body).to_owned());
+        }
+        (meta, text.to_owned())
+    }
+
+    #[cfg(feature = "formal")]
+    fn split_heading(text: &str) -> (Option<String>, String) {
+        let mut heading = None;
+        let body = text
+            .lines()
+            .filter(|line| {
+                if heading.is_none()
+                    && let Some(value) = line.strip_prefix("# ")
+                {
+                    heading = Some(value.trim().to_owned());
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_owned();
+        (heading, body)
+    }
+
     pub fn slugify(title: &str, fallback: &str) -> String {
         let mut out = String::new();
         let mut prev_dash = false;
@@ -1495,7 +1637,18 @@ pub mod util {
 
     #[cfg(test)]
     mod tests {
-        use super::slugify;
+        use super::{resolve_path, slugify};
+        use std::path::Path;
+
+        #[test]
+        fn resolves_workspace_and_home_paths() {
+            let workspace = Path::new("/workspace");
+            assert_eq!(
+                resolve_path(workspace, "src/main.rs"),
+                workspace.join("src/main.rs")
+            );
+            assert_eq!(resolve_path(workspace, "/tmp/file"), Path::new("/tmp/file"));
+        }
 
         #[test]
         fn slugifies() {
@@ -1512,35 +1665,101 @@ pub mod util {
 #[cfg(feature = "formal")]
 pub mod reqmd {
     //! File-backed requirement store.
-    //!
-    //! Requirements are markdown files directly under `.genji/requirements/`:
-    //!
-    //! ```text
-    //! .genji/requirements/
-    //!   1-cat-image-classifier.md
-    //!   2-accept-image-files-and-urls.md
-    //! ```
-    //!
-    //! Metadata lives in simple `key: value` frontmatter (`id`, `level`, `status`,
-    //! `parent`, `source`, `created`, `updated`); the text after the first
-    //! `# Heading` is the requirement body. The level (`stakeholder` or `system`)
-    //! is read from the frontmatter and defaults to `stakeholder` when absent.
 
-    use anyhow::{Context, Result, bail};
-    use std::collections::BTreeMap;
+    use anyhow::{Context, Result};
+    use serde::{Deserialize, Serialize};
+    use std::fmt;
+    use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::str::FromStr;
 
     use crate::config::Config;
-    use crate::storage::util::slugify;
+    use crate::storage::db::FieldPatch;
+    use crate::storage::util::{
+        assign_missing_ids, load_markdown_dir, meta_i64, nonempty_meta, relative_path,
+        replace_backing_file, slugify, write_markdown,
+    };
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum RequirementLevel {
+        #[default]
+        Stakeholder,
+        System,
+    }
+
+    impl RequirementLevel {
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Stakeholder => "stakeholder",
+                Self::System => "system",
+            }
+        }
+    }
+
+    impl fmt::Display for RequirementLevel {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+
+    impl FromStr for RequirementLevel {
+        type Err = &'static str;
+
+        fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+            match s.trim().trim_matches('"').to_ascii_lowercase().as_str() {
+                "stakeholder" => Ok(Self::Stakeholder),
+                "system" => Ok(Self::System),
+                _ => Err("level must be stakeholder|system"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum RequirementStatus {
+        #[default]
+        Active,
+        Met,
+        Removed,
+    }
+
+    impl RequirementStatus {
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Active => "active",
+                Self::Met => "met",
+                Self::Removed => "removed",
+            }
+        }
+    }
+
+    impl fmt::Display for RequirementStatus {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+
+    impl FromStr for RequirementStatus {
+        type Err = &'static str;
+
+        fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+            match s.trim().trim_matches('"').to_ascii_lowercase().as_str() {
+                "active" => Ok(Self::Active),
+                "met" => Ok(Self::Met),
+                "removed" => Ok(Self::Removed),
+                _ => Err("status must be active|met|removed"),
+            }
+        }
+    }
 
     #[derive(Debug, Clone)]
     pub struct Requirement {
         pub id: i64,
-        pub level: String,
+        pub level: RequirementLevel,
         pub title: String,
         pub body: String,
-        pub status: String,
+        pub status: RequirementStatus,
         pub parent_id: Option<i64>,
         pub source: String,
         pub path: PathBuf,
@@ -1550,76 +1769,40 @@ pub mod reqmd {
 
     impl Requirement {
         pub fn display_path(&self, workspace: &Path) -> String {
-            rel_to(workspace, &self.path)
+            relative_path(workspace, &self.path)
         }
     }
 
     fn now_secs() -> String {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-            .to_string()
+        crate::storage::util::unix_secs().to_string()
     }
 
-    fn valid_level(v: &str) -> Option<String> {
-        let v = v.trim().trim_matches('"').to_ascii_lowercase();
-        if v == "stakeholder" || v == "system" {
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    /// Split leading `---` frontmatter from the markdown body.
-    fn split_frontmatter(text: &str) -> (BTreeMap<String, String>, String) {
-        let mut meta = BTreeMap::new();
-        if let Some(rest) = text.strip_prefix("---\n")
-            && let Some(idx) = rest.find("\n---")
-        {
-            let fm = &rest[..idx];
-            let after = &rest[idx + 4..];
-            for line in fm.lines() {
-                if let Some((k, v)) = line.split_once(':') {
-                    meta.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
-                }
-            }
-            let body = after.strip_prefix('\n').unwrap_or(after);
-            return (meta, body.to_string());
-        }
-        (meta, text.to_string())
-    }
-
-    /// Remove the first level-1 heading and return it separately.
-    fn split_heading(text: &str) -> (Option<String>, String) {
-        let mut heading = None;
-        let mut lines: Vec<&str> = Vec::new();
-        for line in text.lines() {
-            if heading.is_none()
-                && let Some(h) = line.strip_prefix("# ")
-            {
-                heading = Some(h.trim().to_string());
-                continue;
-            }
-            lines.push(line);
-        }
-        (heading, lines.join("\n").trim().to_string())
+    fn title_for(raw: &crate::storage::util::MarkdownDocument, fallback: &str) -> String {
+        nonempty_meta(&raw.meta, "title")
+            .or_else(|| raw.heading.clone())
+            .unwrap_or_else(|| {
+                raw.path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(fallback)
+                    .to_string()
+            })
     }
 
     fn render(r: &Requirement) -> String {
         let mut s = String::new();
         s.push_str("---\n");
-        s.push_str(&format!("id: {}\n", r.id));
-        s.push_str(&format!("level: {}\n", r.level));
-        s.push_str(&format!("status: {}\n", r.status));
+        let _ = writeln!(s, "id: {}", r.id);
+        let _ = writeln!(s, "level: {}", r.level);
+        let _ = writeln!(s, "status: {}", r.status);
         if let Some(p) = r.parent_id {
-            s.push_str(&format!("parent: {p}\n"));
+            let _ = writeln!(s, "parent: {p}");
         }
-        s.push_str(&format!("source: {}\n", r.source));
-        s.push_str(&format!("created: {}\n", r.created_at));
-        s.push_str(&format!("updated: {}\n", r.updated_at));
+        let _ = writeln!(s, "source: {}", r.source);
+        let _ = writeln!(s, "created: {}", r.created_at);
+        let _ = writeln!(s, "updated: {}", r.updated_at);
         s.push_str("---\n\n");
-        s.push_str(&format!("# {}\n", r.title));
+        let _ = writeln!(s, "# {}", r.title);
         if !r.body.trim().is_empty() {
             s.push('\n');
             s.push_str(r.body.trim());
@@ -1629,38 +1812,9 @@ pub mod reqmd {
     }
 
     fn write_at(path: &Path, r: &Requirement) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        std::fs::write(path, render(r)).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        write_markdown(path, &render(r))
     }
 
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-        if !dir.exists() {
-            return Ok(());
-        }
-        for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out)?;
-            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                out.push(path);
-            }
-        }
-        Ok(())
-    }
-
-    fn rel_to(workspace: &Path, path: &Path) -> String {
-        path.strip_prefix(workspace)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string()
-    }
-
-    /// Where a requirement's file lives: `<root>/<id>-<slug>.md`.
     fn path_for(cfg: &Config, workspace: &Path, r: &Requirement) -> PathBuf {
         cfg.requirements_path(workspace).join(format!(
             "{}-{}.md",
@@ -1669,102 +1823,25 @@ pub mod reqmd {
         ))
     }
 
-    /// Load every requirement file. Files missing an `id` are assigned one and
-    /// rewritten so identity is stable across runs.
     pub fn load_all(cfg: &Config, workspace: &Path) -> Result<Vec<Requirement>> {
-        let root = cfg.requirements_path(workspace);
-        let mut files = Vec::new();
-        walk(&root, &mut files)?;
-        files.sort();
+        let mut raws = load_markdown_dir(&cfg.requirements_path(workspace))?;
+        let assigned = assign_missing_ids(&mut raws);
 
-        struct Raw {
-            meta: BTreeMap<String, String>,
-            heading: Option<String>,
-            body: String,
-            path: PathBuf,
-        }
-
-        let mut raws = Vec::new();
-        let mut max_id = 0i64;
-        for path in files {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            if text.trim().is_empty() {
-                continue;
-            }
-            let (meta, body_raw) = split_frontmatter(&text);
-            let (heading, body) = split_heading(&body_raw);
-            if let Some(id) = meta.get("id").and_then(|v| v.parse::<i64>().ok()) {
-                max_id = max_id.max(id);
-            }
-            raws.push(Raw {
-                meta,
-                heading,
-                body,
-                path,
-            });
-        }
-
-        let mut next_id = max_id + 1;
         let mut out = Vec::new();
-        for raw in raws {
-            let had_id = raw
-                .meta
-                .get("id")
-                .and_then(|v| v.parse::<i64>().ok())
-                .is_some();
-            let id = raw
-                .meta
-                .get("id")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or_else(|| {
-                    let id = next_id;
-                    next_id += 1;
-                    id
-                });
-            let level = raw
-                .meta
-                .get("level")
-                .and_then(|v| valid_level(v))
-                .unwrap_or_else(|| "stakeholder".into());
-            let title = raw
-                .meta
-                .get("title")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .or(raw.heading)
-                .unwrap_or_else(|| {
-                    raw.path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("requirement")
-                        .to_string()
-                });
-            let status = raw
-                .meta
-                .get("status")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| "active".into());
-            let parent_id = raw.meta.get("parent").and_then(|v| v.parse::<i64>().ok());
-            let source = raw
-                .meta
-                .get("source")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| "user_md".into());
-            let created_at = raw
-                .meta
-                .get("created")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(now_secs);
-            let updated_at = raw
-                .meta
-                .get("updated")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| created_at.clone());
+        for (raw, assigned_id) in raws.into_iter().zip(assigned) {
+            let id = meta_i64(&raw.meta, "id").expect("assign_missing_ids must populate ids");
+            let level = nonempty_meta(&raw.meta, "level")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_default();
+            let title = title_for(&raw, "requirement");
+            let status = nonempty_meta(&raw.meta, "status")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_default();
+            let parent_id = meta_i64(&raw.meta, "parent");
+            let source = nonempty_meta(&raw.meta, "source").unwrap_or_else(|| "user_md".into());
+            let created_at = nonempty_meta(&raw.meta, "created").unwrap_or_else(now_secs);
+            let updated_at =
+                nonempty_meta(&raw.meta, "updated").unwrap_or_else(|| created_at.clone());
 
             let req = Requirement {
                 id,
@@ -1778,17 +1855,13 @@ pub mod reqmd {
                 created_at,
                 updated_at,
             };
-            // Persist a newly assigned id (or fill in missing metadata) once.
-            if !had_id {
+            if assigned_id {
                 write_at(&raw.path, &req)?;
             }
             out.push(req);
         }
 
-        out.sort_by(|a, b| {
-            let rank = |r: &Requirement| if r.level == "stakeholder" { 0 } else { 1 };
-            rank(a).cmp(&rank(b)).then(a.id.cmp(&b.id))
-        });
+        out.sort_by_key(|r| (i32::from(r.level != RequirementLevel::Stakeholder), r.id));
         Ok(out)
     }
 
@@ -1799,22 +1872,19 @@ pub mod reqmd {
     pub fn active_count(cfg: &Config, workspace: &Path) -> Result<i64> {
         Ok(load_all(cfg, workspace)?
             .iter()
-            .filter(|r| r.status == "active")
+            .filter(|r| r.status == RequirementStatus::Active)
             .count() as i64)
     }
 
     pub fn create(
         cfg: &Config,
         workspace: &Path,
-        level: &str,
+        level: RequirementLevel,
         title: &str,
         body: &str,
         parent_id: Option<i64>,
         source: &str,
     ) -> Result<Requirement> {
-        let Some(level) = valid_level(level) else {
-            bail!("level must be `stakeholder` or `system`");
-        };
         let id = load_all(cfg, workspace)?
             .iter()
             .map(|r| r.id)
@@ -1827,7 +1897,7 @@ pub mod reqmd {
             level,
             title: title.to_string(),
             body: body.to_string(),
-            status: "active".into(),
+            status: RequirementStatus::Active,
             parent_id,
             source: source.to_string(),
             path: PathBuf::new(),
@@ -1847,19 +1917,16 @@ pub mod reqmd {
         id: i64,
         title: Option<&str>,
         body: Option<&str>,
-        status: Option<&str>,
-        level: Option<&str>,
-        parent_id: Option<Option<i64>>,
+        status: Option<RequirementStatus>,
+        level: Option<RequirementLevel>,
+        parent_id: FieldPatch<i64>,
     ) -> Result<bool> {
         let mut req = match load_by_id(cfg, workspace, id)? {
             Some(r) => r,
             None => return Ok(false),
         };
-        if let Some(l) = level {
-            let Some(l) = valid_level(l) else {
-                bail!("level must be stakeholder|system");
-            };
-            req.level = l;
+        if let Some(level) = level {
+            req.level = level;
         }
         if let Some(t) = title {
             req.title = t.to_string();
@@ -1867,21 +1934,16 @@ pub mod reqmd {
         if let Some(b) = body {
             req.body = b.to_string();
         }
-        if let Some(s) = status {
-            req.status = s.to_string();
+        if let Some(status) = status {
+            req.status = status;
         }
-        if let Some(p) = parent_id {
-            req.parent_id = p;
-        }
+        parent_id.apply_to(&mut req.parent_id);
         req.updated_at = now_secs();
 
         let old_path = req.path.clone();
         let new_path = path_for(cfg, workspace, &req);
         req.path = new_path.clone();
-        write_at(&new_path, &req)?;
-        if new_path != old_path && old_path.exists() {
-            let _ = std::fs::remove_file(&old_path);
-        }
+        replace_backing_file(&old_path, &new_path, &render(&req))?;
         Ok(true)
     }
 
@@ -1894,11 +1956,18 @@ pub mod reqmd {
                 .with_context(|| format!("deleting {}", req.path.display()))?;
             return Ok(true);
         }
-        update(cfg, workspace, id, None, None, Some("removed"), None, None)
+        update(
+            cfg,
+            workspace,
+            id,
+            None,
+            None,
+            Some(RequirementStatus::Removed),
+            None,
+            FieldPatch::Keep,
+        )
     }
 
-    /// Load and normalize Markdown requirements. Markdown is the only source of
-    /// truth; there is intentionally no database migration path.
     pub fn sync(cfg: &Config, workspace: &Path) -> Result<usize> {
         Ok(load_all(cfg, workspace)?.len())
     }
@@ -1906,10 +1975,11 @@ pub mod reqmd {
     #[cfg(test)]
     mod tests {
         use super::{
-            active_count, create, load_all, load_by_id, remove, split_frontmatter, split_heading,
-            update,
+            RequirementLevel, RequirementStatus, active_count, create, load_all, load_by_id,
+            remove, update,
         };
         use crate::config::Config;
+        use crate::storage::db::FieldPatch;
         use crate::storage::util::slugify;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1925,27 +1995,38 @@ pub mod reqmd {
             let all = load_all(&cfg, &ws).unwrap();
             let a = all.iter().find(|r| r.title == "A").unwrap();
             let b = all.iter().find(|r| r.title == "B").unwrap();
-            assert_eq!(a.level, "system");
-            assert_eq!(b.level, "stakeholder");
+            assert_eq!(a.level, RequirementLevel::System);
+            assert_eq!(b.level, RequirementLevel::Stakeholder);
 
             let _ = std::fs::remove_dir_all(&ws);
         }
 
         #[test]
         fn heading_extraction() {
-            assert_eq!(
-                split_heading("intro\n# Real Title\nbody"),
-                (Some("Real Title".into()), "intro\nbody".into())
+            let titled = crate::storage::util::parse_markdown(
+                std::path::PathBuf::from("test.md"),
+                "intro\n# Real Title\nbody",
             );
-            assert_eq!(split_heading("no heading"), (None, "no heading".into()));
+            assert_eq!(titled.heading, Some("Real Title".into()));
+            assert_eq!(titled.body, "intro\nbody");
+            let plain = crate::storage::util::parse_markdown(
+                std::path::PathBuf::from("test.md"),
+                "no heading",
+            );
+            assert_eq!(plain.heading, None);
+            assert_eq!(plain.body, "no heading");
         }
 
         #[test]
         fn frontmatter_parsing() {
-            let (meta, body) = split_frontmatter("---\nid: 4\nlevel: system\n---\n# T\nbody\n");
-            assert_eq!(meta.get("id").map(String::as_str), Some("4"));
-            assert_eq!(meta.get("level").map(String::as_str), Some("system"));
-            assert_eq!(body, "# T\nbody\n");
+            let doc = crate::storage::util::parse_markdown(
+                std::path::PathBuf::from("test.md"),
+                "---\nid: 4\nlevel: system\n---\n# T\nbody\n",
+            );
+            assert_eq!(doc.meta.get("id").map(String::as_str), Some("4"));
+            assert_eq!(doc.meta.get("level").map(String::as_str), Some("system"));
+            assert_eq!(doc.heading, Some("T".into()));
+            assert_eq!(doc.body, "body");
         }
 
         #[test]
@@ -1960,8 +2041,7 @@ pub mod reqmd {
         fn temp_workspace(tag: &str) -> std::path::PathBuf {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_nanos());
             let dir = std::env::temp_dir().join(format!("genji-reqmd-{tag}-{nanos}"));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
@@ -1976,7 +2056,7 @@ pub mod reqmd {
             let r1 = create(
                 &cfg,
                 &ws,
-                "stakeholder",
+                RequirementLevel::Stakeholder,
                 "Cat Classifier",
                 "Must classify cats.",
                 None,
@@ -1989,7 +2069,7 @@ pub mod reqmd {
             let r2 = create(
                 &cfg,
                 &ws,
-                "system",
+                RequirementLevel::System,
                 "Accept URLs",
                 "Accept image URLs.",
                 Some(1),
@@ -1998,8 +2078,6 @@ pub mod reqmd {
             .unwrap();
             assert_eq!(r2.id, 2);
             assert_eq!(active_count(&cfg, &ws).unwrap(), 2);
-
-            // Editing the title renames the backing file.
             assert!(
                 update(
                     &cfg,
@@ -2007,15 +2085,15 @@ pub mod reqmd {
                     2,
                     Some("Accept Files and URLs"),
                     None,
-                    Some("met"),
+                    Some(RequirementStatus::Met),
                     None,
-                    None
+                    FieldPatch::Keep
                 )
                 .unwrap()
             );
             let r2b = load_by_id(&cfg, &ws, 2).unwrap().unwrap();
             assert_eq!(r2b.title, "Accept Files and URLs");
-            assert_eq!(r2b.status, "met");
+            assert_eq!(r2b.status, RequirementStatus::Met);
             assert_eq!(r2b.parent_id, Some(1));
             assert!(
                 r2b.display_path(&ws)
@@ -2023,9 +2101,19 @@ pub mod reqmd {
             );
             assert_eq!(active_count(&cfg, &ws).unwrap(), 1);
 
-            update(&cfg, &ws, 2, None, None, None, Some("stakeholder"), None).unwrap();
+            update(
+                &cfg,
+                &ws,
+                2,
+                None,
+                None,
+                None,
+                Some(RequirementLevel::Stakeholder),
+                FieldPatch::Keep,
+            )
+            .unwrap();
             let r2c = load_by_id(&cfg, &ws, 2).unwrap().unwrap();
-            assert_eq!(r2c.level, "stakeholder");
+            assert_eq!(r2c.level, RequirementLevel::Stakeholder);
             assert!(
                 r2c.display_path(&ws)
                     .ends_with(".genji/requirements/2-accept-files-and-urls.md")
@@ -2051,8 +2139,7 @@ pub mod reqmd {
             let all = load_all(&cfg, &ws).unwrap();
             assert_eq!(all.len(), 1);
             assert_eq!(all[0].id, 1);
-            assert_eq!(all[0].level, "stakeholder");
-            // The id is persisted back into the file.
+            assert_eq!(all[0].level, RequirementLevel::Stakeholder);
             let text = std::fs::read_to_string(dir.join("hand-written.md")).unwrap();
             assert!(
                 text.contains("id: 1"),
@@ -2066,36 +2153,76 @@ pub mod reqmd {
 #[cfg(feature = "formal")]
 pub mod ticketmd {
     //! File-backed store for formal-mode tickets.
-    //!
-    //! All tickets live as Markdown files directly under `.genji/tickets/`:
-    //!
-    //! ```text
-    //! .genji/tickets/
-    //!   7-add-rate-limit.md
-    //!   8-write-tests.md
-    //! ```
-    //!
-    //! Metadata lives in simple `key: value` frontmatter (`id`, `status`,
-    //! `priority`, `parent`, `requirement`, `mode`, `created`, `updated`); the text
-    //! after the first `# Heading` is the ticket description. Status and
-    //! resolution remain in the Markdown frontmatter; there is no database archive
-    //! or migration path.
 
-    use anyhow::{Context, Result};
-    use std::collections::BTreeMap;
+    use anyhow::Result;
+    use serde::{Deserialize, Serialize};
+    use std::fmt;
+    use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::str::FromStr;
 
     use crate::config::Config;
     use crate::storage::db::TicketEdit;
-    use crate::storage::util::slugify;
+    use crate::storage::util::{
+        assign_missing_ids, load_markdown_dir, meta_i64, nonempty_meta, relative_path,
+        replace_backing_file, slugify, write_markdown,
+    };
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum TicketStatus {
+        #[default]
+        Open,
+        InProgress,
+        Resolved,
+        Closed,
+    }
+
+    impl TicketStatus {
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Open => "open",
+                Self::InProgress => "in_progress",
+                Self::Resolved => "resolved",
+                Self::Closed => "closed",
+            }
+        }
+
+        pub const fn is_open(self) -> bool {
+            matches!(self, Self::Open | Self::InProgress)
+        }
+
+        pub const fn is_done(self) -> bool {
+            matches!(self, Self::Resolved | Self::Closed)
+        }
+    }
+
+    impl fmt::Display for TicketStatus {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+
+    impl FromStr for TicketStatus {
+        type Err = &'static str;
+
+        fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+            match s.trim().trim_matches('"').to_ascii_lowercase().as_str() {
+                "open" => Ok(Self::Open),
+                "in_progress" => Ok(Self::InProgress),
+                "resolved" => Ok(Self::Resolved),
+                "closed" => Ok(Self::Closed),
+                _ => Err("status must be open|in_progress|resolved|closed"),
+            }
+        }
+    }
 
     #[derive(Debug, Clone)]
     pub struct Ticket {
         pub id: i64,
         pub title: String,
         pub description: String,
-        pub status: String,
+        pub status: TicketStatus,
         pub priority: i64,
         pub parent_id: Option<i64>,
         pub requirement_id: Option<i64>,
@@ -2103,86 +2230,53 @@ pub mod ticketmd {
         pub resolution: Option<String>,
         pub created_at: String,
         pub updated_at: String,
-        /// Backing markdown file. `None` for tickets read out of the database
-        /// (resolved/closed ones), which are not backed by a file.
-        pub path: Option<PathBuf>,
+        pub path: PathBuf,
     }
 
     impl Ticket {
-        /// Display path relative to the workspace (falls back to the absolute path
-        /// when it is outside).
-        pub fn display_path(&self, workspace: &Path) -> Option<String> {
-            self.path.as_ref().map(|p| rel_to(workspace, p))
+        pub fn display_path(&self, workspace: &Path) -> String {
+            relative_path(workspace, &self.path)
         }
     }
 
     fn now_secs() -> String {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-            .to_string()
+        crate::storage::util::unix_secs().to_string()
     }
 
-    /// Split leading `---` frontmatter from the markdown body.
-    fn split_frontmatter(text: &str) -> (BTreeMap<String, String>, String) {
-        let mut meta = BTreeMap::new();
-        if let Some(rest) = text.strip_prefix("---\n")
-            && let Some(idx) = rest.find("\n---")
-        {
-            let fm = &rest[..idx];
-            let after = &rest[idx + 4..];
-            for line in fm.lines() {
-                if let Some((k, v)) = line.split_once(':') {
-                    meta.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
-                }
-            }
-            let body = after.strip_prefix('\n').unwrap_or(after);
-            return (meta, body.to_string());
-        }
-        (meta, text.to_string())
-    }
-
-    /// Remove the first level-1 heading and return it separately.
-    fn split_heading(text: &str) -> (Option<String>, String) {
-        let mut heading = None;
-        let mut lines: Vec<&str> = Vec::new();
-        for line in text.lines() {
-            if heading.is_none()
-                && let Some(h) = line.strip_prefix("# ")
-            {
-                heading = Some(h.trim().to_string());
-                continue;
-            }
-            lines.push(line);
-        }
-        (heading, lines.join("\n").trim().to_string())
+    fn title_for(raw: &crate::storage::util::MarkdownDocument, fallback: &str) -> String {
+        nonempty_meta(&raw.meta, "title")
+            .or_else(|| raw.heading.clone())
+            .unwrap_or_else(|| {
+                raw.path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(fallback)
+                    .to_string()
+            })
     }
 
     fn render(t: &Ticket) -> String {
         let mut s = String::new();
         s.push_str("---\n");
-        s.push_str(&format!("id: {}\n", t.id));
-        s.push_str(&format!("status: {}\n", t.status));
-        s.push_str(&format!("priority: {}\n", t.priority));
+        let _ = writeln!(s, "id: {}", t.id);
+        let _ = writeln!(s, "status: {}", t.status);
+        let _ = writeln!(s, "priority: {}", t.priority);
         if let Some(p) = t.parent_id {
-            s.push_str(&format!("parent: {p}\n"));
+            let _ = writeln!(s, "parent: {p}");
         }
         if let Some(r) = t.requirement_id {
-            s.push_str(&format!("requirement: {r}\n"));
+            let _ = writeln!(s, "requirement: {r}");
         }
-        if let Some(m) = &t.mode
-            && !m.trim().is_empty()
-        {
-            s.push_str(&format!("mode: {m}\n"));
+        if let Some(m) = &t.mode {
+            let _ = writeln!(s, "mode: {m}");
         }
         if let Some(r) = &t.resolution {
-            s.push_str(&format!("resolution: {r}\n"));
+            let _ = writeln!(s, "resolution: {r}");
         }
-        s.push_str(&format!("created: {}\n", t.created_at));
-        s.push_str(&format!("updated: {}\n", t.updated_at));
+        let _ = writeln!(s, "created: {}", t.created_at);
+        let _ = writeln!(s, "updated: {}", t.updated_at);
         s.push_str("---\n\n");
-        s.push_str(&format!("# {}\n", t.title));
+        let _ = writeln!(s, "# {}", t.title);
         if !t.description.trim().is_empty() {
             s.push('\n');
             s.push_str(t.description.trim());
@@ -2192,148 +2286,33 @@ pub mod ticketmd {
     }
 
     fn write_at(path: &Path, t: &Ticket) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        std::fs::write(path, render(t)).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        write_markdown(path, &render(t))
     }
 
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-        if !dir.exists() {
-            return Ok(());
-        }
-        for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out)?;
-            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                out.push(path);
-            }
-        }
-        Ok(())
-    }
-
-    fn rel_to(workspace: &Path, path: &Path) -> String {
-        path.strip_prefix(workspace)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string()
-    }
-
-    /// Where a ticket's file lives: `<root>/<id>-<slug>.md`.
     pub fn path_for(cfg: &Config, workspace: &Path, t: &Ticket) -> PathBuf {
         cfg.tickets_path(workspace)
             .join(format!("{}-{}.md", t.id, slugify(&t.title, "ticket")))
     }
 
-    /// Load every open ticket file. Files missing an `id` are assigned one and
-    /// rewritten so identity is stable across runs.
     pub fn load_all(cfg: &Config, workspace: &Path) -> Result<Vec<Ticket>> {
-        let root = cfg.tickets_path(workspace);
-        let mut files = Vec::new();
-        walk(&root, &mut files)?;
-        files.sort();
+        let mut raws = load_markdown_dir(&cfg.tickets_path(workspace))?;
+        let assigned = assign_missing_ids(&mut raws);
 
-        struct Raw {
-            meta: BTreeMap<String, String>,
-            heading: Option<String>,
-            body: String,
-            path: PathBuf,
-        }
-
-        let mut raws = Vec::new();
-        let mut max_id = 0i64;
-        for path in files {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            if text.trim().is_empty() {
-                continue;
-            }
-            let (meta, body_raw) = split_frontmatter(&text);
-            let (heading, body) = split_heading(&body_raw);
-            if let Some(id) = meta.get("id").and_then(|v| v.parse::<i64>().ok()) {
-                max_id = max_id.max(id);
-            }
-            raws.push(Raw {
-                meta,
-                heading,
-                body,
-                path,
-            });
-        }
-
-        let mut next_id = max_id + 1;
         let mut out = Vec::new();
-        for raw in raws {
-            let had_id = raw
-                .meta
-                .get("id")
-                .and_then(|v| v.parse::<i64>().ok())
-                .is_some();
-            let id = raw
-                .meta
-                .get("id")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or_else(|| {
-                    let id = next_id;
-                    next_id += 1;
-                    id
-                });
-            let title = raw
-                .meta
-                .get("title")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .or(raw.heading)
-                .unwrap_or_else(|| {
-                    raw.path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("ticket")
-                        .to_string()
-                });
-            let status = raw
-                .meta
-                .get("status")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| "open".into());
-            let priority = raw
-                .meta
-                .get("priority")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(2)
-                .clamp(1, 3);
-            let parent_id = raw.meta.get("parent").and_then(|v| v.parse::<i64>().ok());
-            let requirement_id = raw
-                .meta
-                .get("requirement")
-                .and_then(|v| v.parse::<i64>().ok());
-            let mode = raw
-                .meta
-                .get("mode")
-                .filter(|s| !s.trim().is_empty())
-                .cloned();
-            let resolution = raw
-                .meta
-                .get("resolution")
-                .filter(|s| !s.trim().is_empty())
-                .cloned();
-            let created_at = raw
-                .meta
-                .get("created")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(now_secs);
-            let updated_at = raw
-                .meta
-                .get("updated")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| created_at.clone());
+        for (raw, assigned_id) in raws.into_iter().zip(assigned) {
+            let id = meta_i64(&raw.meta, "id").expect("assign_missing_ids must populate ids");
+            let title = title_for(&raw, "ticket");
+            let status = nonempty_meta(&raw.meta, "status")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_default();
+            let priority = meta_i64(&raw.meta, "priority").unwrap_or(2).clamp(1, 3);
+            let parent_id = meta_i64(&raw.meta, "parent");
+            let requirement_id = meta_i64(&raw.meta, "requirement");
+            let mode = nonempty_meta(&raw.meta, "mode");
+            let resolution = nonempty_meta(&raw.meta, "resolution");
+            let created_at = nonempty_meta(&raw.meta, "created").unwrap_or_else(now_secs);
+            let updated_at =
+                nonempty_meta(&raw.meta, "updated").unwrap_or_else(|| created_at.clone());
 
             let ticket = Ticket {
                 id,
@@ -2347,10 +2326,9 @@ pub mod ticketmd {
                 resolution,
                 created_at,
                 updated_at,
-                path: Some(raw.path.clone()),
+                path: raw.path.clone(),
             };
-            // Persist a newly assigned id (or fill in missing metadata) once.
-            if !had_id {
+            if assigned_id {
                 write_at(&raw.path, &ticket)?;
             }
             out.push(ticket);
@@ -2362,16 +2340,6 @@ pub mod ticketmd {
 
     pub fn load_by_id(cfg: &Config, workspace: &Path, id: i64) -> Result<Option<Ticket>> {
         Ok(load_all(cfg, workspace)?.into_iter().find(|t| t.id == id))
-    }
-
-    /// Next ticket id from the Markdown store.
-    pub fn next_id(cfg: &Config, workspace: &Path) -> Result<i64> {
-        Ok(load_all(cfg, workspace)?
-            .iter()
-            .map(|t| t.id)
-            .max()
-            .unwrap_or(0)
-            + 1)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2386,38 +2354,38 @@ pub mod ticketmd {
         mode: &str,
     ) -> Result<Ticket> {
         let now = now_secs();
+        let id = load_all(cfg, workspace)?
+            .iter()
+            .map(|ticket| ticket.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         let mut ticket = Ticket {
-            id: next_id(cfg, workspace)?,
+            id,
             title: title.to_string(),
             description: description.to_string(),
-            status: "open".into(),
+            status: TicketStatus::Open,
             priority: priority.clamp(1, 3),
             parent_id,
             requirement_id,
-            mode: if mode.trim().is_empty() {
-                None
-            } else {
-                Some(mode.to_string())
-            },
+            mode: (!mode.trim().is_empty()).then(|| mode.to_string()),
             resolution: None,
             created_at: now.clone(),
             updated_at: now,
-            path: None,
+            path: PathBuf::new(),
         };
         let path = path_for(cfg, workspace, &ticket);
-        ticket.path = Some(path.clone());
+        ticket.path = path.clone();
         write_at(&path, &ticket)?;
         Ok(ticket)
     }
 
-    /// Apply a field edit and/or status/resolution change to a file-backed ticket.
-    /// Returns the updated ticket, or `None` when the id has no file.
     pub fn update(
         cfg: &Config,
         workspace: &Path,
         id: i64,
         edit: &TicketEdit,
-        status: Option<&str>,
+        status: Option<TicketStatus>,
         resolution: Option<&str>,
     ) -> Result<Option<Ticket>> {
         let mut ticket = match load_by_id(cfg, workspace, id)? {
@@ -2433,14 +2401,10 @@ pub mod ticketmd {
         if let Some(v) = edit.priority {
             ticket.priority = v.clamp(1, 3);
         }
-        if let Some(v) = edit.parent_id {
-            ticket.parent_id = v;
-        }
-        if let Some(v) = edit.requirement_id {
-            ticket.requirement_id = v;
-        }
-        if let Some(s) = status {
-            ticket.status = s.to_string();
+        edit.parent_id.apply_to(&mut ticket.parent_id);
+        edit.requirement_id.apply_to(&mut ticket.requirement_id);
+        if let Some(status) = status {
+            ticket.status = status;
         }
         if let Some(r) = resolution {
             ticket.resolution = Some(r.to_string());
@@ -2449,14 +2413,8 @@ pub mod ticketmd {
 
         let old_path = ticket.path.clone();
         let new_path = path_for(cfg, workspace, &ticket);
-        ticket.path = Some(new_path.clone());
-        write_at(&new_path, &ticket)?;
-        if let Some(old) = old_path
-            && old != new_path
-            && old.exists()
-        {
-            let _ = std::fs::remove_file(&old);
-        }
+        ticket.path = new_path.clone();
+        replace_backing_file(&old_path, &new_path, &render(&ticket))?;
         Ok(Some(ticket))
     }
 
@@ -2471,7 +2429,10 @@ pub mod prompts {
     use crate::storage::modes::Mode;
 
     pub fn seed_prompts(db: &Db) -> Result<()> {
-        for mode in Mode::all().into_iter().filter(Mode::allows_extended) {
+        for mode in Mode::all()
+            .into_iter()
+            .filter(|mode| mode.allows_extended())
+        {
             if db.prompt_active(mode.as_str())?.is_none() {
                 db.prompt_add_version(mode.as_str(), "", "default", "initial seed")?;
             }

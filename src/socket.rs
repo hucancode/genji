@@ -93,12 +93,7 @@ impl Control {
                     }
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            let client = c.clone();
-                            let _ = thread::Builder::new()
-                                .name("genji-control-client".into())
-                                .spawn(move || {
-                                    let _ = handle(stream, &client);
-                                });
+                            let _ = handle(stream, &c);
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(50));
@@ -153,63 +148,91 @@ impl Control {
     }
 }
 
+enum ControlCommand<'a> {
+    Status,
+    Context,
+    ContextStats,
+    Stop,
+    SetPlan(&'a str),
+    Ping,
+    Instruction(&'a str),
+    Empty,
+}
+
+fn parse_command(line: &str) -> ControlCommand<'_> {
+    match line {
+        "" => ControlCommand::Empty,
+        "/status" => ControlCommand::Status,
+        "/context" => ControlCommand::Context,
+        "/context stats" => ControlCommand::ContextStats,
+        "/stop" => ControlCommand::Stop,
+        "/ping" => ControlCommand::Ping,
+        "/setplan" | "/setplan " => ControlCommand::SetPlan(""),
+        value => value
+            .strip_prefix("/setplan ")
+            .map_or(ControlCommand::Instruction(value), |rest| {
+                ControlCommand::SetPlan(rest.trim())
+            }),
+    }
+}
+
 fn handle(mut stream: UnixStream, c: &Control) -> Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let line = line.trim();
-    let resp = if line.is_empty() {
-        "error: empty command".to_string()
-    } else if line == "/status" {
-        format!("status: {}", c.status())
-    } else if line == "/context" {
-        serde_json::to_string(&c.context_snapshot()).unwrap_or_else(|e| format!("error: {e}"))
-    } else if line == "/context stats" {
-        serde_json::to_string(&c.context_stats()).unwrap_or_else(|e| format!("error: {e}"))
-    } else if line == "/stop" {
-        c.stop.store(true, Ordering::SeqCst);
-        "stopping".to_string()
-    } else if line == "/setplan" || line == "/setplan " {
-        "error: usage: /setplan <slug>".to_string()
-    } else if let Some(rest) = line.strip_prefix("/setplan ") {
-        let slug = rest.trim();
-        if slug.is_empty() {
-            "error: usage: /setplan <slug>".to_string()
-        } else if slug.eq_ignore_ascii_case("off") {
-            c.set_plan(None);
-            "plan cleared".to_string()
-        } else if !valid_plan_slug(slug) {
-            format!("error: invalid plan slug `{slug}` (use letters, digits, '-' or '_')")
-        } else {
-            c.set_plan(Some(slug.to_string()));
-            // An existing, non-empty plan is read and refined by the agent; a
-            // missing or empty one is only pointed at, so `plan_write` creates
-            // or fills it later without an instruction to follow yet.
-            let file = c.plans_dir.join(format!("{slug}.md"));
-            let mut q = c.queue.lock().unwrap();
-            if let Some(instruction) = plan_instruction(&file, slug) {
-                q.push_back(instruction);
-                format!(
-                    "plan set to {slug} ({} pending, existing plan queued)",
-                    q.len()
-                )
-            } else {
-                format!("plan set to {slug} (empty; awaiting plan content)")
-            }
+    let resp = match parse_command(line) {
+        ControlCommand::Empty => "error: empty command".to_string(),
+        ControlCommand::Status => format!("status: {}", c.status()),
+        ControlCommand::Context => {
+            serde_json::to_string(&c.context_snapshot()).unwrap_or_else(|e| format!("error: {e}"))
         }
-    } else if line == "/ping" {
-        "pong".to_string()
-    } else {
-        let mut q = c.queue.lock().unwrap();
-        q.push_back(line.to_string());
-        eprintln!("[control] received user instruction ({} pending)", q.len());
-        format!("queued ({} pending)", q.len())
+        ControlCommand::ContextStats => {
+            serde_json::to_string(&c.context_stats()).unwrap_or_else(|e| format!("error: {e}"))
+        }
+        ControlCommand::Stop => {
+            c.stop.store(true, Ordering::SeqCst);
+            "stopping".to_string()
+        }
+        ControlCommand::Ping => "pong".to_string(),
+        ControlCommand::Instruction(text) => {
+            let mut q = c.queue.lock().unwrap();
+            q.push_back(text.to_string());
+            eprintln!("[control] received user instruction ({} pending)", q.len());
+            format!("queued ({} pending)", q.len())
+        }
+        ControlCommand::SetPlan(slug) => set_plan_command(c, slug),
     };
     let _ = stream.write_all(format!("{resp}\n").as_bytes());
     let _ = stream.flush();
     let _ = stream.shutdown(Shutdown::Write);
     Ok(())
+}
+
+fn set_plan_command(c: &Control, slug: &str) -> String {
+    if slug.is_empty() {
+        return "error: usage: /setplan <slug>".to_string();
+    }
+    if slug.eq_ignore_ascii_case("off") {
+        c.set_plan(None);
+        return "plan cleared".to_string();
+    }
+    if !valid_plan_slug(slug) {
+        return format!("error: invalid plan slug `{slug}` (use letters, digits, '-' or '_')");
+    }
+    c.set_plan(Some(slug.to_string()));
+    let file = c.plans_dir.join(format!("{slug}.md"));
+    let mut q = c.queue.lock().unwrap();
+    if let Some(instruction) = plan_instruction(&file, slug) {
+        q.push_back(instruction);
+        format!(
+            "plan set to {slug} ({} pending, existing plan queued)",
+            q.len()
+        )
+    } else {
+        format!("plan set to {slug} (empty; awaiting plan content)")
+    }
 }
 
 /// Build the instruction queued when `/setplan` selects a plan. Returns `None`
@@ -264,8 +287,7 @@ mod tests {
     fn temp_file(tag: &str, content: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         let path = std::env::temp_dir().join(format!("genji-control-{tag}-{nanos}.md"));
         std::fs::write(&path, content).unwrap();
         path
@@ -305,8 +327,7 @@ mod tests {
     fn context_command_measures_the_shared_composer() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         let dir = std::env::temp_dir().join(format!("genji-control-ctx-{nanos}"));
         let sock = dir.join("control.sock");
         let composer = Arc::new(RwLock::new(ContextComposer::new(

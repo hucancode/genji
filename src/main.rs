@@ -9,7 +9,6 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
 
 use agent::{Agent, AgentParams};
 use config::Config;
@@ -95,6 +94,46 @@ enum Command {
     },
 }
 
+fn resolve_workspace(cli: &Cli) -> Result<PathBuf> {
+    match &cli.workspace {
+        Some(workspace) => Ok(PathBuf::from(workspace)),
+        None => std::env::current_dir().context("resolving current directory"),
+    }
+}
+
+fn apply_config_overrides(cfg: &mut Config, cli: &Cli) {
+    // Provider precedence: --provider > GENJI_PROVIDER > config.provider.
+    if let Some(provider) = &cli.provider {
+        cfg.provider.clone_from(provider);
+    } else if let Ok(provider) = std::env::var("GENJI_PROVIDER")
+        && !provider.trim().is_empty()
+    {
+        cfg.provider = provider;
+    }
+}
+
+impl Command {
+    fn execute(&self, cli: &Cli) -> Result<Option<()>> {
+        match self {
+            Self::List => Ok(Some(cmd_list()?)),
+            Self::Stop { ids } => Ok(Some(cmd_stop(ids)?)),
+            Self::Instruct { id, instruction } => {
+                Ok(Some(cmd_instruct(id, &instruction.join(" "))?))
+            }
+            Self::Setplan { id, slug } => Ok(Some(cmd_setplan(id, slug)?)),
+            Self::Context { id } => Ok(Some(cmd_context(id)?)),
+            Self::Inspect { id } => Ok(Some(cmd_inspect(id)?)),
+            Self::Reset { yes } => {
+                let workspace = resolve_workspace(cli)?;
+                Ok(Some(cmd_reset(&workspace, *yes)?))
+            }
+            Self::Plan { .. } | Self::Build { .. } | Self::Explore { .. } | Self::Retro { .. } => {
+                Ok(None)
+            }
+        }
+    }
+}
+
 fn ensure_layout(cfg: &Config, workspace: &std::path::Path, formal: bool) -> Result<()> {
     #[cfg(feature = "formal")]
     let mut dirs = vec![cfg.plans_path(workspace), cfg.skills_path(workspace)];
@@ -113,7 +152,59 @@ fn ensure_layout(cfg: &Config, workspace: &std::path::Path, formal: bool) -> Res
     Ok(())
 }
 
+struct PreparedWorkspace {
+    cfg: Config,
+    db: Db,
+    formal: bool,
+}
+
+fn prepare_workspace(workspace: &Path, cli: &Cli) -> Result<PreparedWorkspace> {
+    let mut cfg = Config::load_or_create(workspace)?;
+    apply_config_overrides(&mut cfg, cli);
+    #[cfg(feature = "formal")]
+    let formal = cli.formal;
+    #[cfg(not(feature = "formal"))]
+    let formal = false;
+    ensure_layout(&cfg, workspace, formal)?;
+
+    let db = Db::open(&cfg.db_file(workspace))?;
+    db.init_schema()?;
+    let synced = tools::skills::sync_skills(&db, &cfg.skills_path(workspace)).unwrap_or(0);
+    #[cfg(feature = "formal")]
+    if formal && cfg.auto_ingest_requirements {
+        let total = storage::reqmd::sync(&cfg, workspace)?;
+        if total > 0 && !cli.quiet_startup {
+            eprintln!(
+                "[requirements] loaded {total} md file(s) from {}",
+                cfg.requirements_path(workspace).display()
+            );
+        }
+    }
+    #[cfg(feature = "formal")]
+    if formal {
+        storage::ticketmd::sync(&cfg, workspace)?;
+    }
+    storage::prompts::seed_prompts(&db)?;
+    if synced > 0 && !cli.quiet_startup {
+        eprintln!("[skills] synced {synced} skill file(s)");
+    }
+    Ok(PreparedWorkspace { cfg, db, formal })
+}
+
 const DEFAULT_TASK: &str = "Satisfy the active requirements in .genji/requirements/. Derive system requirements and tickets as needed.";
+
+fn selected_mode<'a>(
+    command: Option<&'a Command>,
+    task: Option<&'a str>,
+) -> (Mode, Option<&'a str>) {
+    match command {
+        Some(Command::Plan { task }) => (Mode::Plan, task.as_deref()),
+        Some(Command::Build { task }) => (Mode::Build, task.as_deref()),
+        Some(Command::Explore { task }) => (Mode::Explore, task.as_deref()),
+        Some(Command::Retro { task }) => (Mode::Retro, task.as_deref()),
+        _ => (Mode::Build, task),
+    }
+}
 
 fn read_task(instructions_file: Option<&str>, task: Option<&str>) -> Result<Option<String>> {
     if let Some(f) = instructions_file {
@@ -190,54 +281,36 @@ fn mode_switch_instruction(mode: Mode) -> String {
 }
 
 struct RunRequest {
-    cfg: Config,
-    workspace: PathBuf,
-    db: Db,
-    instance_id: String,
-    mode: Mode,
-    task: String,
-    formal: bool,
+    params: AgentParams,
     quiet: bool,
-    control: Option<Arc<socket::Control>>,
-    context: Arc<RwLock<storage::context::ContextComposer>>,
+}
+
+impl RunRequest {
+    fn into_agent(self, parent: Option<String>, depth: u32) -> Result<Agent> {
+        let mut params = self.params;
+        params.parent_instance = parent;
+        params.depth = depth;
+        Agent::new(params)
+    }
 }
 
 fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<String> {
-    let RunRequest {
-        cfg,
-        workspace,
-        db,
-        instance_id,
-        mode,
-        task,
-        formal,
-        quiet,
-        control,
-        context,
-    } = req;
+    let task = req.params.task.clone();
+    let instance_id = req.params.instance_id.clone();
+    let mode = req.params.mode;
+    let cfg = &req.params.cfg;
+    let quiet = req.quiet;
     if !quiet {
-        let model = cfg.model_for_mode(mode);
+        let model = cfg.model_for_mode(mode)?;
         eprintln!(
             "[genji] mode={} model={} instance={} task={}",
             mode.as_str(),
             model,
             instance_id,
-            llm::truncate(task.clone(), 120)
+            llm::truncate(&task, 120)
         );
     }
-    let mut agent = Agent::new(AgentParams {
-        cfg,
-        workspace,
-        db,
-        instance_id,
-        parent_instance: parent,
-        mode,
-        depth,
-        task: task.clone(),
-        formal,
-        control,
-        context,
-    })?;
+    let mut agent = req.into_agent(parent, depth)?;
     agent.add_user(&task)?;
     let report = agent.run_loop()?;
     let status = agent.status();
@@ -247,7 +320,8 @@ fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<Str
 
 #[cfg(feature = "formal")]
 fn run_cycle(req: RunRequest) -> Result<String> {
-    let RunRequest {
+    let RunRequest { params, quiet } = req;
+    let AgentParams {
         cfg,
         workspace,
         db,
@@ -255,10 +329,10 @@ fn run_cycle(req: RunRequest) -> Result<String> {
         mode: start_mode,
         task,
         formal,
-        quiet,
         control,
         context,
-    } = req;
+        ..
+    } = params;
     if !quiet {
         eprintln!(
             "[genji] auto-cycle instance={} start={} max_cycles={}",
@@ -313,17 +387,13 @@ fn run_cycle(req: RunRequest) -> Result<String> {
             agent.add_user(&mode_switch_instruction(current))?;
         }
         let report = agent.run_loop()?;
-        let stopped = agent
-            .control
-            .as_ref()
-            .map(|c| c.stop_requested())
-            .unwrap_or(false);
+        let stopped = agent.control.as_ref().is_some_and(|c| c.stop_requested());
         if !quiet {
             eprintln!(
                 "[cycle {}] {} done: {}",
                 cycle + 1,
                 current.as_str(),
-                llm::truncate(report.clone(), 300)
+                llm::truncate(&report, 300)
             );
         }
         last_report = report;
@@ -335,10 +405,10 @@ fn run_cycle(req: RunRequest) -> Result<String> {
             eprintln!("[cycle] LLM failure; ending cycle");
             break;
         }
-        current = match current {
-            Mode::Plan => Mode::Build,
-            Mode::Build => Mode::Plan,
-            _ => Mode::Plan,
+        current = if current == Mode::Plan {
+            Mode::Build
+        } else {
+            Mode::Plan
         };
     }
     let status = agent.status();
@@ -380,11 +450,6 @@ fn query_status(socket: &str) -> String {
     }
 }
 
-fn is_root_instance(_inst: &storage::registry::Instance) -> bool {
-    // TODO: fix this
-    true
-}
-
 /// `genji list` — running instances with their live status. stdout is machine
 /// output (JSON); the human table is written to stderr.
 fn cmd_list() -> Result<()> {
@@ -400,7 +465,6 @@ fn cmd_list() -> Result<()> {
         .map(|(inst, status)| {
             json!({
                 "id": inst.id,
-                "root": is_root_instance(inst),
                 "pid": inst.pid,
                 "uptime_secs": inst.uptime_secs(),
                 "workspace": inst.workspace,
@@ -417,14 +481,13 @@ fn cmd_list() -> Result<()> {
         return Ok(());
     }
     eprintln!(
-        "{:<8} {:<4} {:<7} {:<8} {:<38} STATUS",
-        "ID", "ROOT", "PID", "UPTIME", "WORKSPACE"
+        "{:<8} {:<7} {:<8} {:<38} STATUS",
+        "ID", "PID", "UPTIME", "WORKSPACE"
     );
     for (inst, status) in &rows {
         eprintln!(
-            "{:<8} {:<4} {:<7} {:<8} {:<38} {}",
+            "{:<8} {:<7} {:<8} {:<38} {}",
             inst.id,
-            if is_root_instance(inst) { "*" } else { "" },
             inst.pid,
             format_uptime(inst.uptime_secs()),
             inst.workspace,
@@ -902,96 +965,26 @@ fn cmd_inspect(id: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match &cli.command {
-        Some(Command::List) => return cmd_list(),
-        Some(Command::Stop { ids }) => return cmd_stop(ids),
-        Some(Command::Instruct { id, instruction }) => {
-            let text = instruction.join(" ");
-            return cmd_instruct(id, &text);
-        }
-        Some(Command::Setplan { id, slug }) => return cmd_setplan(id, slug),
-        Some(Command::Context { id }) => return cmd_context(id),
-        Some(Command::Inspect { id }) => return cmd_inspect(id),
-        Some(Command::Reset { yes }) => {
-            let workspace = match &cli.workspace {
-                Some(w) => PathBuf::from(w),
-                None => std::env::current_dir().context("resolving current directory")?,
-            };
-            return cmd_reset(&workspace, *yes);
-        }
-        _ => {}
-    }
-    let workspace = match &cli.workspace {
-        Some(w) => PathBuf::from(w),
-        None => std::env::current_dir().context("resolving current directory")?,
-    };
-    let mut cfg = Config::load_or_create(&workspace)?;
-    // Provider precedence: --provider > GENJI_PROVIDER > config.provider.
-    if let Some(p) = &cli.provider {
-        cfg.provider = p.clone();
-    } else if let Ok(p) = std::env::var("GENJI_PROVIDER")
-        && !p.trim().is_empty()
-    {
-        cfg.provider = p;
-    }
-    #[cfg(feature = "formal")]
-    let formal = cli.formal;
-    #[cfg(not(feature = "formal"))]
-    let formal = false;
-    ensure_layout(&cfg, &workspace, formal)?;
-
-    let db = Db::open(&cfg.db_file(&workspace))?;
-    db.init_schema()?;
-
-    let synced = tools::skills::sync_skills(&db, &cfg.skills_path(&workspace)).unwrap_or(0);
-    #[cfg(feature = "formal")]
-    if formal && cfg.auto_ingest_requirements {
-        let total = storage::reqmd::sync(&cfg, &workspace)?;
-        if total > 0 && !cli.quiet_startup {
-            eprintln!(
-                "[requirements] loaded {total} md file(s) from {}",
-                cfg.requirements_path(&workspace).display()
-            );
+    if let Some(command) = &cli.command {
+        if command.execute(&cli)?.is_some() {
+            return Ok(());
         }
     }
-    #[cfg(feature = "formal")]
-    if formal {
-        storage::ticketmd::sync(&cfg, &workspace)?;
-    }
-    storage::prompts::seed_prompts(&db)?;
-    if synced > 0 && !cli.quiet_startup {
-        eprintln!("[skills] synced {synced} skill file(s)");
-    }
-    let (start_mode, task_arg): (Mode, Option<&str>) = match &cli.command {
-        Some(Command::Plan { task }) => (Mode::Plan, task.as_deref()),
-        Some(Command::Build { task }) => (Mode::Build, task.as_deref()),
-        Some(Command::Explore { task }) => (Mode::Explore, task.as_deref()),
-        Some(Command::Retro { task }) => (Mode::Retro, task.as_deref()),
-        Some(_) => unreachable!("instance subcommand handled above"),
-        None => (Mode::Build, cli.task.as_deref()),
-    };
+    let workspace = resolve_workspace(&cli)?;
+    let prepared = prepare_workspace(&workspace, &cli)?;
+    let PreparedWorkspace { cfg, db, formal } = prepared;
+    let (start_mode, task_arg) = selected_mode(cli.command.as_ref(), cli.task.as_deref());
     let explicit_task = read_task(cli.instructions_file.as_deref(), task_arg)?;
     let quiet = cli.quiet_startup || cli.subagent;
     let instance_id = storage::registry::new_id();
-    {
-        let trace = storage::registry::events_path(&instance_id);
-        if let Some(parent) = trace.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&trace);
-    }
-
     if !quiet {
-        let p = cfg.resolve_active_provider();
+        let p = cfg.resolve_active_provider()?;
         eprintln!(
             "[genji] provider={} kind={} base_url={} model={}",
             cfg.provider,
             p.kind,
             p.base_url,
-            cfg.model_for_mode(start_mode)
+            cfg.model_for_mode(start_mode)?
         );
     }
     let context = agent::build_context(&cfg, &db, start_mode, formal)?;
@@ -1035,37 +1028,41 @@ fn main() -> Result<()> {
     let active_requirements = 0;
     let task = match startup_action(explicit_task, active_requirements, formal) {
         Startup::Run(t) => t,
-        Startup::Wait => match &control {
-            Some(c) => match wait_for_instruction(c, &instance_id, quiet)? {
-                Some(t) => t,
-                None => {
+        Startup::Wait => {
+            if let Some(c) = &control {
+                if let Some(t) = wait_for_instruction(c, &instance_id, quiet)? {
+                    t
+                } else {
                     c.shutdown();
                     return Ok(());
                 }
-            },
-            None => {
+            } else {
                 if !quiet {
                     eprintln!(
                         "[genji] no instruction and no active requirements; \
-                         no control socket to wait on. Nothing to do."
+                     no control socket to wait on. Nothing to do."
                     );
                 }
                 return Ok(());
             }
-        },
+        }
     };
 
     let request = RunRequest {
-        cfg,
-        workspace,
-        db,
-        instance_id,
-        mode: start_mode,
-        task,
-        formal,
+        params: AgentParams {
+            cfg,
+            workspace,
+            db,
+            instance_id,
+            parent_instance: None,
+            mode: start_mode,
+            depth: 0,
+            task,
+            formal,
+            control: control.clone(),
+            context,
+        },
         quiet,
-        control: control.clone(),
-        context,
     };
     #[cfg(feature = "formal")]
     let report = if formal {
