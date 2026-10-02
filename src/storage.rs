@@ -1,89 +1,58 @@
+/// A string-backed enum with `as_str`, `Display`, lenient `FromStr`, and serde
+/// (de)serialization through the same string forms.
+macro_rules! string_enum {
+    ($(#[$m:meta])* pub enum $name:ident { $($(#[$vm:meta])* $variant:ident => $s:literal),+ $(,)? }) => {
+        $(#[$m])*
+        pub enum $name { $($(#[$vm])* $variant),+ }
+
+        impl $name {
+            pub const fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $s),+ }
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = String;
+
+            fn from_str(s: &str) -> std::result::Result<Self, String> {
+                match s.trim().trim_matches('"').to_ascii_lowercase().as_str() {
+                    $($s => Ok(Self::$variant),)+
+                    other => Err(format!(
+                        "unknown {} `{other}` (expected {})",
+                        stringify!($name),
+                        [$($s),+].join("|")
+                    )),
+                }
+            }
+        }
+
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+                s.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+                String::deserialize(d)?.parse().map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+pub(crate) use string_enum;
+
 pub mod context {
     use anyhow::Result;
     use serde_json::{Value, json};
+    use std::fmt::Write as _;
 
     use crate::llm::{self, ChatMessage, LlmClient, Role};
-    use crate::tools::Tool;
-
-    pub fn estimate_tools(tools: &[Value]) -> i64 {
-        let chars = tools
-            .iter()
-            .map(|tool| tool.to_string().chars().count())
-            .fold(0usize, usize::saturating_add);
-        llm::estimate_chars(chars)
-    }
-
-    #[derive(Debug, Clone, Copy, Default)]
-    pub struct ContextInfo {
-        pub system_prompt_tokens: i64,
-        pub system_tools_tokens: i64,
-        pub turn_messages_tokens: i64,
-        pub total_tokens: i64,
-        pub context_window: i64,
-    }
-
-    impl ContextInfo {
-        pub fn compute(messages: &[ChatMessage], tools: &[Value], context_window: i64) -> Self {
-            let system_prompt_tokens = messages
-                .first()
-                .map_or(0, super::super::llm::ChatMessage::est_tokens);
-            let turn_messages_tokens = messages
-                .iter()
-                .skip(1)
-                .map(super::super::llm::ChatMessage::est_tokens)
-                .sum();
-            let system_tools_tokens = estimate_tools(tools);
-            Self {
-                system_prompt_tokens,
-                system_tools_tokens,
-                turn_messages_tokens,
-                total_tokens: system_prompt_tokens + system_tools_tokens + turn_messages_tokens,
-                context_window,
-            }
-        }
-
-        pub fn from_json(v: &Value) -> Self {
-            let get = |k: &str| v.get(k).and_then(serde_json::Value::as_i64).unwrap_or(0);
-            Self {
-                system_prompt_tokens: get("system_prompt_tokens"),
-                system_tools_tokens: get("system_tools_tokens"),
-                turn_messages_tokens: get("turn_messages_tokens"),
-                total_tokens: get("total_tokens"),
-                context_window: get("context_window"),
-            }
-        }
-
-        pub fn percent(&self) -> f64 {
-            percent_of(self.total_tokens, self.context_window)
-        }
-
-        pub fn to_json(self) -> Value {
-            json!({
-                "total_tokens": self.total_tokens,
-                "context_window": self.context_window,
-                "percent": self.percent(),
-                "system_prompt_tokens": self.system_prompt_tokens,
-                "system_tools_tokens": self.system_tools_tokens,
-                "turn_messages_tokens": self.turn_messages_tokens,
-            })
-        }
-
-        pub fn summary(&self) -> String {
-            let p = |tokens: i64| percent_of(tokens, self.context_window);
-            format!(
-                "context: {} / {} tokens ({:.1}%)\n  system prompt: {} ({:.1}%)\n  system tools: {} ({:.1}%)\n  turn messages: {} ({:.1}%)",
-                self.total_tokens,
-                self.context_window,
-                self.percent(),
-                self.system_prompt_tokens,
-                p(self.system_prompt_tokens),
-                self.system_tools_tokens,
-                p(self.system_tools_tokens),
-                self.turn_messages_tokens,
-                p(self.turn_messages_tokens),
-            )
-        }
-    }
 
     #[derive(Debug, Clone)]
     pub struct Compaction {
@@ -100,15 +69,18 @@ pub mod context {
         tools: Vec<Value>,
         context_window: i64,
         last_prompt_tokens: i64,
+        /// Message count when `last_prompt_tokens` was measured.
+        prompt_len: usize,
     }
 
     impl ContextComposer {
-        pub fn new(system: String, tools: Vec<Tool>, context_window: i64) -> Self {
+        pub fn new(system: String, tools: Vec<Value>, context_window: i64) -> Self {
             Self {
                 messages: vec![ChatMessage::system(system)],
-                tools: tools.into_iter().map(|t| t.to_json()).collect(),
+                tools,
                 context_window,
                 last_prompt_tokens: 0,
+                prompt_len: 0,
             }
         }
 
@@ -122,6 +94,16 @@ pub mod context {
 
         pub fn set_last_prompt_tokens(&mut self, tokens: i64) {
             self.last_prompt_tokens = tokens;
+            self.prompt_len = self.messages.len();
+        }
+
+        /// The last measured prompt size plus an estimate for messages added since.
+        fn est_tokens(&self) -> i64 {
+            if self.last_prompt_tokens > 0 {
+                self.last_prompt_tokens + llm::estimate_messages(&self.messages[self.prompt_len..])
+            } else {
+                llm::estimate_messages(&self.messages)
+            }
         }
 
         pub fn push(&mut self, msg: ChatMessage) {
@@ -129,23 +111,14 @@ pub mod context {
         }
 
         pub fn set_system(&mut self, system: String) {
-            if let Some(first) = self.messages.first_mut() {
-                first.role = Role::System;
-                first.content = system;
-            } else {
-                self.messages.push(ChatMessage::system(system));
-            }
+            self.messages[0].content = system;
         }
 
         #[cfg(any(feature = "formal", test))]
-        pub fn switch_mode(&mut self, tools: Vec<Tool>, system: String, context_window: i64) {
-            self.tools = tools.into_iter().map(|t| t.to_json()).collect();
+        pub fn switch_mode(&mut self, tools: Vec<Value>, system: String, context_window: i64) {
+            self.tools = tools;
             self.context_window = context_window;
             self.set_system(system);
-        }
-
-        pub fn stats(&self) -> ContextInfo {
-            ContextInfo::compute(&self.messages, self.tools(), self.context_window)
         }
 
         pub fn snapshot(&self) -> Value {
@@ -153,7 +126,7 @@ pub mod context {
                 "context_window": self.context_window,
                 "last_prompt_tokens": self.last_prompt_tokens,
                 "messages": self.messages,
-                "tools": self.tools(),
+                "tools": self.tools,
             })
         }
 
@@ -164,12 +137,7 @@ pub mod context {
             llm: &LlmClient,
         ) -> Result<Option<Compaction>> {
             let threshold = (self.context_window as f64 * threshold_fraction) as i64;
-            let est = if self.last_prompt_tokens > 0 {
-                self.last_prompt_tokens
-            } else {
-                llm::estimate_messages(&self.messages)
-            };
-            if est >= threshold {
+            if self.est_tokens() >= threshold {
                 self.compact(keep, llm)
             } else {
                 Ok(None)
@@ -178,19 +146,16 @@ pub mod context {
 
         pub fn compact(&mut self, keep: usize, llm: &LlmClient) -> Result<Option<Compaction>> {
             let keep = keep.max(2);
-            if self.messages.len() <= keep + 2 {
+            let len = self.messages.len();
+            if len <= keep + 2 {
                 return Ok(None);
             }
-            let mut split = self.messages.len() - keep;
-            while split < self.messages.len() && self.messages[split].role == Role::Tool {
+            let mut split = len - keep;
+            while split < len && self.messages[split].role == Role::Tool {
                 split += 1;
             }
-            if split <= 1 {
-                return Ok(None);
-            }
             let before = llm::estimate_messages(&self.messages);
-            let middle: Vec<ChatMessage> = self.messages[1..split].to_vec();
-            let rendered_source = render_messages(&middle);
+            let rendered_source = render_messages(&self.messages[1..split]);
             let rendered = llm::truncate(&rendered_source, 120_000);
             let summary_req = vec![
                 ChatMessage::system(
@@ -203,18 +168,16 @@ pub mod context {
             let resp = llm.chat(&summary_req, &[])?;
             let summary = resp.message.content.trim().to_string();
 
-            let system = self.messages[0].clone();
-            let recent: Vec<ChatMessage> = self.messages[split..].to_vec();
-            let removed = i64::try_from(split - 1).unwrap_or(i64::MAX);
-            let mut new_msgs = vec![system];
-            new_msgs.push(ChatMessage::user(format!(
+            let recent = self.messages.split_off(split);
+            self.messages.truncate(1);
+            self.messages.push(ChatMessage::user(format!(
                 "[compacted summary of earlier conversation]\n{summary}"
             )));
-            new_msgs.extend(recent);
-            self.messages = new_msgs;
+            self.messages.extend(recent);
             self.last_prompt_tokens = 0;
+            self.prompt_len = 0;
             Ok(Some(Compaction {
-                removed,
+                removed: i64::try_from(split - 1).unwrap_or(i64::MAX),
                 before,
                 after: llm::estimate_messages(&self.messages),
                 summary,
@@ -224,28 +187,20 @@ pub mod context {
         }
     }
 
-    fn percent_of(tokens: i64, window: i64) -> f64 {
-        if window <= 0 {
-            0.0
-        } else {
-            (tokens as f64) * 100.0 / (window as f64)
-        }
-    }
-
     fn render_messages(msgs: &[ChatMessage]) -> String {
         let mut out = String::new();
         for m in msgs {
-            out.push_str(&format!("[{}] {}", m.role, m.content));
+            let _ = write!(out, "[{}] {}", m.role, m.content);
             if !m.tool_calls.is_empty() {
                 let calls: Vec<String> = m
                     .tool_calls
                     .iter()
                     .map(|c| format!("{}({})", c.name, llm::truncate(&c.arguments, 200)))
                     .collect();
-                out.push_str(&format!("\n  calls: {}", calls.join(", ")));
+                let _ = write!(out, "\n  calls: {}", calls.join(", "));
             }
             if let Some(id) = &m.tool_call_id {
-                out.push_str(&format!(" (tool_call_id={id})"));
+                let _ = write!(out, " (tool_call_id={id})");
             }
             out.push_str("\n\n");
         }
@@ -254,84 +209,16 @@ pub mod context {
 
     #[cfg(test)]
     mod tests {
-        use super::{ContextComposer, ContextInfo, estimate_tools};
-        use crate::llm::{ChatMessage, Role};
-        use crate::tools::Tool;
+        use super::ContextComposer;
+        use crate::llm::ChatMessage;
         use serde_json::json;
 
-        fn tool(name: &'static str) -> Tool {
-            crate::tools::test_tool(name, json!({"type": "object"}))
+        fn tool(name: &str) -> serde_json::Value {
+            json!({"type": "function", "function": {"name": name}})
         }
 
         #[test]
-        fn splits_context_into_system_tools_and_turns() {
-            let messages = vec![
-                ChatMessage::system("s".repeat(400)),
-                ChatMessage::user("u".repeat(400)),
-                ChatMessage::assistant("a".repeat(400)),
-            ];
-            let tools = vec![json!({"type": "function", "function": {"name": "read"}})];
-            let info = ContextInfo::compute(&messages, &tools, 1000);
-            assert!(info.system_prompt_tokens > 0);
-            assert!(info.turn_messages_tokens > info.system_prompt_tokens);
-            assert_eq!(info.system_tools_tokens, estimate_tools(&tools));
-            assert_eq!(
-                info.total_tokens,
-                info.system_prompt_tokens + info.system_tools_tokens + info.turn_messages_tokens
-            );
-            assert!(info.percent() > 0.0);
-        }
-
-        #[test]
-        fn json_round_trips() {
-            let info = ContextInfo {
-                system_prompt_tokens: 10,
-                system_tools_tokens: 20,
-                turn_messages_tokens: 30,
-                total_tokens: 60,
-                context_window: 1000,
-            };
-            let back = ContextInfo::from_json(&info.to_json());
-            assert_eq!(back.total_tokens, 60);
-            assert_eq!(back.system_tools_tokens, 20);
-            assert_eq!(back.turn_messages_tokens, 30);
-        }
-
-        #[test]
-        fn summary_reports_zero_for_unknown_window() {
-            let info = ContextInfo {
-                total_tokens: 5,
-                context_window: 0,
-                ..Default::default()
-            };
-            assert_eq!(info.percent(), 0.0);
-            assert!(info.summary().contains("5 / 0 tokens"));
-        }
-
-        #[test]
-        fn stats_measure_the_current_conversation() {
-            let mut ctx = ContextComposer::new("system".to_string(), vec![tool("read")], 1000);
-            let base = ctx.stats();
-            assert!(base.system_prompt_tokens > 0);
-            assert!(base.system_tools_tokens > 0);
-            assert_eq!(base.turn_messages_tokens, 0);
-
-            ctx.push(ChatMessage::user("hello"));
-            ctx.push(ChatMessage::tool_result("call_1", "result"));
-            assert_eq!(ctx.messages().len(), 3);
-            assert_eq!(ctx.messages()[2].role, Role::Tool);
-
-            let stats = ctx.stats();
-            assert!(stats.turn_messages_tokens > 0);
-            assert_eq!(stats.context_window, 1000);
-            assert_eq!(
-                stats.total_tokens,
-                stats.system_prompt_tokens + stats.system_tools_tokens + stats.turn_messages_tokens
-            );
-        }
-
-        #[test]
-        fn snapshot_returns_live_prompt_without_stats() {
+        fn snapshot_returns_live_prompt() {
             let mut ctx =
                 ContextComposer::new("you are genji".to_string(), vec![tool("read")], 1000);
             ctx.push(ChatMessage::user("hello"));
@@ -343,94 +230,36 @@ pub mod context {
             assert_eq!(snap["messages"][0]["content"], "you are genji");
             assert_eq!(snap["messages"][1]["role"], "user");
             assert_eq!(snap["tools"][0]["function"]["name"], "read");
-            assert!(snap.get("total_tokens").is_none());
+        }
+
+        #[test]
+        fn estimate_counts_messages_after_last_prompt() {
+            let mut ctx = ContextComposer::new("sys".to_string(), Vec::new(), 1000);
+            ctx.set_last_prompt_tokens(100);
+            assert_eq!(ctx.est_tokens(), 108);
+            ctx.push(ChatMessage::tool_result("c1", "x".repeat(4000)));
+            assert_eq!(ctx.est_tokens(), 100 + 1004 + 8);
         }
 
         #[test]
         fn switch_mode_replaces_system_and_tools() {
             let mut ctx = ContextComposer::new("old".to_string(), vec![tool("read")], 1000);
             ctx.push(ChatMessage::user("keep me"));
-            let turns = ctx.stats().turn_messages_tokens;
             ctx.switch_mode(vec![tool("bash")], "new".to_string(), 2000);
             assert_eq!(ctx.messages()[0].content, "new");
             assert_eq!(ctx.messages()[1].content, "keep me");
             assert_eq!(ctx.tools()[0]["function"]["name"], "bash");
-            let stats = ctx.stats();
-            assert_eq!(stats.context_window, 2000);
-            assert_eq!(stats.turn_messages_tokens, turns);
+            assert_eq!(ctx.snapshot()["context_window"].as_i64(), Some(2000));
         }
     }
 }
 pub mod db {
     use anyhow::{Context, Result};
-    use rusqlite::{Connection, OptionalExtension, params};
-    #[cfg(feature = "formal")]
-    use serde::de::DeserializeOwned;
+    use rusqlite::{Connection, params};
+    use serde_json::{Value, json};
     use std::path::Path;
 
     const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
-
-    #[cfg(feature = "formal")]
-    #[derive(Debug, Clone, Default)]
-    pub enum FieldPatch<T> {
-        #[default]
-        Keep,
-        Set(T),
-        Clear,
-    }
-
-    #[cfg(feature = "formal")]
-    impl<'de, T: DeserializeOwned> serde::Deserialize<'de> for FieldPatch<T> {
-        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            match Option::<T>::deserialize(deserializer)? {
-                Some(value) => Ok(Self::Set(value)),
-                None => Ok(Self::Clear),
-            }
-        }
-    }
-
-    #[cfg(feature = "formal")]
-    impl<T: Clone> FieldPatch<T> {
-        pub fn apply_to(&self, slot: &mut Option<T>) {
-            match self {
-                Self::Keep => {}
-                Self::Set(value) => *slot = Some(value.clone()),
-                Self::Clear => *slot = None,
-            }
-        }
-    }
-
-    #[cfg(feature = "formal")]
-    #[derive(Default)]
-    pub struct TicketEdit {
-        pub title: Option<String>,
-        pub description: Option<String>,
-        pub priority: Option<i64>,
-        pub parent_id: FieldPatch<i64>,
-        pub requirement_id: FieldPatch<i64>,
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct SkillRow {
-        pub name: String,
-        pub path: String,
-        pub description: String,
-        pub content: String,
-        pub uses: i64,
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct PromptVersionRow {
-        pub version: i64,
-        pub content: String,
-        pub author: String,
-        pub reason: String,
-        pub active: i64,
-        pub created_at: String,
-    }
 
     pub struct Db {
         pub conn: Connection,
@@ -445,14 +274,10 @@ pub mod db {
             let conn = Connection::open(path)
                 .with_context(|| format!("opening sqlite db {}", path.display()))?;
             conn.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
             )?;
+            conn.execute_batch(include_str!("sql/schema.sql"))?;
             Ok(Db { conn })
-        }
-
-        pub fn init_schema(&self) -> Result<()> {
-            self.conn.execute_batch(include_str!("sql/schema.sql"))?;
-            Ok(())
         }
 
         pub fn instance_start(
@@ -465,9 +290,9 @@ pub mod db {
             depth: u32,
         ) -> Result<()> {
             self.conn.execute(
-            "INSERT INTO instances(id,mode,parent_instance,task,model,depth,status) VALUES(?,?,?,?,?,?,'running')",
-            params![id, mode, parent, task, model, i64::from(depth)],
-        )?;
+                "INSERT INTO instances(id,mode,parent_instance,task,model,depth,status) VALUES(?,?,?,?,?,?,'running')",
+                params![id, mode, parent, task, model, i64::from(depth)],
+            )?;
             Ok(())
         }
 
@@ -479,11 +304,18 @@ pub mod db {
             report: &str,
         ) -> Result<()> {
             self.conn.execute(
-            &format!(
-                "UPDATE instances SET status=?, tokens_used=?, report=?, ended_at={NOW} WHERE id=?"
-            ),
-            params![status, tokens, report, id],
-        )?;
+                &format!(
+                    "UPDATE instances SET status=?, tokens_used=?, report=?, ended_at={NOW} WHERE id=?"
+                ),
+                params![status, tokens, report, id],
+            )?;
+            Ok(())
+        }
+
+        #[cfg(feature = "formal")]
+        pub fn instance_set_mode(&self, id: &str, mode: &str) -> Result<()> {
+            self.conn
+                .execute("UPDATE instances SET mode=? WHERE id=?", params![mode, id])?;
             Ok(())
         }
 
@@ -493,6 +325,39 @@ pub mod db {
                 params![tokens, id],
             )?;
             Ok(())
+        }
+
+        /// Summary of the single instance whose id starts with `prefix`.
+        pub fn instance_summary(&self, prefix: &str) -> Result<Value> {
+            let mut stmt = self.conn.prepare(
+                "SELECT i.id,i.mode,i.model,i.parent_instance,i.depth,i.task,i.status,i.tokens_used,
+                        i.started_at,i.ended_at,i.report,
+                        (SELECT COUNT(*) FROM messages m WHERE m.instance_id=i.id)
+                 FROM instances i WHERE i.id LIKE ?1 || '%' ORDER BY i.id LIMIT 2",
+            )?;
+            let mut rows = stmt
+                .query_map(params![prefix], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, String>(0)?,
+                        "mode": r.get::<_, String>(1)?,
+                        "model": r.get::<_, Option<String>>(2)?,
+                        "parent": r.get::<_, Option<String>>(3)?,
+                        "depth": r.get::<_, i64>(4)?,
+                        "task": r.get::<_, Option<String>>(5)?,
+                        "status": r.get::<_, String>(6)?,
+                        "tokens_used": r.get::<_, i64>(7)?,
+                        "started_at": r.get::<_, String>(8)?,
+                        "ended_at": r.get::<_, Option<String>>(9)?,
+                        "report": r.get::<_, Option<String>>(10)?,
+                        "messages": r.get::<_, i64>(11)?,
+                    }))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            match rows.len() {
+                1 => Ok(rows.remove(0)),
+                0 => anyhow::bail!("no recorded instance with id `{prefix}`"),
+                _ => anyhow::bail!("instance id `{prefix}` is ambiguous (use a longer prefix)"),
+            }
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -505,12 +370,13 @@ pub mod db {
             tool_calls: Option<&str>,
             tool_call_id: Option<&str>,
             reasoning: Option<&str>,
-        ) -> Result<i64> {
-            self.conn.execute(
-            "INSERT INTO messages(instance_id,seq,role,content,tool_calls,tool_call_id,reasoning) VALUES(?,?,?,?,?,?,?)",
-            params![instance_id, seq, role, content, tool_calls, tool_call_id, reasoning],
-        )?;
-            Ok(self.conn.last_insert_rowid())
+        ) -> Result<()> {
+            self.conn
+                .prepare_cached(
+                    "INSERT INTO messages(instance_id,seq,role,content,tool_calls,tool_call_id,reasoning) VALUES(?,?,?,?,?,?,?)",
+                )?
+                .execute(params![instance_id, seq, role, content, tool_calls, tool_call_id, reasoning])?;
+            Ok(())
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -524,10 +390,11 @@ pub mod db {
             is_error: bool,
             duration_ms: i64,
         ) -> Result<()> {
-            self.conn.execute(
-            "INSERT INTO tool_calls(instance_id,message_seq,name,args,result,is_error,duration_ms) VALUES(?,?,?,?,?,?,?)",
-            params![instance_id, message_seq, name, args, result, i64::from(is_error), duration_ms],
-        )?;
+            self.conn
+                .prepare_cached(
+                    "INSERT INTO tool_calls(instance_id,message_seq,name,args,result,is_error,duration_ms) VALUES(?,?,?,?,?,?,?)",
+                )?
+                .execute(params![instance_id, message_seq, name, args, result, i64::from(is_error), duration_ms])?;
             Ok(())
         }
 
@@ -539,191 +406,10 @@ pub mod db {
             question: &str,
         ) -> Result<i64> {
             self.conn.execute(
-            "INSERT INTO requirement_questions(requirement_id,instance_id,question) VALUES(?,?,?)",
-            params![requirement_id, instance_id, question],
-        )?;
+                "INSERT INTO requirement_questions(requirement_id,instance_id,question) VALUES(?,?,?)",
+                params![requirement_id, instance_id, question],
+            )?;
             Ok(self.conn.last_insert_rowid())
-        }
-
-        pub fn skill_upsert(
-            &self,
-            name: &str,
-            path: &str,
-            description: &str,
-            content: &str,
-        ) -> Result<i64> {
-            self.conn.execute(
-            &format!(
-                "INSERT INTO skills(name,path,description,content,uses) VALUES(?,?,?,?,0)
-                 ON CONFLICT(name) DO UPDATE SET path=excluded.path, description=excluded.description,
-                    content=excluded.content, updated_at={NOW}"
-            ),
-            params![name, path, description, content],
-        )?;
-            let id: i64 =
-                self.conn
-                    .query_row("SELECT id FROM skills WHERE name=?", params![name], |r| {
-                        r.get(0)
-                    })?;
-            Ok(id)
-        }
-
-        fn skill_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillRow> {
-            Ok(SkillRow {
-                name: row.get(0)?,
-                path: row.get(1)?,
-                description: row.get(2)?,
-                content: row.get(3)?,
-                uses: row.get(4)?,
-            })
-        }
-
-        pub fn skill_get(&self, name: &str) -> Result<Option<SkillRow>> {
-            Ok(self
-                .conn
-                .query_row(
-                    "SELECT name,path,description,content,uses FROM skills WHERE name=?",
-                    params![name],
-                    Self::skill_from_row,
-                )
-                .optional()?)
-        }
-
-        pub fn has_skills(&self) -> Result<bool> {
-            Ok(self
-                .conn
-                .query_row("SELECT EXISTS(SELECT 1 FROM skills)", [], |row| row.get(0))?)
-        }
-
-        pub fn skill_list(&self) -> Result<Vec<SkillRow>> {
-            let mut stmt = self.conn.prepare(
-                "SELECT name,path,description,content,uses FROM skills ORDER BY name",
-            )?;
-            let rows = stmt.query_map([], Self::skill_from_row)?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        }
-
-        pub fn skill_record_load(&self, instance_id: &str, name: &str) -> Result<()> {
-            self.conn.execute(
-                "INSERT INTO skill_loads(instance_id,skill_name) VALUES(?,?)",
-                params![instance_id, name],
-            )?;
-            self.conn
-                .execute("UPDATE skills SET uses=uses+1 WHERE name=?", params![name])?;
-            Ok(())
-        }
-
-        pub fn skill_version_add(
-            &self,
-            name: &str,
-            content: &str,
-            description: &str,
-            author: &str,
-            reason: &str,
-        ) -> Result<i64> {
-            let version: i64 = self.conn.query_row(
-                "SELECT COALESCE(MAX(version),0)+1 FROM skill_versions WHERE skill_name=?",
-                params![name],
-                |r| r.get(0),
-            )?;
-            self.conn.execute(
-            "INSERT INTO skill_versions(skill_name,version,content,description,author,reason) VALUES(?,?,?,?,?,?)",
-            params![name, version, content, description, author, reason],
-        )?;
-            Ok(version)
-        }
-
-        pub fn skill_version_get(
-            &self,
-            name: &str,
-            version: i64,
-        ) -> Result<Option<(String, String)>> {
-            Ok(self
-            .conn
-            .query_row(
-                "SELECT content,description FROM skill_versions WHERE skill_name=? AND version=?",
-                params![name, version],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?)
-        }
-
-        fn prompt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PromptVersionRow> {
-            Ok(PromptVersionRow {
-                version: row.get(0)?,
-                content: row.get(1)?,
-                author: row.get(2)?,
-                reason: row.get(3)?,
-                active: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        }
-
-        pub fn prompt_active(&self, mode: &str) -> Result<Option<PromptVersionRow>> {
-            Ok(self
-            .conn
-            .query_row(
-                "SELECT version,content,author,reason,active,created_at FROM prompt_versions
-                 WHERE mode=? AND active=1 ORDER BY version DESC LIMIT 1",
-                params![mode],
-                Self::prompt_from_row,
-            )
-            .optional()?)
-        }
-
-        pub fn prompt_add_version(
-            &self,
-            mode: &str,
-            content: &str,
-            author: &str,
-            reason: &str,
-        ) -> Result<i64> {
-            let version: i64 = self.conn.query_row(
-                "SELECT COALESCE(MAX(version),0)+1 FROM prompt_versions WHERE mode=?",
-                params![mode],
-                |r| r.get(0),
-            )?;
-            self.conn.execute(
-                "UPDATE prompt_versions SET active=0 WHERE mode=?",
-                params![mode],
-            )?;
-            self.conn.execute(
-            "INSERT INTO prompt_versions(mode,version,content,author,reason,active) VALUES(?,?,?,?,?,1)",
-            params![mode, version, content, author, reason],
-        )?;
-            Ok(version)
-        }
-
-        pub fn prompt_activate(&self, mode: &str, version: i64) -> Result<bool> {
-            let exists: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT id FROM prompt_versions WHERE mode=? AND version=?",
-                    params![mode, version],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if exists.is_none() {
-                return Ok(false);
-            }
-            self.conn.execute(
-                "UPDATE prompt_versions SET active=0 WHERE mode=?",
-                params![mode],
-            )?;
-            self.conn.execute(
-                "UPDATE prompt_versions SET active=1 WHERE mode=? AND version=?",
-                params![mode, version],
-            )?;
-            Ok(true)
-        }
-
-        pub fn prompt_versions(&self, mode: &str) -> Result<Vec<PromptVersionRow>> {
-            let mut stmt = self.conn.prepare(
-            "SELECT version,content,author,reason,active,created_at FROM prompt_versions
-             WHERE mode=? ORDER BY version DESC",
-        )?;
-            let rows = stmt.query_map(params![mode], Self::prompt_from_row)?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         }
 
         pub fn compaction_add(
@@ -735,94 +421,52 @@ pub mod db {
             summary: &str,
         ) -> Result<()> {
             self.conn.execute(
-            "INSERT INTO compactions(instance_id,removed_messages,before_tokens,after_tokens,summary) VALUES(?,?,?,?,?)",
-            params![instance_id, removed, before, after, summary],
-        )?;
+                "INSERT INTO compactions(instance_id,removed_messages,before_tokens,after_tokens,summary) VALUES(?,?,?,?,?)",
+                params![instance_id, removed, before, after, summary],
+            )?;
             Ok(())
         }
     }
 }
 pub mod events {
-    //! Machine-readable event stream.
+    //! Machine-readable event stream (JSON lines on stdout).
 
     use serde_json::{Value, json};
     use std::io::{self, Write};
-    use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
+
     pub struct EventEmitter {
         instance: String,
-        seq: AtomicU64,
-        out: Mutex<Box<dyn Write + Send>>,
-        trace: Mutex<Option<std::fs::File>>,
+        /// Sequence counter and sink, locked together so `seq` matches line order.
+        out: Mutex<(u64, Box<dyn Write + Send>)>,
     }
 
     impl EventEmitter {
-        pub fn new(instance: impl Into<String>, trace_path: Option<PathBuf>) -> io::Result<Self> {
-            Self::with_writer_and_trace(instance, Box::new(io::stdout()), trace_path)
+        pub fn new(instance: impl Into<String>) -> Self {
+            Self::with_writer(instance, Box::new(io::stdout()))
         }
 
-        #[cfg(test)]
         pub fn with_writer(instance: impl Into<String>, out: Box<dyn Write + Send>) -> Self {
-            Self::with_writer_and_trace(instance, out, None)
-                .expect("an emitter without a trace file cannot fail to initialize")
-        }
-
-        fn with_writer_and_trace(
-            instance: impl Into<String>,
-            out: Box<dyn Write + Send>,
-            trace_path: Option<PathBuf>,
-        ) -> io::Result<Self> {
-            let trace = match trace_path {
-                Some(p) => {
-                    if let Some(parent) = p.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    Some(
-                        std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&p)?,
-                    )
-                }
-                None => None,
-            };
-            Ok(Self {
+            Self {
                 instance: instance.into(),
-                seq: AtomicU64::new(0),
-                out: Mutex::new(out),
-                trace: Mutex::new(trace),
-            })
-        }
-
-        fn now_ms() -> u64 {
-            crate::storage::util::unix_millis()
+                out: Mutex::new((0, out)),
+            }
         }
 
         pub fn emit(&self, mut event: Value) {
-            if let Some(obj) = event.as_object_mut() {
-                let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-                obj.insert("seq".into(), json!(seq));
-                obj.insert("ts".into(), json!(Self::now_ms()));
-                if !self.instance.is_empty() && !obj.contains_key("instance") {
-                    obj.insert("instance".into(), json!(self.instance));
-                }
-            }
-            let Ok(line) = serde_json::to_string(&event) else {
+            let Ok(mut guard) = self.out.lock() else {
                 return;
             };
-            if let Ok(mut trace) = self.trace.lock()
-                && let Some(f) = trace.as_mut()
-                && writeln!(f, "{line}").and_then(|()| f.flush()).is_err()
-            {
-                eprintln!("[events] failed to append to the event file");
-            }
-            if let Ok(mut out) = self.out.lock() {
+            let (seq, out) = &mut *guard;
+            *seq += 1;
+            event["seq"] = json!(*seq);
+            event["ts"] = json!(crate::storage::util::unix_millis());
+            event["instance"] = json!(self.instance);
+            if let Ok(line) = serde_json::to_string(&event) {
                 let _ = writeln!(out, "{line}");
                 let _ = out.flush();
             }
         }
-
         pub fn instance_start(
             &self,
             workspace: &str,
@@ -993,80 +637,21 @@ pub mod events {
             assert!(out[0].get("arguments").is_none());
             assert_eq!(out[0]["raw_arguments"], "not json");
         }
-
-        #[test]
-        fn event_file_creation_is_fail_fast() {
-            let parent = std::env::temp_dir().join(format!(
-                "genji-events-blocked-{}-{}",
-                std::process::id(),
-                super::EventEmitter::now_ms()
-            ));
-            let _ = std::fs::remove_file(&parent);
-            std::fs::write(&parent, "not a directory").unwrap();
-            let result = EventEmitter::new("sess-fail", Some(parent.join("events.jsonl")));
-            assert!(result.is_err());
-            let _ = std::fs::remove_file(&parent);
-        }
-
-        #[test]
-        fn events_are_appended_to_the_trace_file() {
-            let path = std::env::temp_dir().join(format!(
-                "genji-events-test-{}-{}.jsonl",
-                std::process::id(),
-                super::EventEmitter::now_ms()
-            ));
-            let _ = std::fs::remove_file(&path);
-            let e = EventEmitter::new("sess-trace", Some(path.clone())).unwrap();
-            e.user("one");
-            e.instance_end("done", 3, "report text");
-            let text = std::fs::read_to_string(&path).unwrap();
-            let parsed: Vec<Value> = text
-                .lines()
-                .map(|l| serde_json::from_str(l).unwrap())
-                .collect();
-            assert_eq!(parsed[0]["type"], "user");
-            assert_eq!(parsed[1]["type"], "instance_end");
-            assert_eq!(parsed[1]["report"], "report text");
-            let _ = std::fs::remove_file(&path);
-        }
     }
 }
 pub mod modes {
-    use anyhow::{Result, bail};
-    use clap::ValueEnum;
-    use serde::{Deserialize, Serialize};
-    use std::fmt;
-    use std::str::FromStr;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
-    #[serde(rename_all = "lowercase")]
-    pub enum Mode {
-        Plan,
-        Build,
-        Explore,
-        Retro,
+    string_enum! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Mode {
+            Plan => "plan",
+            Build => "build",
+            Explore => "explore",
+            Retro => "retro",
+        }
     }
 
     impl Mode {
-        pub const fn as_str(self) -> &'static str {
-            match self {
-                Mode::Plan => "plan",
-                Mode::Build => "build",
-                Mode::Explore => "explore",
-                Mode::Retro => "retro",
-            }
-        }
-
-        pub fn parse(s: &str) -> Result<Mode> {
-            match s.to_ascii_lowercase().as_str() {
-                "plan" => Ok(Mode::Plan),
-                "build" => Ok(Mode::Build),
-                "explore" => Ok(Mode::Explore),
-                "retro" => Ok(Mode::Retro),
-                other => bail!("unknown mode `{other}` (expected plan|build|explore|retro)"),
-            }
-        }
-
         pub const fn core_prompt(self) -> &'static str {
             match self {
                 Mode::Plan => include_str!("prompts/plan.md"),
@@ -1087,82 +672,27 @@ pub mod modes {
                 _ => "",
             }
         }
-
-        pub fn all() -> [Mode; 4] {
-            [Mode::Plan, Mode::Build, Mode::Explore, Mode::Retro]
-        }
     }
 
-    impl fmt::Display for Mode {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(self.as_str())
-        }
-    }
-
-    impl FromStr for Mode {
-        type Err = anyhow::Error;
-
-        fn from_str(s: &str) -> Result<Self> {
-            Self::parse(s)
-        }
-    }
-
-    pub fn shared_preamble() -> &'static str {
-        include_str!("prompts/shared.md")
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn retro_has_no_extended_prompt() {
-            assert!(!Mode::Retro.allows_extended());
-        }
-
-        #[test]
-        fn other_modes_are_extensible() {
-            for mode in [Mode::Plan, Mode::Build, Mode::Explore] {
-                assert!(mode.allows_extended());
-            }
-        }
-    }
+    pub const SHARED_PREAMBLE: &str = include_str!("prompts/shared.md");
 }
 pub mod proc {
     use anyhow::{Context, Result};
     use std::fs::File;
     use std::io::Read;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    use crate::storage::util::{TempPath, tmp_file};
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     pub struct ProcResult {
         pub code: Option<i32>,
         pub stdout: String,
         pub stderr: String,
         pub timed_out: bool,
-        pub duration_ms: u128,
-    }
-
-    fn tmp_path(dir: &Path, tag: &str) -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        dir.join(format!(".{tag}-{}-{n}.tmp", std::process::id()))
-    }
-
-    struct TempFiles {
-        paths: [PathBuf; 2],
-    }
-
-    impl Drop for TempFiles {
-        fn drop(&mut self) {
-            for path in &self.paths {
-                let _ = std::fs::remove_file(path);
-            }
-        }
+        pub duration_ms: u64,
     }
 
     fn read_capped(path: &Path, cap: usize) -> String {
@@ -1171,9 +701,10 @@ pub mod proc {
         };
         let mut buf = Vec::new();
         let _ = f.take(cap as u64).read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).to_string()
+        String::from_utf8_lossy(&buf).into_owned()
     }
 
+    /// Run `program`, capturing at most `max_read_bytes` of each output stream.
     pub fn run_capture(
         program: &str,
         args: &[String],
@@ -1183,13 +714,10 @@ pub mod proc {
         max_read_bytes: usize,
     ) -> Result<ProcResult> {
         std::fs::create_dir_all(tmpdir).ok();
-        let out_path = tmp_path(tmpdir, "out");
-        let err_path = tmp_path(tmpdir, "err");
-        let _temp_files = TempFiles {
-            paths: [out_path.clone(), err_path.clone()],
-        };
-        let out_file = File::create(&out_path).context("creating stdout temp")?;
-        let err_file = File::create(&err_path).context("creating stderr temp")?;
+        let out = TempPath(tmp_file(tmpdir, ".out", "tmp"));
+        let err = TempPath(tmp_file(tmpdir, ".err", "tmp"));
+        let out_file = File::create(&out.0).context("creating stdout temp")?;
+        let err_file = File::create(&err.0).context("creating stderr temp")?;
 
         let start = Instant::now();
         let mut child = Command::new(program)
@@ -1202,7 +730,6 @@ pub mod proc {
             .with_context(|| format!("spawning `{program}`"))?;
 
         let mut timed_out = false;
-        let poll = Duration::from_millis(25);
         let code = loop {
             if let Some(status) = child.try_wait()? {
                 break status.code();
@@ -1213,35 +740,16 @@ pub mod proc {
                 timed_out = true;
                 break None;
             }
-            std::thread::sleep(poll);
+            std::thread::sleep(Duration::from_millis(25));
         };
 
-        let stdout = read_capped(&out_path, max_read_bytes);
-        let stderr = read_capped(&err_path, max_read_bytes);
         Ok(ProcResult {
             code,
-            stdout,
-            stderr,
+            stdout: read_capped(&out.0, max_read_bytes),
+            stderr: read_capped(&err.0, max_read_bytes),
             timed_out,
-            duration_ms: start.elapsed().as_millis(),
+            duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
         })
-    }
-
-    pub fn run_bash(
-        command: &str,
-        cwd: &Path,
-        tmpdir: &Path,
-        timeout: Duration,
-        max_read_bytes: usize,
-    ) -> Result<ProcResult> {
-        run_capture(
-            "bash",
-            &["-c".to_string(), command.to_string()],
-            cwd,
-            tmpdir,
-            timeout,
-            max_read_bytes,
-        )
     }
 }
 pub mod registry {
@@ -1251,6 +759,8 @@ pub mod registry {
     use serde::{Deserialize, Serialize};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::storage::util::unix_secs;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Instance {
@@ -1264,7 +774,7 @@ pub mod registry {
     }
 
     impl Instance {
-        pub fn path(&self) -> PathBuf {
+        fn path(&self) -> PathBuf {
             dir().join(format!("{}.json", self.id))
         }
 
@@ -1272,20 +782,30 @@ pub mod registry {
             let d = dir();
             std::fs::create_dir_all(&d)
                 .with_context(|| format!("creating instance registry {}", d.display()))?;
+            // Write then rename so readers never see (and delete) a partial record.
             let p = self.path();
+            let tmp = p.with_extension("json.tmp");
             let text = serde_json::to_string_pretty(self)?;
-            std::fs::write(&p, format!("{text}\n"))
-                .with_context(|| format!("writing instance record {}", p.display()))?;
-            Ok(())
+            std::fs::write(&tmp, format!("{text}\n"))
+                .with_context(|| format!("writing instance record {}", tmp.display()))?;
+            std::fs::rename(&tmp, &p)
+                .with_context(|| format!("writing instance record {}", p.display()))
         }
 
         pub fn uptime_secs(&self) -> u64 {
-            now_secs().saturating_sub(self.started_at)
+            unix_secs().saturating_sub(self.started_at)
         }
 
-        pub fn is_live(&self) -> bool {
-            crate::socket::send(Path::new(&self.control_socket), "/ping")
-                .is_ok_and(|r| !r.trim().is_empty())
+        /// The live status line, or `None` when the instance does not answer.
+        pub fn status(&self) -> Option<String> {
+            let reply = crate::socket::send(Path::new(&self.control_socket), "/status").ok()?;
+            (!reply.is_empty()).then(|| {
+                reply
+                    .strip_prefix("status:")
+                    .unwrap_or(&reply)
+                    .trim()
+                    .to_string()
+            })
         }
     }
 
@@ -1303,105 +823,83 @@ pub mod registry {
         std::env::temp_dir().join("genji-instances")
     }
 
-    pub fn events_dir() -> PathBuf {
-        dir().join("events")
-    }
-
-    pub fn events_path(id: &str) -> PathBuf {
-        events_dir().join(format!("{id}.jsonl"))
-    }
-
-    pub fn now_secs() -> u64 {
-        crate::storage::util::unix_secs()
-    }
-
-    fn candidate(seed: u64) -> u64 {
-        let mut x = seed;
-        if x == 0 {
-            x = 0x9e37_79b9_7f4a_7c15;
-        }
-        // mix so small pid/time deltas spread across the id space
-        x ^= x >> 33;
-        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        x ^= x >> 33;
-        x
-    }
-
     /// A short, human-friendly instance id, unique among currently-registered ids.
     pub fn new_id() -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-        let mut x = candidate(nanos ^ (u64::from(std::process::id()) << 21));
+        let mut x =
+            (nanos ^ (u64::from(std::process::id()) << 21)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        x ^= x >> 32;
         let d = dir();
-        for _ in 0..64 {
+        loop {
             let id = format!("{:06x}", x & 0x00ff_ffff);
             if !d.join(format!("{id}.json")).exists() {
                 return id;
             }
-            x = candidate(x);
+            x = x.wrapping_add(1);
         }
-        format!(
-            "{:08x}",
-            (nanos ^ u64::from(std::process::id())) & u64::from(u32::MAX)
-        )
     }
 
-    pub fn load_all() -> Vec<Instance> {
-        let d = dir();
-        let mut out = Vec::new();
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            return out;
+    /// Every registry record, oldest first, without checking liveness.
+    /// Unreadable records are removed.
+    fn records() -> Vec<Instance> {
+        let Ok(rd) = std::fs::read_dir(dir()) else {
+            return Vec::new();
         };
-        for entry in rd.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&p) else {
-                continue;
-            };
-            match serde_json::from_str::<Instance>(&text) {
-                Ok(inst) => out.push(inst),
-                Err(_) => {
+        let mut out: Vec<Instance> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .filter_map(|p| {
+                let inst = std::fs::read_to_string(&p)
+                    .ok()
+                    .and_then(|t| serde_json::from_str(&t).ok());
+                if inst.is_none() {
                     let _ = std::fs::remove_file(&p);
                 }
-            }
-        }
-        out.sort_by_key(|i| (i.started_at, i.id.clone()));
+                inst
+            })
+            .collect();
+        out.sort_by(|a, b| (a.started_at, &a.id).cmp(&(b.started_at, &b.id)));
         out
     }
 
-    pub fn list_live() -> Vec<Instance> {
-        let mut out = Vec::new();
-        for inst in load_all() {
-            if inst.is_live() {
-                out.push(inst);
-            } else {
-                remove(&inst.id);
-            }
+    /// The instance with its live status, or `None` (and its record removed)
+    /// when it does not answer.
+    fn live(inst: Instance) -> Option<(Instance, String)> {
+        let status = inst.status();
+        if status.is_none() {
+            remove(&inst.id);
         }
-        out
+        status.map(|s| (inst, s))
     }
 
+    /// Running instances with their live status. Stale records are removed.
+    pub fn list_live() -> Vec<(Instance, String)> {
+        records().into_iter().filter_map(live).collect()
+    }
+
+    /// The running instance whose id equals or uniquely starts with `id`.
+    /// Only matching records are probed.
     pub fn find(id: &str) -> Result<Instance> {
         let id = id.trim();
-        let live = list_live();
-
-        if let Some(inst) = live.iter().find(|i| i.id == id) {
-            return Ok(inst.clone());
-        }
-
         if id.is_empty() {
             bail!("missing instance id (see `genji list`)");
         }
-
-        let matches: Vec<&Instance> = live.iter().filter(|i| i.id.starts_with(id)).collect();
-        match matches.as_slice() {
-            [inst] => Ok((*inst).clone()),
-            [] => bail!("no running genji instance with id `{id}` (see `genji list`)"),
-            many => {
-                let ids: Vec<&str> = many.iter().map(|i| i.id.as_str()).collect();
+        let mut matches: Vec<Instance> = records()
+            .into_iter()
+            .filter(|i| i.id.starts_with(id))
+            .filter_map(|i| live(i).map(|(i, _)| i))
+            .collect();
+        if let Some(i) = matches.iter().position(|i| i.id == id) {
+            return Ok(matches.swap_remove(i));
+        }
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            0 => bail!("no running genji instance with id `{id}` (see `genji list`)"),
+            _ => {
+                let ids: Vec<&str> = matches.iter().map(|i| i.id.as_str()).collect();
                 bail!(
                     "instance id `{id}` is ambiguous; matches: {} (use a longer prefix)",
                     ids.join(", ")
@@ -1417,11 +915,36 @@ pub mod registry {
 pub mod util {
     //! Small shared filesystem helpers.
 
-    #[cfg(feature = "formal")]
     use anyhow::{Context, Result};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Write `text` to `path`, creating missing parent directories.
+    pub fn write_file(path: &Path, text: impl AsRef<[u8]>) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// A unique path under `dir` for a scratch file named `<prefix>-<pid>-<n>.<ext>`.
+    pub fn tmp_file(dir: &Path, prefix: &str, ext: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!("{prefix}-{}-{n}.{ext}", std::process::id()))
+    }
+
+    /// A scratch file path removed on drop.
+    pub struct TempPath(pub PathBuf);
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     pub fn expand_home(path: &str) -> PathBuf {
         path.strip_prefix("~/").map_or_else(
@@ -1500,17 +1023,63 @@ pub mod util {
     }
 
     #[cfg(feature = "formal")]
-    pub fn assign_missing_ids(raws: &mut [MarkdownDocument]) -> Vec<bool> {
-        let mut next = next_id(raws, |raw| meta_i64(&raw.meta, "id").unwrap_or(0));
-        raws.iter_mut()
+    #[derive(Debug, Clone, Default)]
+    pub enum FieldPatch<T> {
+        #[default]
+        Keep,
+        Set(T),
+        Clear,
+    }
+
+    #[cfg(feature = "formal")]
+    impl<'de, T: serde::de::DeserializeOwned> serde::Deserialize<'de> for FieldPatch<T> {
+        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            Ok(match Option::<T>::deserialize(deserializer)? {
+                Some(value) => Self::Set(value),
+                None => Self::Clear,
+            })
+        }
+    }
+
+    #[cfg(feature = "formal")]
+    impl<T: Clone> FieldPatch<T> {
+        pub fn apply_to(&self, slot: &mut Option<T>) {
+            match self {
+                Self::Keep => {}
+                Self::Set(value) => *slot = Some(value.clone()),
+                Self::Clear => *slot = None,
+            }
+        }
+    }
+
+    /// Load every markdown record under `dir`, assigning ids to files that lack
+    /// one (and writing the id back).
+    #[cfg(feature = "formal")]
+    pub fn load_records<T>(
+        dir: &Path,
+        build: impl Fn(MarkdownDocument, i64) -> T,
+        render: impl Fn(&T) -> String,
+    ) -> Result<Vec<T>> {
+        let raws = load_markdown_dir(dir)?;
+        let mut next = next_id(&raws, |raw| meta_i64(&raw.meta, "id").unwrap_or(0));
+        raws.into_iter()
             .map(|raw| {
-                if meta_i64(&raw.meta, "id").is_some() {
-                    false
-                } else {
-                    raw.meta.insert("id".into(), next.to_string());
-                    next = next.saturating_add(1);
-                    true
+                let (id, fresh_path) = match meta_i64(&raw.meta, "id") {
+                    Some(id) => (id, None),
+                    None => {
+                        let id = next;
+                        next = next.saturating_add(1);
+                        (id, Some(raw.path.clone()))
+                    }
+                };
+                let record = build(raw, id);
+                if let Some(path) = fresh_path {
+                    write_file(&path, render(&record))?;
                 }
+                Ok(record)
             })
             .collect()
     }
@@ -1541,18 +1110,8 @@ pub mod util {
     }
 
     #[cfg(feature = "formal")]
-    pub fn write_markdown(path: &Path, text: &str) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
-    }
-
-    #[cfg(feature = "formal")]
     pub fn persist_renamed(old_path: &Path, new_path: &Path, text: &str) -> Result<()> {
-        write_markdown(new_path, text)?;
+        write_file(new_path, text)?;
         if new_path != old_path && old_path.exists() {
             let _ = std::fs::remove_file(old_path);
         }
@@ -1635,6 +1194,15 @@ pub mod util {
         (heading, body)
     }
 
+    /// A bare file-name slug: letters, digits, `-` and `_`, at most 64 chars.
+    pub fn valid_slug(slug: &str) -> bool {
+        !slug.is_empty()
+            && slug.len() <= 64
+            && slug
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }
+
     pub fn slugify(title: &str, fallback: &str) -> String {
         let mut out = String::new();
         let mut prev_dash = false;
@@ -1658,9 +1226,21 @@ pub mod util {
         }
     }
 
+    /// A fresh, empty scratch directory for a test.
+    #[cfg(test)]
+    pub fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("genji-{tag}-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::{resolve_path, slugify};
+        use super::{resolve_path, slugify, valid_slug};
         use std::path::Path;
 
         #[test]
@@ -1674,6 +1254,17 @@ pub mod util {
         }
 
         #[test]
+        fn slugs_are_safe_file_names() {
+            assert!(valid_slug("rate-limiting"));
+            assert!(valid_slug("Plan_2"));
+            assert!(!valid_slug(""));
+            assert!(!valid_slug("../escape"));
+            assert!(!valid_slug("a/b"));
+            assert!(!valid_slug("has space"));
+            assert!(!valid_slug(&"x".repeat(65)));
+        }
+
+        #[test]
         fn slugifies() {
             assert_eq!(
                 slugify("Accept image files & URLs!", "x"),
@@ -1683,6 +1274,30 @@ pub mod util {
             assert_eq!(slugify("", "plan"), "plan");
             assert_eq!(slugify("!!!", "plan"), "plan");
         }
+
+        #[cfg(feature = "formal")]
+        #[test]
+        fn heading_extraction() {
+            let titled = super::parse_markdown("test.md".into(), "intro\n# Real Title\nbody");
+            assert_eq!(titled.heading, Some("Real Title".into()));
+            assert_eq!(titled.body, "intro\nbody");
+            let plain = super::parse_markdown("test.md".into(), "no heading");
+            assert_eq!(plain.heading, None);
+            assert_eq!(plain.body, "no heading");
+        }
+
+        #[cfg(feature = "formal")]
+        #[test]
+        fn frontmatter_parsing() {
+            let doc = super::parse_markdown(
+                "test.md".into(),
+                "---\nid: 4\nlevel: system\n---\n# T\nbody\n",
+            );
+            assert_eq!(doc.meta.get("id").map(String::as_str), Some("4"));
+            assert_eq!(doc.meta.get("level").map(String::as_str), Some("system"));
+            assert_eq!(doc.heading, Some("T".into()));
+            assert_eq!(doc.body, "body");
+        }
     }
 }
 #[cfg(feature = "formal")]
@@ -1690,86 +1305,30 @@ pub mod reqmd {
     //! File-backed requirement store.
 
     use anyhow::{Context, Result};
-    use serde::{Deserialize, Serialize};
-    use std::fmt;
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
-    use std::str::FromStr;
 
     use crate::config::Config;
-    use crate::storage::db::FieldPatch;
     use crate::storage::util::{
-        assign_missing_ids, document_title, load_markdown_dir, meta_i64, next_id, nonempty_meta,
-        persist_renamed, relative_path, slugify, timestamps, write_markdown,
+        document_title, load_records, meta_i64, next_id, nonempty_meta, persist_renamed,
+        relative_path, slugify, timestamps, write_file,
     };
 
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(rename_all = "lowercase")]
-    pub enum RequirementLevel {
-        #[default]
-        Stakeholder,
-        System,
-    }
-
-    impl RequirementLevel {
-        pub const fn as_str(self) -> &'static str {
-            match self {
-                Self::Stakeholder => "stakeholder",
-                Self::System => "system",
-            }
+    string_enum! {
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+        pub enum RequirementLevel {
+            #[default]
+            Stakeholder => "stakeholder",
+            System => "system",
         }
     }
 
-    impl fmt::Display for RequirementLevel {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(self.as_str())
-        }
-    }
-
-    impl FromStr for RequirementLevel {
-        type Err = &'static str;
-
-        fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-            match s.trim().trim_matches('"').to_ascii_lowercase().as_str() {
-                "stakeholder" => Ok(Self::Stakeholder),
-                "system" => Ok(Self::System),
-                _ => Err("level must be stakeholder|system"),
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(rename_all = "lowercase")]
-    pub enum RequirementStatus {
-        #[default]
-        Active,
-        Met,
-    }
-
-    impl RequirementStatus {
-        pub const fn as_str(self) -> &'static str {
-            match self {
-                Self::Active => "active",
-                Self::Met => "met",
-            }
-        }
-    }
-
-    impl fmt::Display for RequirementStatus {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(self.as_str())
-        }
-    }
-
-    impl FromStr for RequirementStatus {
-        type Err = &'static str;
-
-        fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-            match s.trim().trim_matches('"').to_ascii_lowercase().as_str() {
-                "active" => Ok(Self::Active),
-                "met" => Ok(Self::Met),
-                _ => Err("status must be active|met"),
-            }
+    string_enum! {
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+        pub enum RequirementStatus {
+            #[default]
+            Active => "active",
+            Met => "met",
         }
     }
 
@@ -1815,10 +1374,6 @@ pub mod reqmd {
         s
     }
 
-    fn write_at(path: &Path, r: &Requirement) -> Result<()> {
-        write_markdown(path, &render(r))
-    }
-
     fn path_for(cfg: &Config, workspace: &Path, r: &Requirement) -> PathBuf {
         cfg.requirements_path(workspace).join(format!(
             "{}-{}.md",
@@ -1828,41 +1383,34 @@ pub mod reqmd {
     }
 
     pub fn load_all(cfg: &Config, workspace: &Path) -> Result<Vec<Requirement>> {
-        let mut raws = load_markdown_dir(&cfg.requirements_path(workspace))?;
-        let assigned = assign_missing_ids(&mut raws);
-
-        let mut out = Vec::new();
-        for (raw, assigned_id) in raws.into_iter().zip(assigned) {
-            let id = meta_i64(&raw.meta, "id").expect("assign_missing_ids must populate ids");
-            let level = nonempty_meta(&raw.meta, "level")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_default();
-            let title = document_title(&raw, "requirement");
-            let status = nonempty_meta(&raw.meta, "status")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_default();
-            let parent_id = meta_i64(&raw.meta, "parent");
-            let source = nonempty_meta(&raw.meta, "source").unwrap_or_else(|| "user_md".into());
-            let (created_at, updated_at) = timestamps(&raw.meta);
-
-            let req = Requirement {
-                id,
-                level,
-                title,
-                body: raw.body,
-                status,
-                parent_id,
-                source,
-                path: raw.path.clone(),
-                created_at,
-                updated_at,
-            };
-            if assigned_id {
-                write_at(&raw.path, &req)?;
-            }
-            out.push(req);
-        }
-
+        let mut out = load_records(
+            &cfg.requirements_path(workspace),
+            |raw, id| {
+                let level = nonempty_meta(&raw.meta, "level")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_default();
+                let title = document_title(&raw, "requirement");
+                let status = nonempty_meta(&raw.meta, "status")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_default();
+                let parent_id = meta_i64(&raw.meta, "parent");
+                let source = nonempty_meta(&raw.meta, "source").unwrap_or_else(|| "user_md".into());
+                let (created_at, updated_at) = timestamps(&raw.meta);
+                Requirement {
+                    id,
+                    level,
+                    title,
+                    body: raw.body,
+                    status,
+                    parent_id,
+                    source,
+                    path: raw.path,
+                    created_at,
+                    updated_at,
+                }
+            },
+            render,
+        )?;
         out.sort_by_key(|r| (i32::from(r.level != RequirementLevel::Stakeholder), r.id));
         Ok(out)
     }
@@ -1903,45 +1451,27 @@ pub mod reqmd {
         };
         let path = path_for(cfg, workspace, &req);
         req.path = path.clone();
-        write_at(&path, &req)?;
+        write_file(&path, render(&req))?;
         Ok(req)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Apply `edit` to requirement `id`, then persist it (renaming its file when
+    /// the title changed). `None` when the requirement does not exist.
     pub fn update(
         cfg: &Config,
         workspace: &Path,
         id: i64,
-        title: Option<&str>,
-        body: Option<&str>,
-        status: Option<RequirementStatus>,
-        level: Option<RequirementLevel>,
-        parent_id: FieldPatch<i64>,
-    ) -> Result<bool> {
-        let mut req = match load_by_id(cfg, workspace, id)? {
-            Some(r) => r,
-            None => return Ok(false),
+        edit: impl FnOnce(&mut Requirement),
+    ) -> Result<Option<Requirement>> {
+        let Some(mut req) = load_by_id(cfg, workspace, id)? else {
+            return Ok(None);
         };
-        if let Some(level) = level {
-            req.level = level;
-        }
-        if let Some(t) = title {
-            req.title = t.to_string();
-        }
-        if let Some(b) = body {
-            req.body = b.to_string();
-        }
-        if let Some(status) = status {
-            req.status = status;
-        }
-        parent_id.apply_to(&mut req.parent_id);
+        edit(&mut req);
         req.updated_at = crate::storage::util::unix_secs().to_string();
-
-        let old_path = req.path.clone();
         let new_path = path_for(cfg, workspace, &req);
-        req.path = new_path.clone();
-        persist_renamed(&old_path, &new_path, &render(&req))?;
-        Ok(true)
+        let old_path = std::mem::replace(&mut req.path, new_path);
+        persist_renamed(&old_path, &req.path, &render(&req))?;
+        Ok(Some(req))
     }
 
     pub fn remove(cfg: &Config, workspace: &Path, id: i64) -> Result<bool> {
@@ -1950,11 +1480,7 @@ pub mod reqmd {
         };
         std::fs::remove_file(&req.path)
             .with_context(|| format!("deleting {}", req.path.display()))?;
-        return Ok(true);
-    }
-
-    pub fn sync(cfg: &Config, workspace: &Path) -> Result<usize> {
-        Ok(load_all(cfg, workspace)?.len())
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -1964,9 +1490,7 @@ pub mod reqmd {
             remove, update,
         };
         use crate::config::Config;
-        use crate::storage::db::FieldPatch;
-        use crate::storage::util::slugify;
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use crate::storage::util::temp_dir as temp_workspace;
 
         #[test]
         fn level_from_frontmatter() {
@@ -1984,53 +1508,6 @@ pub mod reqmd {
             assert_eq!(b.level, RequirementLevel::Stakeholder);
 
             let _ = std::fs::remove_dir_all(&ws);
-        }
-
-        #[test]
-        fn heading_extraction() {
-            let titled = crate::storage::util::parse_markdown(
-                std::path::PathBuf::from("test.md"),
-                "intro\n# Real Title\nbody",
-            );
-            assert_eq!(titled.heading, Some("Real Title".into()));
-            assert_eq!(titled.body, "intro\nbody");
-            let plain = crate::storage::util::parse_markdown(
-                std::path::PathBuf::from("test.md"),
-                "no heading",
-            );
-            assert_eq!(plain.heading, None);
-            assert_eq!(plain.body, "no heading");
-        }
-
-        #[test]
-        fn frontmatter_parsing() {
-            let doc = crate::storage::util::parse_markdown(
-                std::path::PathBuf::from("test.md"),
-                "---\nid: 4\nlevel: system\n---\n# T\nbody\n",
-            );
-            assert_eq!(doc.meta.get("id").map(String::as_str), Some("4"));
-            assert_eq!(doc.meta.get("level").map(String::as_str), Some("system"));
-            assert_eq!(doc.heading, Some("T".into()));
-            assert_eq!(doc.body, "body");
-        }
-
-        #[test]
-        fn slugging() {
-            assert_eq!(
-                slugify("Accept image files & URLs!", "requirement"),
-                "accept-image-files-urls"
-            );
-            assert_eq!(slugify("", "requirement"), "requirement");
-        }
-
-        fn temp_workspace(tag: &str) -> std::path::PathBuf {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos());
-            let dir = std::env::temp_dir().join(format!("genji-reqmd-{tag}-{nanos}"));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            dir
         }
 
         #[test]
@@ -2064,17 +1541,12 @@ pub mod reqmd {
             assert_eq!(r2.id, 2);
             assert_eq!(active_count(&cfg, &ws).unwrap(), 2);
             assert!(
-                update(
-                    &cfg,
-                    &ws,
-                    2,
-                    Some("Accept Files and URLs"),
-                    None,
-                    Some(RequirementStatus::Met),
-                    None,
-                    FieldPatch::Keep
-                )
+                update(&cfg, &ws, 2, |r| {
+                    r.title = "Accept Files and URLs".into();
+                    r.status = RequirementStatus::Met;
+                })
                 .unwrap()
+                .is_some()
             );
             let r2b = load_by_id(&cfg, &ws, 2).unwrap().unwrap();
             assert_eq!(r2b.title, "Accept Files and URLs");
@@ -2086,17 +1558,7 @@ pub mod reqmd {
             );
             assert_eq!(active_count(&cfg, &ws).unwrap(), 1);
 
-            update(
-                &cfg,
-                &ws,
-                2,
-                None,
-                None,
-                None,
-                Some(RequirementLevel::Stakeholder),
-                FieldPatch::Keep,
-            )
-            .unwrap();
+            update(&cfg, &ws, 2, |r| r.level = RequirementLevel::Stakeholder).unwrap();
             let r2c = load_by_id(&cfg, &ws, 2).unwrap().unwrap();
             assert_eq!(r2c.level, RequirementLevel::Stakeholder);
             assert!(
@@ -2104,9 +1566,7 @@ pub mod reqmd {
                     .ends_with(".genji/requirements/2-accept-files-and-urls.md")
             );
 
-            assert!(remove(&cfg, &ws, 2, false).unwrap());
-            assert_eq!(active_count(&cfg, &ws).unwrap(), 1);
-            assert!(remove(&cfg, &ws, 2, true).unwrap());
+            assert!(remove(&cfg, &ws, 2).unwrap());
             assert!(load_by_id(&cfg, &ws, 2).unwrap().is_none());
             assert_eq!(load_all(&cfg, &ws).unwrap().len(), 1);
 
@@ -2140,65 +1600,33 @@ pub mod ticketmd {
     //! File-backed store for formal-mode tickets.
 
     use anyhow::Result;
-    use serde::{Deserialize, Serialize};
-    use std::fmt;
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
-    use std::str::FromStr;
 
     use crate::config::Config;
-    use crate::storage::db::TicketEdit;
     use crate::storage::util::{
-        assign_missing_ids, document_title, load_markdown_dir, meta_i64, next_id, nonempty_meta,
-        persist_renamed, relative_path, slugify, timestamps, write_markdown,
+        document_title, load_records, meta_i64, next_id, nonempty_meta, persist_renamed,
+        relative_path, slugify, timestamps, write_file,
     };
 
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum TicketStatus {
-        #[default]
-        Open,
-        InProgress,
-        Resolved,
-        Closed,
+    string_enum! {
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+        pub enum TicketStatus {
+            #[default]
+            Open => "open",
+            InProgress => "in_progress",
+            Resolved => "resolved",
+            Closed => "closed",
+        }
     }
 
     impl TicketStatus {
-        pub const fn as_str(self) -> &'static str {
-            match self {
-                Self::Open => "open",
-                Self::InProgress => "in_progress",
-                Self::Resolved => "resolved",
-                Self::Closed => "closed",
-            }
-        }
-
         pub const fn is_open(self) -> bool {
             matches!(self, Self::Open | Self::InProgress)
         }
 
         pub const fn is_done(self) -> bool {
             matches!(self, Self::Resolved | Self::Closed)
-        }
-    }
-
-    impl fmt::Display for TicketStatus {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(self.as_str())
-        }
-    }
-
-    impl FromStr for TicketStatus {
-        type Err = &'static str;
-
-        fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-            match s.trim().trim_matches('"').to_ascii_lowercase().as_str() {
-                "open" => Ok(Self::Open),
-                "in_progress" => Ok(Self::InProgress),
-                "resolved" => Ok(Self::Resolved),
-                "closed" => Ok(Self::Closed),
-                _ => Err("status must be open|in_progress|resolved|closed"),
-            }
         }
     }
 
@@ -2254,53 +1682,42 @@ pub mod ticketmd {
         s
     }
 
-    fn write_at(path: &Path, t: &Ticket) -> Result<()> {
-        write_markdown(path, &render(t))
-    }
-
     pub fn path_for(cfg: &Config, workspace: &Path, t: &Ticket) -> PathBuf {
         cfg.tickets_path(workspace)
             .join(format!("{}-{}.md", t.id, slugify(&t.title, "ticket")))
     }
 
     pub fn load_all(cfg: &Config, workspace: &Path) -> Result<Vec<Ticket>> {
-        let mut raws = load_markdown_dir(&cfg.tickets_path(workspace))?;
-        let assigned = assign_missing_ids(&mut raws);
-
-        let mut out = Vec::new();
-        for (raw, assigned_id) in raws.into_iter().zip(assigned) {
-            let id = meta_i64(&raw.meta, "id").expect("assign_missing_ids must populate ids");
-            let title = document_title(&raw, "ticket");
-            let status = nonempty_meta(&raw.meta, "status")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_default();
-            let priority = meta_i64(&raw.meta, "priority").unwrap_or(2).clamp(1, 3);
-            let parent_id = meta_i64(&raw.meta, "parent");
-            let requirement_id = meta_i64(&raw.meta, "requirement");
-            let mode = nonempty_meta(&raw.meta, "mode");
-            let resolution = nonempty_meta(&raw.meta, "resolution");
-            let (created_at, updated_at) = timestamps(&raw.meta);
-
-            let ticket = Ticket {
-                id,
-                title,
-                description: raw.body,
-                status,
-                priority,
-                parent_id,
-                requirement_id,
-                mode,
-                resolution,
-                created_at,
-                updated_at,
-                path: raw.path.clone(),
-            };
-            if assigned_id {
-                write_at(&raw.path, &ticket)?;
-            }
-            out.push(ticket);
-        }
-
+        let mut out = load_records(
+            &cfg.tickets_path(workspace),
+            |raw, id| {
+                let title = document_title(&raw, "ticket");
+                let status = nonempty_meta(&raw.meta, "status")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_default();
+                let priority = meta_i64(&raw.meta, "priority").unwrap_or(2).clamp(1, 3);
+                let parent_id = meta_i64(&raw.meta, "parent");
+                let requirement_id = meta_i64(&raw.meta, "requirement");
+                let mode = nonempty_meta(&raw.meta, "mode");
+                let resolution = nonempty_meta(&raw.meta, "resolution");
+                let (created_at, updated_at) = timestamps(&raw.meta);
+                Ticket {
+                    id,
+                    title,
+                    description: raw.body,
+                    status,
+                    priority,
+                    parent_id,
+                    requirement_id,
+                    mode,
+                    resolution,
+                    created_at,
+                    updated_at,
+                    path: raw.path,
+                }
+            },
+            render,
+        )?;
         out.sort_by_key(|t| (t.priority, t.id));
         Ok(out)
     }
@@ -2338,77 +1755,27 @@ pub mod ticketmd {
         };
         let path = path_for(cfg, workspace, &ticket);
         ticket.path = path.clone();
-        write_at(&path, &ticket)?;
+        write_file(&path, render(&ticket))?;
         Ok(ticket)
     }
 
+    /// Apply `edit` to ticket `id`, then persist it (renaming its file when the
+    /// title changed). `None` when the ticket does not exist.
     pub fn update(
         cfg: &Config,
         workspace: &Path,
         id: i64,
-        edit: &TicketEdit,
-        status: Option<TicketStatus>,
-        resolution: Option<&str>,
+        edit: impl FnOnce(&mut Ticket),
     ) -> Result<Option<Ticket>> {
-        let mut ticket = match load_by_id(cfg, workspace, id)? {
-            Some(t) => t,
-            None => return Ok(None),
+        let Some(mut ticket) = load_by_id(cfg, workspace, id)? else {
+            return Ok(None);
         };
-        if let Some(v) = &edit.title {
-            ticket.title = v.clone();
-        }
-        if let Some(v) = &edit.description {
-            ticket.description = v.clone();
-        }
-        if let Some(v) = edit.priority {
-            ticket.priority = v.clamp(1, 3);
-        }
-        edit.parent_id.apply_to(&mut ticket.parent_id);
-        edit.requirement_id.apply_to(&mut ticket.requirement_id);
-        if let Some(status) = status {
-            ticket.status = status;
-        }
-        if let Some(r) = resolution {
-            ticket.resolution = Some(r.to_string());
-        }
+        edit(&mut ticket);
+        ticket.priority = ticket.priority.clamp(1, 3);
         ticket.updated_at = crate::storage::util::unix_secs().to_string();
-
-        let old_path = ticket.path.clone();
         let new_path = path_for(cfg, workspace, &ticket);
-        ticket.path = new_path.clone();
-        persist_renamed(&old_path, &new_path, &render(&ticket))?;
+        let old_path = std::mem::replace(&mut ticket.path, new_path);
+        persist_renamed(&old_path, &ticket.path, &render(&ticket))?;
         Ok(Some(ticket))
-    }
-
-    pub fn sync(cfg: &Config, workspace: &Path) -> Result<usize> {
-        Ok(load_all(cfg, workspace)?.len())
-    }
-}
-pub mod prompts {
-    use anyhow::Result;
-
-    use crate::storage::db::Db;
-    use crate::storage::modes::Mode;
-
-    pub fn seed_prompts(db: &Db) -> Result<()> {
-        for mode in Mode::all()
-            .into_iter()
-            .filter(|mode| mode.allows_extended())
-        {
-            if db.prompt_active(mode.as_str())?.is_none() {
-                db.prompt_add_version(mode.as_str(), "", "default", "initial seed")?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn load_extended(db: &Db, mode: Mode) -> Result<String> {
-        if !mode.allows_extended() {
-            return Ok(String::new());
-        }
-        Ok(db
-            .prompt_active(mode.as_str())?
-            .map(|p| p.content)
-            .unwrap_or_default())
     }
 }

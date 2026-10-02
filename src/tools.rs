@@ -1,15 +1,13 @@
-use anyhow::{Context, Result, anyhow};
-use serde::de::DeserializeOwned;
+use anyhow::{Context, Result, anyhow, bail};
+use serde::Deserialize;
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::Agent;
 use crate::config::Config;
 use crate::storage::modes::Mode;
-use std::path::Path;
+use crate::storage::util::{relative_path, tmp_file, write_file};
 
 pub mod basic {
     use anyhow::{Context, Result, bail};
@@ -20,12 +18,13 @@ pub mod basic {
 
     use crate::agent::Agent;
     use crate::storage::proc;
+    use crate::storage::util::write_file;
 
     #[derive(Debug, Deserialize)]
     struct ReadArgs {
         path: String,
-        offset: Option<i64>,
-        limit: Option<i64>,
+        offset: Option<usize>,
+        limit: Option<usize>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -39,22 +38,21 @@ pub mod basic {
         let path = agent.resolve_path(&parsed.path);
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let offset = usize::try_from(parsed.offset.unwrap_or(1).max(1))?;
-        let limit = usize::try_from(parsed.limit.unwrap_or(2000).max(1))?;
+        let offset = parsed.offset.unwrap_or(1).max(1);
+        let limit = parsed.limit.unwrap_or(2000).max(1);
 
-        let lines: Vec<&str> = content.lines().collect();
-        let total = lines.len();
+        let total = content.lines().count();
         if total == 0 {
             return Ok(format!("{} is empty (0 lines)", path.display()));
         }
         let start = (offset - 1).min(total);
         let end = (start + limit).min(total);
         let mut out = String::new();
-        for (i, line) in lines[start..end].iter().enumerate() {
-            writeln!(out, "{:>6}\t{}", start + i + 1, line)?;
+        for (i, line) in content.lines().enumerate().take(end).skip(start) {
+            writeln!(out, "{:>6}\t{line}", i + 1)?;
         }
         if end < total {
-            writeln!(out, "\n[showing lines {}-{} of {}]", start + 1, end, total)?;
+            writeln!(out, "\n[showing lines {}-{end} of {total}]", start + 1)?;
         }
         Ok(out)
     }
@@ -62,15 +60,10 @@ pub mod basic {
     pub fn write(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: WriteArgs = super::parse_args(args)?;
         let path = agent.resolve_path(&parsed.path);
-        let content = parsed.content;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        std::fs::write(&path, &content).with_context(|| format!("writing {}", path.display()))?;
+        write_file(&path, &parsed.content)?;
         Ok(format!(
             "wrote {} bytes to {}",
-            content.len(),
+            parsed.content.len(),
             agent.display_path(&path)
         ))
     }
@@ -94,32 +87,29 @@ pub mod basic {
     }
 
     fn apply_edits(content: &str, edits: &[(String, String)], replace_all: bool) -> Result<String> {
-        if edits.len() == 1 && replace_all {
-            let (old, new) = &edits[0];
+        if let [(old, new)] = edits
+            && replace_all
+        {
             if old.is_empty() {
                 bail!("oldText must not be empty");
             }
-            let count = content.matches(old.as_str()).count();
-            if count == 0 {
+            if !content.contains(old.as_str()) {
                 bail!("oldText not found");
             }
-            return Ok(content.replace(old.as_str(), new.as_str()));
+            return Ok(content.replace(old.as_str(), new));
         }
-        let mut ranges: Vec<(usize, usize, String)> = Vec::new();
+        let mut ranges = Vec::new();
         for (old, new) in edits {
             let start = find_unique(content, old)?;
-            ranges.push((start, start + old.len(), new.clone()));
+            ranges.push((start, start + old.len(), new));
         }
-        let mut sorted = ranges;
-        sorted.sort_by_key(|r| r.0);
-        for w in sorted.windows(2) {
-            if w[0].1 > w[1].0 {
-                bail!("edit ranges overlap");
-            }
+        ranges.sort_by_key(|r| r.0);
+        if ranges.windows(2).any(|w| w[0].1 > w[1].0) {
+            bail!("edit ranges overlap");
         }
         let mut out = content.to_string();
-        for (start, end, new) in sorted.into_iter().rev() {
-            out.replace_range(start..end, &new);
+        for (start, end, new) in ranges.into_iter().rev() {
+            out.replace_range(start..end, new);
         }
         Ok(out)
     }
@@ -128,14 +118,18 @@ pub mod basic {
     struct EditArgs {
         path: String,
         edits: Option<Vec<EditEntry>>,
-        #[serde(rename = "oldText", alias = "old_text")] old_text: Option<String>,
-        #[serde(rename = "newText", alias = "new_text")] new_text: Option<String>,
+        #[serde(rename = "oldText", alias = "old_text")]
+        old_text: Option<String>,
+        #[serde(rename = "newText", alias = "new_text")]
+        new_text: Option<String>,
         replace_all: Option<bool>,
     }
     #[derive(Debug, Deserialize)]
     struct EditEntry {
-        #[serde(rename = "oldText", alias = "old_text")] old_text: String,
-        #[serde(rename = "newText", alias = "new_text")] new_text: String,
+        #[serde(rename = "oldText", alias = "old_text")]
+        old_text: String,
+        #[serde(rename = "newText", alias = "new_text")]
+        new_text: String,
     }
 
     pub fn edit(agent: &mut Agent, args: &Value) -> Result<String> {
@@ -145,19 +139,23 @@ pub mod basic {
             .with_context(|| format!("reading {}", path.display()))?;
 
         let replace_all = parsed.replace_all.unwrap_or(false);
-        let mut edits: Vec<(String, String)> = parsed.edits.unwrap_or_default()
-            .into_iter().map(|e| (e.old_text, e.new_text)).collect();
+        let mut edits: Vec<(String, String)> = parsed
+            .edits
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.old_text, e.new_text))
+            .collect();
         if edits.is_empty()
-            && let (Some(old), Some(new)) = (parsed.old_text, parsed.new_text) {
-                edits.push((old, new));
-            }
+            && let (Some(old), Some(new)) = (parsed.old_text, parsed.new_text)
+        {
+            edits.push((old, new));
+        }
         if edits.is_empty() {
             bail!("no edits supplied (provide `edits` array or `oldText`/`newText`)");
         }
 
         let new_content = apply_edits(&content, &edits, replace_all)?;
-        std::fs::write(&path, &new_content)
-            .with_context(|| format!("writing {}", path.display()))?;
+        write_file(&path, &new_content)?;
         Ok(format!(
             "applied {} edit(s) to {} ({} -> {} bytes)",
             edits.len(),
@@ -168,7 +166,11 @@ pub mod basic {
     }
 
     #[derive(Debug, Deserialize)]
-    struct LsArgs { path: Option<String>, show_hidden: Option<bool>, max_depth: Option<i64> }
+    struct LsArgs {
+        path: Option<String>,
+        show_hidden: Option<bool>,
+        max_depth: Option<usize>,
+    }
 
     pub fn ls(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: LsArgs = super::parse_args(args)?;
@@ -178,18 +180,14 @@ pub mod basic {
             bail!("path does not exist: {}", root.display());
         }
         let show_hidden = parsed.show_hidden.unwrap_or(false);
-        let max_depth = parsed.max_depth.unwrap_or(0).max(0);
 
         let mut builder = ignore::WalkBuilder::new(&root);
         builder
             .hidden(!show_hidden)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .ignore(true)
             .parents(false)
             .require_git(false)
-            .max_depth(Some(usize::try_from(max_depth + 1)?));
+            .sort_by_file_path(Ord::cmp)
+            .max_depth(Some(parsed.max_depth.unwrap_or(0) + 1));
 
         let mut lines: Vec<String> = Vec::new();
         let mut dirs = 0usize;
@@ -200,11 +198,7 @@ pub mod basic {
                 continue; // skip the root itself
             }
             let path = entry.path();
-            let rel_path = path
-                .strip_prefix(&agent.workspace)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
+            let rel_path = agent.display_path(path);
             let Ok(meta) = entry.metadata() else { continue };
             if meta.is_dir() {
                 dirs += 1;
@@ -214,12 +208,11 @@ pub mod basic {
                 lines.push(format!("f {:>8} {rel_path}", meta.len()));
             }
         }
-        lines.sort();
         let mut out = lines.join("\n");
         if out.is_empty() {
             out = "(empty)".into();
         }
-        out.push_str(&format!("\n\n[{dirs} dirs, {files} files under {rel}]"));
+        let _ = write!(out, "\n\n[{dirs} dirs, {files} files under {rel}]");
         Ok(out)
     }
 
@@ -245,34 +238,28 @@ pub mod basic {
                 }),
         );
         let cap = agent.cfg.tool_result_max_bytes.saturating_mul(2).max(8192);
-        let res = proc::run_bash(
-            &command,
+        let res = proc::run_capture(
+            "bash",
+            &["-c".to_string(), command.clone()],
             &cwd,
             &agent.cfg.tmp_path(&agent.workspace),
             timeout,
             cap,
         )
         .with_context(|| format!("running command: {command}"))?;
-        let mut out = String::new();
-        out.push_str(&format!(
+        let mut out = format!(
             "exit_code: {}\n",
             res.code.map_or_else(|| "none".into(), |c| c.to_string())
-        ));
+        );
         if res.timed_out {
-            out.push_str(&format!("[timed out after {}s]\n", timeout.as_secs()));
+            let _ = writeln!(out, "[timed out after {}s]", timeout.as_secs());
         }
-        if !res.stdout.is_empty() {
-            out.push_str("--- stdout ---\n");
-            out.push_str(&res.stdout);
-            if !res.stdout.ends_with('\n') {
-                out.push('\n');
-            }
-        }
-        if !res.stderr.is_empty() {
-            out.push_str("--- stderr ---\n");
-            out.push_str(&res.stderr);
-            if !res.stderr.ends_with('\n') {
-                out.push('\n');
+        for (label, text) in [("stdout", &res.stdout), ("stderr", &res.stderr)] {
+            if !text.is_empty() {
+                let _ = write!(out, "--- {label} ---\n{text}");
+                if !text.ends_with('\n') {
+                    out.push('\n');
+                }
             }
         }
         Ok(out)
@@ -327,7 +314,7 @@ pub mod basic {
     }
 }
 pub mod plans {
-    use anyhow::{Context, Result};
+    use anyhow::Result;
     use serde::Deserialize;
     use serde_json::Value;
     use std::path::{Path, PathBuf};
@@ -335,7 +322,7 @@ pub mod plans {
     use super::parse_args;
     use crate::agent::Agent;
     use crate::config::Config;
-    use crate::storage::util::slugify;
+    use crate::storage::util::{slugify, write_file};
 
     pub fn write_plan(
         cfg: &Config,
@@ -344,42 +331,34 @@ pub mod plans {
         content: &str,
         path: Option<&str>,
     ) -> Result<PathBuf> {
-        let rel = match path {
-            Some(p) => p.to_string(),
-            None => format!(
-                "{}/{}.md",
-                cfg.plans_dir.trim_end_matches('/'),
-                slugify(title, "plan")
-            ),
+        let path = match path {
+            Some(p) => crate::storage::util::resolve_path(workspace, p),
+            None => cfg.plan_file(workspace, &slugify(title, "plan")),
         };
-        let path = crate::storage::util::resolve_path(workspace, &rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
         let body = if content.trim_start().starts_with("# ") {
             content.to_string()
         } else {
             format!("# {}\n\n{}", title.trim(), content.trim_start())
         };
-        std::fs::write(&path, &body).with_context(|| format!("writing {}", path.display()))?;
+        write_file(&path, &body)?;
         Ok(path)
     }
 
     #[derive(Debug, Deserialize)]
-    struct WriteArgs { title: String, content: String, path: Option<String> }
+    struct WriteArgs {
+        title: String,
+        content: String,
+        path: Option<String>,
+    }
 
     pub fn write(agent: &mut Agent, args: &Value) -> Result<String> {
-        let parsed: WriteArgs = parse_args(args)?;
-        let title = parsed.title;
-        let content = parsed.content;
-        let explicit = parsed.path;
+        let a: WriteArgs = parse_args(args)?;
         let path = write_plan(
             &agent.cfg,
             &agent.workspace,
-            &title,
-            &content,
-            explicit.as_deref(),
+            &a.title,
+            &a.content,
+            a.path.as_deref(),
         )?;
         Ok(format!("wrote plan to {}", agent.display_path(&path)))
     }
@@ -388,17 +367,7 @@ pub mod plans {
     mod tests {
         use super::write_plan;
         use crate::config::Config;
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        fn temp_workspace(tag: &str) -> std::path::PathBuf {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos());
-            let dir = std::env::temp_dir().join(format!("genji-plans-{tag}-{nanos}"));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            dir
-        }
+        use crate::storage::util::temp_dir as temp_workspace;
 
         #[test]
         fn writes_plan_under_plans_dir_with_heading() {
@@ -438,21 +407,21 @@ pub mod requirements {
     use serde::Deserialize;
     use serde_json::Value;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt::Write as _;
     use std::path::Path;
-
 
     use crate::agent::Agent;
     use crate::config::Config;
-    use crate::storage::db::FieldPatch;
     use crate::storage::reqmd::{self, Requirement, RequirementLevel, RequirementStatus};
+    use crate::storage::util::FieldPatch;
 
     fn fmt_req(r: &Requirement, workspace: &Path, full: bool) -> String {
         let mut s = format!("#{} [{}:{}] {}\n", r.id, r.level, r.status, r.title);
         if let Some(p) = r.parent_id {
-            s.push_str(&format!("parent: #{p}\n"));
+            let _ = writeln!(s, "parent: #{p}");
         }
-        s.push_str(&format!("source: {}\n", r.source));
-        s.push_str(&format!("source_path: {}\n", r.display_path(workspace)));
+        let _ = writeln!(s, "source: {}", r.source);
+        let _ = writeln!(s, "source_path: {}", r.display_path(workspace));
         let body = r.body.trim();
         if !body.is_empty() {
             s.push('\n');
@@ -470,51 +439,53 @@ pub mod requirements {
         s
     }
 
-    fn parse_level_arg(level: &str) -> Result<RequirementLevel> {
-        level
-            .parse()
-            .map_err(|_| anyhow::anyhow!("level must be `stakeholder` or `system`"))
-    }
-
-    fn parse_status_arg(status: &str) -> Result<RequirementStatus> {
-        status
-            .parse()
-            .map_err(|_| anyhow::anyhow!("status must be active|met|removed"))
-    }
-
     #[derive(Debug, Deserialize)]
-    struct CreateArgs { level: String, title: String, body: String, parent_id: Option<i64> }
+    struct CreateArgs {
+        level: RequirementLevel,
+        title: String,
+        body: String,
+        parent_id: Option<i64>,
+    }
     #[derive(Debug, Deserialize)]
-    struct ReadArgs { id: Option<i64>, level: Option<String>, status: Option<String> }
+    struct ReadArgs {
+        id: Option<i64>,
+        level: Option<RequirementLevel>,
+        status: Option<RequirementStatus>,
+    }
     #[derive(Debug, Deserialize)]
     struct UpdateArgs {
         id: i64,
         title: Option<String>,
         body: Option<String>,
-        status: Option<String>,
-        level: Option<String>,
-        #[serde(default)] parent_id: FieldPatch<i64>,
+        status: Option<RequirementStatus>,
+        level: Option<RequirementLevel>,
+        #[serde(default)]
+        parent_id: FieldPatch<i64>,
     }
     #[derive(Debug, Deserialize)]
-    struct RemoveArgs { id: i64 }
+    struct RemoveArgs {
+        id: i64,
+    }
     #[derive(Debug, Deserialize)]
-    struct TreeArgs { status: Option<String> }
+    struct TreeArgs {
+        status: Option<RequirementStatus>,
+    }
     #[derive(Debug, Deserialize)]
-    struct AskArgs { question: String, requirement_id: Option<i64> }
+    struct AskArgs {
+        question: String,
+        requirement_id: Option<i64>,
+    }
 
     pub fn create(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: CreateArgs = super::parse_args(args)?;
-        let level = parse_level_arg(&parsed.level)?;
-        let title = parsed.title;
-        let body = parsed.body;
-        let parent_id = parsed.parent_id;
+        let level = parsed.level;
         let r = reqmd::create(
             &agent.cfg,
             &agent.workspace,
             level,
-            &title,
-            &body,
-            parent_id,
+            &parsed.title,
+            &parsed.body,
+            parsed.parent_id,
             "agent",
         )?;
         Ok(format!(
@@ -557,48 +528,49 @@ pub mod requirements {
 
     pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: ReadArgs = super::parse_args(args)?;
-        let level = parsed.level.as_deref().map(parse_level_arg).transpose()?;
-        let status = parsed.status.as_deref().map(parse_status_arg).transpose()?;
-        read_requirements(&agent.cfg, &agent.workspace, parsed.id, level, status)
+        read_requirements(
+            &agent.cfg,
+            &agent.workspace,
+            parsed.id,
+            parsed.level,
+            parsed.status,
+        )
     }
 
     pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: UpdateArgs = super::parse_args(args)?;
         let id = parsed.id;
-        let status = parsed.status.as_deref().map(parse_status_arg).transpose()?;
-        let level = parsed.level.as_deref().map(parse_level_arg).transpose()?;
-        let parent_id = parsed.parent_id;
-        if !reqmd::update(
-            &agent.cfg,
-            &agent.workspace,
-            id,
-            parsed.title.as_deref(),
-            parsed.body.as_deref(),
-            status,
-            level,
-            parent_id,
-        )? {
-            bail!("requirement #{id} not found");
-        }
+        reqmd::update(&agent.cfg, &agent.workspace, id, |r| {
+            if let Some(v) = parsed.title {
+                r.title = v;
+            }
+            if let Some(v) = parsed.body {
+                r.body = v;
+            }
+            if let Some(v) = parsed.status {
+                r.status = v;
+            }
+            if let Some(v) = parsed.level {
+                r.level = v;
+            }
+            parsed.parent_id.apply_to(&mut r.parent_id);
+        })?
+        .ok_or_else(|| anyhow::anyhow!("requirement #{id} not found"))?;
         Ok(format!("updated requirement #{id}"))
     }
 
     pub fn remove(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: RemoveArgs = super::parse_args(args)?;
         let id = parsed.id;
-        if !reqmd::remove(&agent.cfg, &agent.workspace, id, hard)? {
+        if !reqmd::remove(&agent.cfg, &agent.workspace, id)? {
             bail!("requirement #{id} not found");
         }
-        Ok(format!(
-            "{} requirement #{id}",
-            if hard { "deleted" } else { "removed" }
-        ))
+        Ok(format!("deleted requirement #{id}"))
     }
 
     pub fn tree(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: TreeArgs = super::parse_args(args)?;
-        let filter = parsed.status.as_deref()
-            .map(parse_status_arg).transpose()?;
+        let filter = parsed.status;
         let reqs: Vec<Requirement> = reqmd::load_all(&agent.cfg, &agent.workspace)?
             .into_iter()
             .filter(|r| filter.is_none_or(|s| r.status == s))
@@ -607,7 +579,7 @@ pub mod requirements {
             return Ok("(no requirements)".into());
         }
 
-        let tickets = super::tickets::list_all(agent)?;
+        let tickets = crate::storage::ticketmd::load_all(&agent.cfg, &agent.workspace)?;
         let mut open: BTreeMap<i64, i64> = BTreeMap::new();
         let mut done: BTreeMap<i64, i64> = BTreeMap::new();
         for t in &tickets {
@@ -631,7 +603,8 @@ pub mod requirements {
         }
 
         let mut out = String::new();
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "requirements: {} active / {} total, tickets: {} open / {} done\n\n",
             reqs.iter()
                 .filter(|r| r.status == RequirementStatus::Active)
@@ -639,7 +612,7 @@ pub mod requirements {
             reqs.len(),
             tickets.iter().filter(|t| t.status.is_open()).count(),
             tickets.iter().filter(|t| t.status.is_done()).count(),
-        ));
+        );
         let mut visited = BTreeSet::new();
         if let Some(roots) = children.get(&None) {
             for r in roots {
@@ -670,10 +643,11 @@ pub mod requirements {
         let indent = "  ".repeat(depth);
         let o = open.get(&req.id).copied().unwrap_or(0);
         let d = done.get(&req.id).copied().unwrap_or(0);
-        out.push_str(&format!(
-            "{indent}#{} [{}:{}] {}  (tickets: {o} open / {d} done)\n",
+        let _ = writeln!(
+            out,
+            "{indent}#{} [{}:{}] {}  (tickets: {o} open / {d} done)",
             req.id, req.level, req.status, req.title
-        ));
+        );
         if let Some(kids) = children.get(&Some(req.id)) {
             for k in kids {
                 render_tree(k, children, open, done, depth + 1, visited, out);
@@ -684,11 +658,9 @@ pub mod requirements {
     pub fn ask(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: AskArgs = super::parse_args(args)?;
         let question = parsed.question;
-        let requirement_id = parsed.requirement_id;
         let qid = agent
             .db
-            .question_ask(requirement_id, &agent.instance_id, &question)?;
-
+            .question_ask(parsed.requirement_id, &agent.instance_id, &question)?;
         Ok(format!(
             "recorded question #{qid}: {question}\n(no interactive user available; relay this question to the user)"
         ))
@@ -698,19 +670,8 @@ pub mod requirements {
     mod tests {
         use super::read_requirements;
         use crate::config::Config;
-        use crate::storage::db::FieldPatch;
         use crate::storage::reqmd::{self, RequirementLevel, RequirementStatus};
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        fn temp_workspace(tag: &str) -> std::path::PathBuf {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos());
-            let dir = std::env::temp_dir().join(format!("genji-reqtools-{tag}-{nanos}"));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            dir
-        }
+        use crate::storage::util::temp_dir as temp_workspace;
 
         #[test]
         fn reads_one_by_id_and_lists_with_filters() {
@@ -736,17 +697,7 @@ pub mod requirements {
                 "agent",
             )
             .unwrap();
-            reqmd::update(
-                &cfg,
-                &ws,
-                child.id,
-                None,
-                None,
-                Some(RequirementStatus::Met),
-                None,
-                FieldPatch::Keep,
-            )
-            .unwrap();
+            reqmd::update(&cfg, &ws, child.id, |r| r.status = RequirementStatus::Met).unwrap();
 
             // By id: the full requirement body, with no filtering applied.
             let one = read_requirements(&cfg, &ws, Some(parent.id), None, None).unwrap();
@@ -784,541 +735,278 @@ pub mod requirements {
     }
 }
 pub mod retro {
-    use anyhow::{Result, bail};
-    use rusqlite::params;
+    use anyhow::Result;
+    use rusqlite::{Params, Row, params};
+    use serde::Deserialize;
     use serde_json::Value;
+    use std::fmt::Write as _;
 
-    use super::{opt_bool, opt_i64, opt_str, req_str};
+    use super::parse_args;
     use crate::agent::Agent;
-    use crate::storage::db::PromptVersionRow;
-    use crate::storage::modes::Mode;
+
+    fn rows_text<P: Params>(
+        agent: &Agent,
+        sql: &str,
+        p: P,
+        empty: &str,
+        fmt: impl FnMut(&Row) -> rusqlite::Result<String>,
+    ) -> Result<String> {
+        let mut stmt = agent.db.conn.prepare_cached(sql)?;
+        let out = stmt
+            .query_map(p, fmt)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .concat();
+        Ok(if out.is_empty() { empty.into() } else { out })
+    }
+
+    #[derive(Deserialize)]
+    struct InstancesArgs {
+        mode: Option<String>,
+        limit: Option<i64>,
+    }
+    #[derive(Deserialize)]
+    struct MessagesArgs {
+        instance_id: Option<String>,
+        role: Option<String>,
+        search: Option<String>,
+        limit: Option<i64>,
+    }
+    #[derive(Deserialize)]
+    struct ToolCallsArgs {
+        instance_id: Option<String>,
+        name: Option<String>,
+        errors_only: Option<bool>,
+        limit: Option<i64>,
+    }
 
     pub fn instances(agent: &mut Agent, args: &Value) -> Result<String> {
-        let limit = opt_i64(args, "limit").unwrap_or(20).clamp(1, 500);
-        let mode = opt_str(args, "mode");
-        let mut stmt = agent.db.conn.prepare(
-            "SELECT id,mode,parent_instance,depth,status,tokens_used,started_at,substr(COALESCE(task,''),1,80) FROM instances WHERE (?1 IS NULL OR mode = ?1) ORDER BY started_at DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![mode, limit], |r| {
-            Ok(format!(
-                "{}\t{}\tdepth={}\t{}\ttokens={}\t{}\t{}\n",
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, String>(6)?,
-                r.get::<_, String>(7)?
-            ))
-        })?;
-        let mut out = String::new();
-        for row in rows {
-            out.push_str(&row?);
-        }
-        if out.is_empty() {
-            out = "(no instances)".into();
-        }
-        Ok(out)
+        let a: InstancesArgs = parse_args(args)?;
+        rows_text(
+            agent,
+            "SELECT id,mode,depth,status,tokens_used,started_at,substr(COALESCE(task,''),1,80) FROM instances WHERE (?1 IS NULL OR mode = ?1) ORDER BY started_at DESC LIMIT ?2",
+            params![a.mode, a.limit.unwrap_or(20).clamp(1, 500)],
+            "(no instances)",
+            |r| {
+                Ok(format!(
+                    "{}\t{}\tdepth={}\t{}\ttokens={}\t{}\t{}\n",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?
+                ))
+            },
+        )
     }
 
-    pub fn instance(agent: &mut Agent, args: &Value) -> Result<String> {
-        let sid = req_str(args, "instance_id")?;
-        let limit = opt_i64(args, "limit").unwrap_or(200).clamp(1, 2000);
-        let mut stmt = agent.db.conn.prepare(
-        "SELECT seq,role,content,tool_calls FROM messages WHERE instance_id=? ORDER BY seq LIMIT ?",
-    )?;
-        let rows = stmt.query_map(params![sid, limit], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        let mut out = String::new();
-        for row in rows {
-            let (seq, role, content, tc) = row?;
-            let snippet: String = content.chars().take(500).collect();
-            out.push_str(&format!("#{seq} [{role}] {snippet}\n"));
-            if let Some(tc) = tc
-                && tc != "null"
-                && !tc.is_empty()
-            {
-                out.push_str(&format!(
-                    "    tool_calls: {}\n",
-                    tc.chars().take(200).collect::<String>()
-                ));
-            }
-        }
-        if out.is_empty() {
-            out = format!("(instance {sid} has no messages)");
-        }
-        Ok(out)
-    }
-
+    /// The latest `limit` matching messages, oldest first, so one instance reads as a conversation.
     pub fn messages(agent: &mut Agent, args: &Value) -> Result<String> {
-        let limit = opt_i64(args, "limit").unwrap_or(50).clamp(1, 500);
-        let instance_id = opt_str(args, "instance_id");
-        let role = opt_str(args, "role");
-        let search = opt_str(args, "search").map(|q| format!("%{q}%"));
-        let mut stmt = agent.db.conn.prepare(
-            "SELECT instance_id,seq,role,substr(content,1,400),created_at FROM messages WHERE (?1 IS NULL OR instance_id = ?1) AND (?2 IS NULL OR role = ?2) AND (?3 IS NULL OR content LIKE ?3) ORDER BY id DESC LIMIT ?4",
-        )?;
-        let rows = stmt.query_map(params![instance_id, role, search, limit], |r| {
-            Ok(format!(
-                "{}\t#{} [{}]\t{}\t{}\n",
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(3)?
-            ))
-        })?;
-        let mut out = String::new();
-        for row in rows {
-            out.push_str(&row?);
-        }
-        if out.is_empty() {
-            out = "(no matching messages)".into();
-        }
-        Ok(out)
+        let a: MessagesArgs = parse_args(args)?;
+        let search = a.search.map(|q| format!("%{q}%"));
+        rows_text(
+            agent,
+            "SELECT * FROM (SELECT id,instance_id,seq,role,created_at,substr(content,1,500),substr(tool_calls,1,200) FROM messages WHERE (?1 IS NULL OR instance_id = ?1) AND (?2 IS NULL OR role = ?2) AND (?3 IS NULL OR content LIKE ?3) ORDER BY id DESC LIMIT ?4) ORDER BY id",
+            params![
+                a.instance_id,
+                a.role,
+                search,
+                a.limit.unwrap_or(50).clamp(1, 2000)
+            ],
+            "(no matching messages)",
+            |r| {
+                let mut s = format!(
+                    "{}\t#{} [{}]\t{}\t{}\n",
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?
+                );
+                if let Some(tc) = r.get::<_, Option<String>>(6)? {
+                    let _ = writeln!(s, "    tool_calls: {tc}");
+                }
+                Ok(s)
+            },
+        )
     }
 
     pub fn tool_calls(agent: &mut Agent, args: &Value) -> Result<String> {
-        let limit = opt_i64(args, "limit").unwrap_or(50).clamp(1, 500);
-        let instance_id = opt_str(args, "instance_id");
-        let name = opt_str(args, "name");
-        let errors_only = opt_bool(args, "errors_only").unwrap_or(false);
-        let mut stmt = agent.db.conn.prepare(
+        let a: ToolCallsArgs = parse_args(args)?;
+        rows_text(
+            agent,
             "SELECT instance_id,name,is_error,duration_ms,substr(args,1,160),substr(result,1,300),created_at FROM tool_calls WHERE (?1 IS NULL OR instance_id = ?1) AND (?2 IS NULL OR name = ?2) AND (?3 = 0 OR is_error = 1) ORDER BY id DESC LIMIT ?4",
-        )?;
-        let rows = stmt.query_map(params![instance_id, name, errors_only, limit], |r| {
-            Ok(format!(
-                "{}\t{}\terr={}\t{}ms\t{}\n  args: {}\n  result: {}\n",
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, String>(6)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-            ))
-        })?;
-        let mut out = String::new();
-        for row in rows {
-            out.push_str(&row?);
-        }
-        if out.is_empty() {
-            out = "(no matching tool calls)".into();
-        }
-        Ok(out)
+            params![
+                a.instance_id,
+                a.name,
+                a.errors_only.unwrap_or(false),
+                a.limit.unwrap_or(50).clamp(1, 500)
+            ],
+            "(no matching tool calls)",
+            |r| {
+                Ok(format!(
+                    "{}\t{}\terr={}\t{}ms\t{}\n  args: {}\n  result: {}\n",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            },
+        )
     }
 
     pub fn stats(agent: &mut Agent, _args: &Value) -> Result<String> {
-        let mut out = String::new();
-        let (instances, tokens): (i64, i64) = agent.db.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(tokens_used),0) FROM instances",
+        let (instances, tokens, compactions): (i64, i64, i64) = agent.db.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(tokens_used),0), (SELECT COUNT(*) FROM compactions) FROM instances",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        out.push_str(&format!("instances: {instances}, total tokens: {tokens}\n"));
-        out.push_str("instances by mode:\n");
-        {
-            let mut stmt = agent
-                .db
-                .conn
-                .prepare("SELECT mode,COUNT(*) FROM instances GROUP BY mode ORDER BY 2 DESC")?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-            for row in rows {
-                let (m, c) = row?;
-                out.push_str(&format!("  {m}: {c}\n"));
-            }
-        }
-        out.push_str("tool calls (name, count, errors, avg_ms):\n");
-        {
-            let mut stmt = agent.db.conn.prepare(
-                "SELECT name,COUNT(*),COALESCE(SUM(is_error),0),CAST(AVG(duration_ms) AS INT)
-             FROM tool_calls GROUP BY name ORDER BY 2 DESC",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
+        let by_mode = rows_text(
+            agent,
+            "SELECT mode,COUNT(*) FROM instances GROUP BY mode ORDER BY 2 DESC",
+            [],
+            "  (none)\n",
+            |r| {
+                Ok(format!(
+                    "  {}: {}\n",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?
+                ))
+            },
+        )?;
+        let tools = rows_text(
+            agent,
+            "SELECT name,COUNT(*),COALESCE(SUM(is_error),0),CAST(AVG(duration_ms) AS INT) FROM tool_calls GROUP BY name ORDER BY 2 DESC",
+            [],
+            "  (none)\n",
+            |r| {
+                Ok(format!(
+                    "  {}: calls={} errors={} avg={}ms\n",
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(3)?
                 ))
-            })?;
-            for row in rows {
-                let (n, c, e, d) = row?;
-                out.push_str(&format!("  {n}: calls={c} errors={e} avg={d}ms\n"));
-            }
-        }
-        out.push_str("skills by loads:\n");
-        {
-            let mut stmt = agent.db.conn.prepare(
-            "SELECT skill_name,COUNT(*) FROM skill_loads GROUP BY skill_name ORDER BY 2 DESC LIMIT 20",
+            },
         )?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-            let mut any = false;
-            for row in rows {
-                let (n, c) = row?;
-                any = true;
-                out.push_str(&format!("  {n}: {c}\n"));
-            }
-            if !any {
-                out.push_str("  (none)\n");
-            }
-        }
-        let compactions: i64 =
-            agent
-                .db
-                .conn
-                .query_row("SELECT COUNT(*) FROM compactions", [], |r| r.get(0))?;
-        out.push_str(&format!("compactions: {compactions}\n"));
-        Ok(out)
-    }
-
-    fn parse_mode(s: &str) -> Result<Mode> {
-        let mode = Mode::parse(s)?;
-        if !mode.allows_extended() {
-            bail!(
-                "mode `{}` does not support an extended prompt",
-                mode.as_str()
-            );
-        }
-        Ok(mode)
-    }
-
-    pub fn prompt_read(agent: &mut Agent, args: &Value) -> Result<String> {
-        let mode = parse_mode(&req_str(args, "mode")?)?;
-        match agent.db.prompt_active(mode.as_str())? {
-            Some(p) => Ok(format!(
-                "mode={} version={} author={} created={}\n\n{}",
-                mode.as_str(),
-                p.version,
-                p.author,
-                p.created_at,
-                p.content
-            )),
-            None => Ok(format!("(no active extended prompt for {})", mode.as_str())),
-        }
-    }
-
-    pub fn prompt_edit(agent: &mut Agent, args: &Value) -> Result<String> {
-        let mode = parse_mode(&req_str(args, "mode")?)?;
-        let content = req_str(args, "content")?;
-        let reason = opt_str(args, "reason").unwrap_or_default();
-        let version = agent
-            .db
-            .prompt_add_version(mode.as_str(), &content, "retro", &reason)?;
-        // Keep the in-memory system prompt fresh if we edited our own mode.
-        agent.refresh_system_prompt()?;
+        let skills = rows_text(
+            agent,
+            "SELECT json_extract(args,'$.name'),COUNT(*) FROM tool_calls WHERE name='skill_load' GROUP BY 1 ORDER BY 2 DESC LIMIT 20",
+            [],
+            "  (none)\n",
+            |r| {
+                Ok(format!(
+                    "  {}: {}\n",
+                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    r.get::<_, i64>(1)?
+                ))
+            },
+        )?;
         Ok(format!(
-            "updated extended prompt for `{}` to v{version}",
-            mode.as_str()
-        ))
-    }
-
-    pub fn prompt_history(agent: &mut Agent, args: &Value) -> Result<String> {
-        let mode = parse_mode(&req_str(args, "mode")?)?;
-        let versions: Vec<PromptVersionRow> = agent.db.prompt_versions(mode.as_str())?;
-        if versions.is_empty() {
-            return Ok(format!("(no versions for {})", mode.as_str()));
-        }
-        let mut out = String::new();
-        for v in versions {
-            out.push_str(&format!(
-                "v{}\t{}\tactive={}\tby {}\t{}\t{}B\n",
-                v.version,
-                v.created_at,
-                v.active,
-                v.author,
-                v.reason,
-                v.content.len()
-            ));
-        }
-        Ok(out)
-    }
-
-    pub fn prompt_rollback(agent: &mut Agent, args: &Value) -> Result<String> {
-        let mode = parse_mode(&req_str(args, "mode")?)?;
-        let version = opt_i64(args, "version").ok_or_else(|| anyhow::anyhow!("missing version"))?;
-        if !agent.db.prompt_activate(mode.as_str(), version)? {
-            bail!("mode {} has no version {}", mode.as_str(), version);
-        }
-        agent.refresh_system_prompt()?;
-        Ok(format!(
-            "activated v{version} for `{}` extended prompt",
-            mode.as_str()
+            "instances: {instances}, total tokens: {tokens}\ninstances by mode:\n{by_mode}tool calls (name, count, errors, avg_ms):\n{tools}skills by loads:\n{skills}compactions: {compactions}\n"
         ))
     }
 }
 pub mod skills {
-    use anyhow::{Context, Result, bail};
+    use anyhow::{Result, bail};
+    use serde::Deserialize;
     use serde_json::Value;
-    use std::path::Path;
+    use std::path::PathBuf;
 
-    use super::{opt_i64, opt_str, req_str};
+    use super::parse_args;
     use crate::agent::Agent;
-    use crate::storage::db::Db;
-    use crate::storage::util::split_frontmatter;
+    use crate::config::Config;
+    use crate::storage::util::{split_frontmatter, valid_slug};
 
-    pub fn parse_skill(text: &str, fallback_name: &str) -> (String, String, String) {
-        let (meta, body) = split_frontmatter(text);
-        let name = meta
-            .get("name")
-            .cloned()
-            .unwrap_or_else(|| fallback_name.to_string());
-        let description = meta.get("description").cloned().unwrap_or_default();
-        (name, description, body)
+    fn skill_files(cfg: &Config, workspace: &std::path::Path) -> impl Iterator<Item = PathBuf> {
+        std::fs::read_dir(cfg.skills_path(workspace))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
     }
 
-    fn render_skill(name: &str, description: &str, content: &str) -> String {
-        format!(
-            "---\nname: {name}\ndescription: {}\n---\n\n{}\n",
-            description.replace('\n', " "),
-            content.trim_end()
-        )
+    fn names(cfg: &Config, workspace: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = skill_files(cfg, workspace)
+            .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
+            .collect();
+        names.sort();
+        names
     }
 
-    pub fn sync_skills(db: &Db, dir: &Path) -> Result<usize> {
-        if !dir.exists() {
-            return Ok(0);
-        }
-        let mut count = 0;
-        for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("skill")
-                .to_string();
-            let text = std::fs::read_to_string(&path)?;
-            let (name, desc, body) = parse_skill(&text, &stem);
-            let existing = db.skill_get(&name)?;
-            let changed = match &existing {
-                Some(e) => e.content != body || e.description != desc,
-                None => true,
-            };
-            db.skill_upsert(&name, &path.to_string_lossy(), &desc, &body)?;
-            if changed {
-                db.skill_version_add(&name, &body, &desc, "file", "synced from file")?;
-            }
-            count += 1;
-        }
-        Ok(count)
+    pub fn any(cfg: &Config, workspace: &std::path::Path) -> bool {
+        skill_files(cfg, workspace).next().is_some()
     }
 
-    fn write_skill_file(agent: &Agent, name: &str, description: &str, content: &str) -> Result<()> {
-        let dir = agent.cfg.skills_path(&agent.workspace);
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{name}.md"));
-        std::fs::write(&path, render_skill(name, description, content))
-            .with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
-    }
-
-    fn save_skill(
-        agent: &Agent,
-        name: &str,
-        description: &str,
-        content: &str,
-        author: &str,
-        reason: &str,
-    ) -> Result<()> {
-        let dir = agent.cfg.skills_path(&agent.workspace);
-        let path = dir.join(format!("{name}.md"));
-        agent
-            .db
-            .skill_upsert(name, &path.to_string_lossy(), description, content)?;
-        agent
-            .db
-            .skill_version_add(name, content, description, author, reason)?;
-        write_skill_file(agent, name, description, content)?;
-        Ok(())
+    #[derive(Deserialize)]
+    struct LoadArgs {
+        name: String,
     }
 
     pub fn load(agent: &mut Agent, args: &Value) -> Result<String> {
-        let name = req_str(args, "name")?;
-        let skill = agent.db.skill_get(&name)?;
-        if let Some(s) = skill {
-            agent.db.skill_record_load(&agent.instance_id, &name)?;
-            Ok(format!(
-                "# Skill: {}\n{}\n\n{}",
-                s.name, s.description, s.content
-            ))
-        } else {
-            let names: Vec<String> = agent.db.skill_list()?.into_iter().map(|s| s.name).collect();
-            bail!(
+        let LoadArgs { name } = parse_args(args)?;
+        let path = agent
+            .cfg
+            .skills_path(&agent.workspace)
+            .join(format!("{name}.md"));
+        let text = match valid_slug(&name).then(|| std::fs::read_to_string(&path)) {
+            Some(Ok(text)) => text,
+            _ => bail!(
                 "skill `{name}` not found. available: {}",
-                if names.is_empty() {
-                    "(none)".into()
-                } else {
-                    names.join(", ")
-                }
-            )
-        }
-    }
-
-    pub fn list(agent: &mut Agent, _args: &Value) -> Result<String> {
-        let skills = agent.db.skill_list()?;
-        if skills.is_empty() {
-            return Ok("(no skills)".into());
-        }
-        let mut out = String::new();
-        for s in skills {
-            out.push_str(&format!(
-                "- {} (uses={}): {}\n",
-                s.name,
-                s.uses,
-                if s.description.is_empty() {
-                    "(no description)"
-                } else {
-                    &s.description
-                }
-            ));
-        }
-        Ok(out)
-    }
-
-    pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
-        let name = req_str(args, "name")?;
-        if let Some(v) = opt_i64(args, "version") {
-            return match agent.db.skill_version_get(&name, v)? {
-                Some((content, desc)) => Ok(format!("# {name} v{v}\n{desc}\n\n{content}")),
-                None => bail!("skill `{name}` has no version {v}"),
-            };
-        }
-        let s = agent
-            .db
-            .skill_get(&name)?
-            .ok_or_else(|| anyhow::anyhow!("skill `{name}` not found"))?;
-        Ok(format!(
-            "# {}\npath: {}\nuses: {}\ndescription: {}\n\n{}",
-            s.name, s.path, s.uses, s.description, s.content
-        ))
-    }
-
-    pub fn write(agent: &mut Agent, args: &Value) -> Result<String> {
-        let name = req_str(args, "name")?;
-        if name.contains('/') || name.contains("..") {
-            bail!("invalid skill name");
-        }
-        let description = opt_str(args, "description").unwrap_or_default();
-        let content = req_str(args, "content")?;
-        let reason = opt_str(args, "reason").unwrap_or_default();
-        let existed = agent.db.skill_get(&name)?.is_some();
-        save_skill(agent, &name, &description, &content, "retro", &reason)?;
-        Ok(format!(
-            "{} skill `{name}` ({} bytes)",
-            if existed { "updated" } else { "created" },
-            content.len()
-        ))
-    }
-
-    pub fn edit(agent: &mut Agent, args: &Value) -> Result<String> {
-        let name = req_str(args, "name")?;
-        let old = req_str(args, "oldText")?;
-        let new = req_str(args, "newText")?;
-        let reason = opt_str(args, "reason").unwrap_or_default();
-        let s = agent
-            .db
-            .skill_get(&name)?
-            .ok_or_else(|| anyhow::anyhow!("skill `{name}` not found"))?;
-        let count = s.content.matches(&old).count();
-        if count == 0 {
-            bail!("oldText not found in skill `{name}`");
-        }
-        if count > 1 {
-            bail!("oldText is not unique in skill `{name}` ({count} matches)");
-        }
-        let updated = s.content.replacen(&old, &new, 1);
-        save_skill(agent, &name, &s.description, &updated, "retro", &reason)?;
-        Ok(format!("edited skill `{name}`"))
-    }
-
-    pub fn history(agent: &mut Agent, args: &Value) -> Result<String> {
-        let name = req_str(args, "name")?;
-        let mut stmt = agent.db.conn.prepare(
-            "SELECT version,author,reason,length(content),created_at FROM skill_versions
-         WHERE skill_name=? ORDER BY version DESC",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![name], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })?;
-        let mut out = String::new();
-        for row in rows {
-            let (v, author, reason, len, at) = row?;
-            out.push_str(&format!("v{v}\t{at}\tby {author}\t{len}B\t{reason}\n"));
-        }
-        if out.is_empty() {
-            out = format!("(no versions for `{name}`)");
-        }
-        Ok(out)
-    }
-
-    pub fn rollback(agent: &mut Agent, args: &Value) -> Result<String> {
-        let name = req_str(args, "name")?;
-        let version = opt_i64(args, "version").ok_or_else(|| anyhow::anyhow!("missing version"))?;
-        let (content, desc) = agent
-            .db
-            .skill_version_get(&name, version)?
-            .ok_or_else(|| anyhow::anyhow!("skill `{name}` has no version {version}"))?;
-        save_skill(
-            agent,
-            &name,
-            &desc,
-            &content,
-            "rollback",
-            &format!("rolled back to v{version}"),
-        )?;
-        Ok(format!("rolled skill `{name}` back to v{version}"))
+                names(&agent.cfg, &agent.workspace).join(", ")
+            ),
+        };
+        let (meta, body) = split_frontmatter(&text);
+        let description = meta.get("description").map_or("", String::as_str);
+        Ok(format!("# Skill: {name}\n{description}\n\n{body}"))
     }
 
     #[cfg(test)]
     mod tests {
-        use super::parse_skill;
+        use super::*;
 
         #[test]
-        fn parses_frontmatter() {
-            let text = "---\nname: foo\ndescription: bar baz\n---\n\n# Body\ncontent\n";
-            let (n, d, b) = parse_skill(text, "fallback");
-            assert_eq!(n, "foo");
-            assert_eq!(d, "bar baz");
-            assert!(b.contains("Body"));
-        }
-
-        #[test]
-        fn falls_back_without_frontmatter() {
-            let (n, _d, b) = parse_skill("just content", "stem");
-            assert_eq!(n, "stem");
-            assert_eq!(b, "just content");
+        fn lists_markdown_files_only() {
+            let ws = crate::storage::util::temp_dir("skills");
+            let cfg = Config::default();
+            let dir = cfg.skills_path(&ws);
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(!any(&cfg, &ws));
+            std::fs::write(dir.join("b.md"), "x").unwrap();
+            std::fs::write(dir.join("a.md"), "x").unwrap();
+            std::fs::write(dir.join("c.txt"), "x").unwrap();
+            assert_eq!(names(&cfg, &ws), ["a", "b"]);
+            let _ = std::fs::remove_dir_all(&ws);
         }
     }
 }
 pub mod spawn {
     use anyhow::{Result, bail};
+    use serde::Deserialize;
     use serde_json::{Value, json};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::time::Duration;
 
-    use super::{opt_str, req_str};
+    use super::parse_args;
     use crate::agent::Agent;
     use crate::storage::proc;
+    use crate::storage::util::{TempPath, tmp_file, write_file};
+
+    #[derive(Deserialize)]
+    struct SpawnArgs {
+        mode: String,
+        instructions: String,
+        task: Option<String>,
+    }
 
     pub fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
-        let mode = req_str(args, "mode")?;
-        if !["plan", "build", "explore"].contains(&mode.as_str()) {
+        let a: SpawnArgs = parse_args(args)?;
+        if !["plan", "build", "explore"].contains(&a.mode.as_str()) {
             bail!("spawn mode must be plan|build|explore (not retro)");
         }
         if agent.depth >= agent.cfg.max_subagent_depth {
@@ -1328,128 +1016,72 @@ pub mod spawn {
                 agent.cfg.max_subagent_depth
             );
         }
-        let instructions = req_str(args, "instructions")?;
-        let task = opt_str(args, "task").unwrap_or_else(|| format!("subagent:{mode}"));
-
+        let task = a.task.unwrap_or_else(|| format!("subagent:{}", a.mode));
+        let tmp = agent.cfg.tmp_path(&agent.workspace);
         let exe = std::env::current_exe().unwrap_or_else(|_| "genji".into());
-        let instruction_file = InstructionFile::create(&agent.workspace, &instructions)?;
+        let instruction_file = TempPath(tmp_file(&tmp, "subagent", "md"));
+        write_file(&instruction_file.0, &a.instructions)?;
         let cmd_args = build_subagent_args(
-            &mode,
+            &a.mode,
             &agent.instance_id,
-            instruction_file.path(),
+            &instruction_file.0,
             &task,
             agent.depth,
             agent.formal,
         );
-
-        let cap = agent.cfg.tool_result_max_bytes.saturating_mul(2).max(16384);
+        // The child's stdout is a JSONL event stream whose last line carries the
+        // report, so it must be read whole; only the parsed report is bounded.
         let res = proc::run_capture(
             &exe.to_string_lossy(),
             &cmd_args,
             &agent.workspace,
-            &agent.cfg.tmp_path(&agent.workspace),
+            &tmp,
             Duration::from_secs(agent.cfg.spawn_timeout_secs),
-            cap,
+            usize::MAX,
         )?;
 
-        let ParsedEvents {
-            parsed,
-            sub_instance,
-            saw_end,
-            start,
-            mut end,
-            mut errors,
-            tools,
-        } = parse_subagent_events(&res.stdout);
-
-        if parsed == 0 {
-            let text = if res.stdout.trim().is_empty() {
-                res.stderr.trim().to_string()
-            } else {
-                res.stdout.trim().to_string()
+        // The child streams JSON events on stdout; only its identity and final report matter here.
+        let mut sub_instance = None;
+        let mut end = None;
+        for line in res.stdout.lines() {
+            let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
             };
-            end = Some(json!({
-                "type": "instance_end",
-                "status": if res.timed_out { "timed_out" } else { "unknown" },
-                "report": text,
-            }));
-        } else if !saw_end {
-            errors.push(json!({
-                "type": "error",
-                "message": "subagent event stream ended without instance_end",
-            }));
-        }
-        if res.timed_out {
-            if let Some(e) = end.as_mut() {
-                e["status"] = json!("timed_out");
+            match event["type"].as_str() {
+                Some("instance_start") => {
+                    sub_instance = event["instance"].as_str().map(String::from)
+                }
+                Some("instance_end") => end = Some(event),
+                _ => {}
             }
-            errors.push(json!({ "type": "error", "message": "subagent timed out" }));
         }
-
-        let events = bounded_events(
-            start,
-            tools,
-            errors,
-            end,
-            agent
-                .cfg
-                .tool_result_max_bytes
-                .saturating_sub(1024)
-                .max(4096),
-        );
-        let status = events
-            .iter()
-            .rev()
-            .find(|e| e.get("type").and_then(|t| t.as_str()) == Some("instance_end"))
-            .and_then(|e| e.get("status"))
-            .and_then(|s| s.as_str())
-            .unwrap_or("incomplete")
-            .to_string();
-
+        let (mut status, report) = match &end {
+            Some(e) => (
+                e["status"].as_str().unwrap_or("unknown"),
+                e["report"].as_str().unwrap_or("").to_string(),
+            ),
+            None => {
+                let text = if res.stdout.trim().is_empty() {
+                    &res.stderr
+                } else {
+                    &res.stdout
+                };
+                ("incomplete", text.trim().to_string())
+            }
+        };
+        if res.timed_out {
+            status = "timed_out";
+        }
         Ok(json!({
-            "subagent_instance": if sub_instance.is_empty() {
-                Value::Null
-            } else {
-                json!(sub_instance)
-            },
-            "mode": mode,
+            "subagent_instance": sub_instance,
+            "mode": a.mode,
             "status": status,
             "exit_code": res.code,
             "timed_out": res.timed_out,
-            "duration_ms": res.duration_ms as u64,
-            "events": events,
+            "duration_ms": res.duration_ms,
+            "report": crate::llm::truncate(&report, agent.cfg.tool_result_max_bytes.saturating_sub(1024).max(4096)),
         })
         .to_string())
-    }
-
-    struct InstructionFile {
-        path: PathBuf,
-    }
-
-    impl InstructionFile {
-        fn create(workspace: &Path, instructions: &str) -> Result<Self> {
-            let dir = workspace.join(".genji").join("tmp");
-            std::fs::create_dir_all(&dir)?;
-            let path = dir.join(format!(
-                "subagent-{}-{}.md",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_nanos())
-            ));
-            std::fs::write(&path, instructions)?;
-            Ok(Self { path })
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for InstructionFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
     }
 
     fn build_subagent_args(
@@ -1460,156 +1092,27 @@ pub mod spawn {
         depth: u32,
         formal: bool,
     ) -> Vec<String> {
-        let mut args = vec![
-            mode.to_string(),
-            "--subagent".to_string(),
-            "--parent-instance".to_string(),
-            parent_instance.to_string(),
-            "--instructions-file".to_string(),
-            instructions.to_string_lossy().into_owned(),
-            "--label".to_string(),
-            task.to_string(),
-            "--depth".to_string(),
-            (depth + 1).to_string(),
-            "--quiet-startup".to_string(),
-            "--no-control".to_string(),
-        ];
+        let mut args: Vec<String> = [
+            mode,
+            "--subagent",
+            "--parent-instance",
+            parent_instance,
+            "--instructions-file",
+            &instructions.to_string_lossy(),
+            "--label",
+            task,
+            "--depth",
+            &(depth + 1).to_string(),
+            "--quiet-startup",
+            "--no-control",
+        ]
+        .map(String::from)
+        .into();
         // Subagents inherit Formal so a build subagent can work the same tickets.
         if formal {
             args.push("--formal".to_string());
         }
         args
-    }
-
-    struct ParsedEvents {
-        parsed: usize,
-        sub_instance: String,
-        saw_end: bool,
-        start: Option<Value>,
-        end: Option<Value>,
-        errors: Vec<Value>,
-        tools: Vec<Value>,
-    }
-
-    fn parse_subagent_events(stdout: &str) -> ParsedEvents {
-        let mut result = ParsedEvents {
-            parsed: 0,
-            sub_instance: String::new(),
-            saw_end: false,
-            start: None,
-            end: None,
-            errors: Vec::new(),
-            tools: Vec::new(),
-        };
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(event) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if event.get("type").is_none() {
-                continue;
-            }
-            result.parsed += 1;
-            if result.sub_instance.is_empty()
-                && let Some(s) = event.get("instance").and_then(|s| s.as_str())
-            {
-                result.sub_instance = s.to_string();
-            }
-            match event.get("type").and_then(|t| t.as_str()) {
-                Some("instance_start") => result.start = Some(event),
-                Some("instance_end") => {
-                    result.saw_end = true;
-                    result.end = Some(event);
-                }
-                Some("error") => result.errors.push(event),
-                Some("tool_call" | "tool_result") => result.tools.push(event),
-                _ => {}
-            }
-        }
-        result
-    }
-
-    fn bounded_events(
-        start: Option<Value>,
-        tools: Vec<Value>,
-        errors: Vec<Value>,
-        end: Option<Value>,
-        budget: usize,
-    ) -> Vec<Value> {
-        let end = end.unwrap_or_else(|| json!({ "type": "instance_end", "status": "incomplete" }));
-        let mut events: Vec<Value> = Vec::new();
-        if let Some(s) = start {
-            events.push(s);
-        }
-        events.extend(tools);
-        events.extend(errors);
-        events.push(end);
-
-        // Clip bulky string fields.
-        const CLIP: usize = 2000;
-        for ev in &mut events {
-            for field in ["result", "content", "reasoning", "summary", "message"] {
-                if let Some(s) = ev.get(field).and_then(|v| v.as_str())
-                    && s.len() > CLIP
-                {
-                    ev[field] = json!(crate::llm::truncate(s, CLIP));
-                }
-            }
-        }
-
-        let size = |evs: &[Value]| serde_json::to_string(evs).map_or(usize::MAX, |s| s.len());
-        // Drop tool detail (oldest first) while keeping start/errors/end.
-        while size(&events) > budget {
-            let idx = events.iter().position(|e| {
-                matches!(
-                    e.get("type").and_then(|t| t.as_str()),
-                    Some("tool_call" | "tool_result")
-                )
-            });
-            match idx {
-                Some(i) => {
-                    events.remove(i);
-                }
-                None => break,
-            }
-        }
-        // Last resort: shrink the report so `instance_end` still fits.
-        while size(&events) > budget {
-            let Some(i) = events
-                .iter()
-                .rposition(|e| e.get("type").and_then(|t| t.as_str()) == Some("instance_end"))
-            else {
-                break;
-            };
-            let report_len = events[i]
-                .get("report")
-                .and_then(|v| v.as_str())
-                .map_or(0, str::len);
-            if report_len <= 64 {
-                break;
-            }
-            let current = events[i]
-                .get("report")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let shrunk = crate::llm::truncate(&current, report_len / 2);
-            events[i]["report"] = json!(shrunk);
-        }
-        // Absolute last resort: keep only `instance_end`.
-        if size(&events) > budget
-            && let Some(i) = events
-                .iter()
-                .rposition(|e| e.get("type").and_then(|t| t.as_str()) == Some("instance_end"))
-        {
-            let end = events.remove(i);
-            events.clear();
-            events.push(end);
-        }
-        events
     }
 }
 #[cfg(feature = "formal")]
@@ -1617,36 +1120,28 @@ pub mod tickets {
     use anyhow::{Result, bail};
     use serde::Deserialize;
     use serde_json::Value;
+    use std::fmt::Write as _;
     use std::path::Path;
 
-
     use crate::agent::Agent;
-    use crate::storage::db::{FieldPatch, TicketEdit};
     use crate::storage::ticketmd::{self, Ticket, TicketStatus};
-
-    fn find(agent: &Agent, id: i64) -> Result<Option<Ticket>> {
-        ticketmd::load_by_id(&agent.cfg, &agent.workspace, id)
-    }
-
-    pub fn list_all(agent: &Agent) -> Result<Vec<Ticket>> {
-        ticketmd::load_all(&agent.cfg, &agent.workspace)
-    }
+    use crate::storage::util::FieldPatch;
 
     fn fmt_ticket(t: &Ticket, workspace: &Path) -> String {
         let mut s = format!("#{} [{}] {}\n", t.id, t.status, t.title);
         if t.priority != 2 {
-            s.push_str(&format!("priority: {}\n", t.priority));
+            let _ = writeln!(s, "priority: {}", t.priority);
         }
         if let Some(r) = t.requirement_id {
-            s.push_str(&format!("requirement: #{r}\n"));
+            let _ = writeln!(s, "requirement: #{r}");
         }
         if let Some(p) = t.parent_id {
-            s.push_str(&format!("parent: #{p}\n"));
+            let _ = writeln!(s, "parent: #{p}");
         }
-        s.push_str(&format!("path: {}\n", t.display_path(workspace)));
-        s.push_str(&format!("created: {}\n", t.created_at));
+        let _ = writeln!(s, "path: {}", t.display_path(workspace));
+        let _ = writeln!(s, "created: {}", t.created_at);
         if let Some(r) = &t.resolution {
-            s.push_str(&format!("resolution: {r}\n"));
+            let _ = writeln!(s, "resolution: {r}");
         }
         if !t.description.trim().is_empty() {
             s.push('\n');
@@ -1657,42 +1152,54 @@ pub mod tickets {
     }
 
     #[derive(Debug, Deserialize)]
-    struct CreateArgs { title: String, description: Option<String>, priority: Option<i64>, parent_id: Option<i64>, requirement_id: Option<i64> }
+    struct CreateArgs {
+        title: String,
+        description: Option<String>,
+        priority: Option<i64>,
+        parent_id: Option<i64>,
+        requirement_id: Option<i64>,
+    }
     #[derive(Debug, Deserialize)]
-    struct ReadArgs { id: Option<i64>, status: Option<String>, requirement_id: Option<i64> }
+    struct ReadArgs {
+        id: Option<i64>,
+        status: Option<TicketStatus>,
+        requirement_id: Option<i64>,
+    }
     #[derive(Debug, Deserialize)]
-    struct ClaimArgs { id: Option<i64>, requirement_id: Option<i64> }
+    struct ClaimArgs {
+        id: Option<i64>,
+        requirement_id: Option<i64>,
+    }
     #[derive(Debug, Deserialize)]
     struct UpdateArgs {
         id: i64,
         title: Option<String>,
         description: Option<String>,
         priority: Option<i64>,
-        #[serde(default)] parent_id: FieldPatch<i64>,
-        #[serde(default)] requirement_id: FieldPatch<i64>,
-        status: Option<String>,
+        #[serde(default)]
+        parent_id: FieldPatch<i64>,
+        #[serde(default)]
+        requirement_id: FieldPatch<i64>,
+        status: Option<TicketStatus>,
         resolution: Option<String>,
     }
     #[derive(Debug, Deserialize)]
-    struct CloseArgs { id: i64, reason: Option<String> }
+    struct CloseArgs {
+        id: i64,
+        reason: Option<String>,
+    }
 
     pub fn create(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: CreateArgs = super::parse_args(args)?;
-        let title = parsed.title;
-        let description = parsed.description.unwrap_or_default();
-        let priority = parsed.priority.unwrap_or(2).clamp(1, 3);
-        let parent_id = parsed.parent_id;
-        let requirement_id = parsed.requirement_id;
-        let mode = agent.mode.as_str().to_string();
         let t = ticketmd::create(
             &agent.cfg,
             &agent.workspace,
-            &title,
-            &description,
-            priority,
-            parent_id,
-            requirement_id,
-            &mode,
+            &parsed.title,
+            parsed.description.as_deref().unwrap_or_default(),
+            parsed.priority.unwrap_or(2).clamp(1, 3),
+            parsed.parent_id,
+            parsed.requirement_id,
+            agent.mode.as_str(),
         )?;
         Ok(format!("created ticket #{}: {}", t.id, t.title))
     }
@@ -1700,13 +1207,12 @@ pub mod tickets {
     pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: ReadArgs = super::parse_args(args)?;
         if let Some(id) = parsed.id {
-            return match find(agent, id)? {
+            return match ticketmd::load_by_id(&agent.cfg, &agent.workspace, id)? {
                 Some(t) => Ok(fmt_ticket(&t, &agent.workspace)),
                 None => bail!("ticket #{id} not found"),
             };
         }
-        let status = parsed.status.as_deref()
-            .map(parse_ticket_status).transpose()?;
+        let status = parsed.status;
         let requirement_id = parsed.requirement_id;
         let tickets: Vec<Ticket> = ticketmd::load_all(&agent.cfg, &agent.workspace)?
             .into_iter()
@@ -1726,14 +1232,15 @@ pub mod tickets {
 
     pub fn claim(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: ClaimArgs = super::parse_args(args)?;
-        let id = parsed.id;
-        let requirement_id = parsed.requirement_id;
+        let (id, requirement_id) = (parsed.id, parsed.requirement_id);
         let ticket = match id {
-            Some(id) => find(agent, id)?,
-            None => list_all(agent)?.into_iter().find(|t| {
-                t.status == TicketStatus::Open
-                    && requirement_id.is_none_or(|r| t.requirement_id == Some(r))
-            }),
+            Some(id) => ticketmd::load_by_id(&agent.cfg, &agent.workspace, id)?,
+            None => ticketmd::load_all(&agent.cfg, &agent.workspace)?
+                .into_iter()
+                .find(|t| {
+                    t.status == TicketStatus::Open
+                        && requirement_id.is_none_or(|r| t.requirement_id == Some(r))
+                }),
         };
         let Some(t) = ticket else {
             return Ok(match id {
@@ -1744,14 +1251,9 @@ pub mod tickets {
         if !t.status.is_open() {
             bail!("ticket #{} is {} and cannot be claimed", t.id, t.status);
         }
-        let Some(t) = ticketmd::update(
-            &agent.cfg,
-            &agent.workspace,
-            t.id,
-            &TicketEdit::default(),
-            Some(TicketStatus::InProgress),
-            None,
-        )?
+        let Some(t) = ticketmd::update(&agent.cfg, &agent.workspace, t.id, |t| {
+            t.status = TicketStatus::InProgress;
+        })?
         else {
             bail!("ticket #{} is archived and cannot be claimed", t.id);
         };
@@ -1762,33 +1264,28 @@ pub mod tickets {
         ))
     }
 
-    fn parse_ticket_status(status: &str) -> Result<TicketStatus> {
-        status
-            .parse()
-            .map_err(|_| anyhow::anyhow!("status must be open|in_progress|resolved|closed"))
-    }
-
     pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: UpdateArgs = super::parse_args(args)?;
         let id = parsed.id;
-        let status = parsed.status.as_deref()
-            .map(parse_ticket_status).transpose()?;
-        let edit = TicketEdit {
-            title: parsed.title,
-            description: parsed.description,
-            priority: parsed.priority.map(|p| p.clamp(1, 3)),
-            parent_id: parsed.parent_id,
-            requirement_id: parsed.requirement_id,
-        };
-        let resolution = parsed.resolution;
-        ticketmd::update(
-            &agent.cfg,
-            &agent.workspace,
-            id,
-            &edit,
-            status,
-            resolution.as_deref(),
-        )?
+        ticketmd::update(&agent.cfg, &agent.workspace, id, |t| {
+            if let Some(v) = parsed.title {
+                t.title = v;
+            }
+            if let Some(v) = parsed.description {
+                t.description = v;
+            }
+            if let Some(v) = parsed.priority {
+                t.priority = v;
+            }
+            parsed.parent_id.apply_to(&mut t.parent_id);
+            parsed.requirement_id.apply_to(&mut t.requirement_id);
+            if let Some(v) = parsed.status {
+                t.status = v;
+            }
+            if let Some(v) = parsed.resolution {
+                t.resolution = Some(v);
+            }
+        })?
         .ok_or_else(|| anyhow::anyhow!("ticket #{id} not found"))?;
         Ok(format!("updated ticket #{id}"))
     }
@@ -1796,36 +1293,42 @@ pub mod tickets {
     pub fn close(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: CloseArgs = super::parse_args(args)?;
         let id = parsed.id;
-        let reason = parsed.reason;
-        ticketmd::update(
-            &agent.cfg,
-            &agent.workspace,
-            id,
-            &TicketEdit::default(),
-            Some(TicketStatus::Closed),
-            reason.as_deref(),
-        )?
+        ticketmd::update(&agent.cfg, &agent.workspace, id, |t| {
+            t.status = TicketStatus::Closed;
+            if let Some(v) = parsed.reason {
+                t.resolution = Some(v);
+            }
+        })?
         .ok_or_else(|| anyhow::anyhow!("ticket #{id} not found"))?;
         Ok(format!("ticket #{id} closed"))
     }
 }
 
-type ToolGate = u8;
-const GATE_FORMAL: ToolGate = 1 << 0;
-const GATE_SKILLS: ToolGate = 1 << 1;
+/// Optional capability a tool needs before it is offered to the model.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    None,
+    #[cfg_attr(not(feature = "formal"), allow(dead_code))]
+    Formal,
+    Skills,
+}
 
-#[derive(Debug, Clone)]
-pub struct Tool {
+struct Tool {
     name: &'static str,
     description: &'static str,
     parameters: Value,
     modes: &'static [Mode],
-    gate: ToolGate,
+    gate: Gate,
     handler: fn(&mut Agent, &Value) -> Result<String>,
 }
 
 impl Tool {
-    pub fn to_json(&self) -> Value {
+    fn gate(mut self, gate: Gate) -> Self {
+        self.gate = gate;
+        self
+    }
+
+    fn to_json(&self) -> Value {
         json!({
             "type": "function",
             "function": {
@@ -1837,9 +1340,12 @@ impl Tool {
     }
 
     fn available(&self, mode: Mode, formal: bool, has_skills: bool) -> bool {
-        let capabilities =
-            if formal { GATE_FORMAL } else { 0 } | if has_skills { GATE_SKILLS } else { 0 };
-        self.modes.contains(&mode) && capabilities & self.gate == self.gate
+        self.modes.contains(&mode)
+            && match self.gate {
+                Gate::None => true,
+                Gate::Formal => formal,
+                Gate::Skills => has_skills,
+            }
     }
 }
 
@@ -1850,10 +1356,9 @@ const PLAN_BUILD: &[Mode] = &[Mode::Plan, Mode::Build];
 const PLAN_BUILD_EXPLORE: &[Mode] = &[Mode::Plan, Mode::Build, Mode::Explore];
 const RETRO: &[Mode] = &[Mode::Retro];
 
-fn gated_tool(
+fn tool(
     name: &'static str,
     modes: &'static [Mode],
-    gate: ToolGate,
     description: &'static str,
     parameters: Value,
     handler: fn(&mut Agent, &Value) -> Result<String>,
@@ -1863,45 +1368,9 @@ fn gated_tool(
         description,
         parameters,
         modes,
-        gate,
+        gate: Gate::None,
         handler,
     }
-}
-
-fn tool(
-    name: &'static str,
-    modes: &'static [Mode],
-    description: &'static str,
-    parameters: Value,
-    handler: fn(&mut Agent, &Value) -> Result<String>,
-) -> Tool {
-    gated_tool(name, modes, 0, description, parameters, handler)
-}
-
-#[cfg(test)]
-pub(crate) fn test_tool(name: &'static str, parameters: Value) -> Tool {
-    tool(name, ALL_MODES, "d", parameters, basic::read)
-}
-
-#[cfg(feature = "formal")]
-fn formal_tool(
-    name: &'static str,
-    modes: &'static [Mode],
-    description: &'static str,
-    parameters: Value,
-    handler: fn(&mut Agent, &Value) -> Result<String>,
-) -> Tool {
-    gated_tool(name, modes, GATE_FORMAL, description, parameters, handler)
-}
-
-fn skill_tool(
-    name: &'static str,
-    modes: &'static [Mode],
-    description: &'static str,
-    parameters: Value,
-    handler: fn(&mut Agent, &Value) -> Result<String>,
-) -> Tool {
-    gated_tool(name, modes, GATE_SKILLS, description, parameters, handler)
 }
 
 fn registry() -> &'static [Tool] {
@@ -1962,7 +1431,7 @@ fn registry() -> &'static [Tool] {
                 "required":["title","content"]
             }), plans::write),
             #[cfg(feature = "formal")]
-            formal_tool("ticket_create", PLAN, "Create a work ticket.", json!({
+            tool("ticket_create", PLAN, "Create a work ticket.", json!({
                 "type":"object",
                 "properties":{
                     "title":{"type":"string"},
@@ -1972,26 +1441,26 @@ fn registry() -> &'static [Tool] {
                     "requirement_id":{"type":"integer","description":"Requirement this ticket addresses"}
                 },
                 "required":["title"]
-            }), tickets::create),
+            }), tickets::create).gate(Gate::Formal),
             #[cfg(feature = "formal")]
-            formal_tool("ticket_read", PLAN_BUILD, "Read one ticket by id, or list actionable tickets.", json!({
+            tool("ticket_read", PLAN_BUILD, "Read one ticket by id, or list actionable tickets.", json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"integer"},
                     "status":{"type":"string","enum":["open","in_progress","resolved","closed"]},
                     "requirement_id":{"type":"integer"}
                 }
-            }), tickets::read),
+            }), tickets::read).gate(Gate::Formal),
             #[cfg(feature = "formal")]
-            formal_tool("ticket_claim", PLAN_BUILD, "Claim the next open ticket (highest priority) or a specific ticket, marking it in_progress.", json!({
+            tool("ticket_claim", PLAN_BUILD, "Claim the next open ticket (highest priority) or a specific ticket, marking it in_progress.", json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"integer","description":"Claim this ticket instead of the next one"},
                     "requirement_id":{"type":"integer","description":"Only consider tickets for this requirement"}
                 }
-            }), tickets::claim),
+            }), tickets::claim).gate(Gate::Formal),
             #[cfg(feature = "formal")]
-            formal_tool("ticket_update", PLAN_BUILD, "Update a ticket's fields and/or status.", json!({
+            tool("ticket_update", PLAN_BUILD, "Update a ticket's fields and/or status.", json!({
                 "type":"object",
                 "properties":{
                     "id":{"type":"integer"},
@@ -2004,73 +1473,73 @@ fn registry() -> &'static [Tool] {
                     "resolution":{"type":"string"}
                 },
                 "required":["id"]
-            }), tickets::update),
+            }), tickets::update).gate(Gate::Formal),
             #[cfg(feature = "formal")]
-            formal_tool("ticket_close", PLAN_BUILD, "Close a ticket when its work is done and verified, or it is obsolete/duplicate/won't-fix.", json!({
+            tool("ticket_close", PLAN_BUILD, "Close a ticket when its work is done and verified, or it is obsolete/duplicate/won't-fix.", json!({
                 "type":"object",
                 "properties":{"id":{"type":"integer"},"reason":{"type":"string"}},
                 "required":["id"]
-            }), tickets::close),
+            }), tickets::close).gate(Gate::Formal),
             #[cfg(feature = "formal")]
-            formal_tool("requirement_create", PLAN, "Create a stakeholder or system requirement.", json!({
+            tool("requirement_create", PLAN, "Create a stakeholder or system requirement.", json!({
                 "type":"object",
                 "properties":{
                     "level":{"type":"string","enum":["stakeholder","system"]},
                     "title":{"type":"string"},
                     "body":{"type":"string"},
-                    "parent_id":{"type":["integer","null"],"description":"Parent requirement id; null clears it"}
-                },
-                "required":["level","title","body"]
-            }), requirements::create),
-            #[cfg(feature = "formal")]
-            formal_tool("requirement_read", PLAN_BUILD, "Read a requirement by id, or list/filter requirements by level and status when id is omitted.", json!({
-                "type":"object",
-                "properties":{
-                    "id":{"type":"integer"},
-                    "level":{"type":"string","enum":["stakeholder","system"]},
-                    "status":{"type":"string","enum":["active","met","removed"]}
-                }
-            }), requirements::read),
-            #[cfg(feature = "formal")]
-            formal_tool("requirement_tree", PLAN_BUILD, "Show the requirement hierarchy with ticket coverage per requirement.", json!({
-                "type":"object",
-                "properties":{
-                    "status":{"type":"string","enum":["active","met","removed"],"description":"Only show requirements with this status"}
-                }
-            }), requirements::tree),
-            #[cfg(feature = "formal")]
-            formal_tool("requirement_update", PLAN, "Update a requirement's title/body/status/level/parent.", json!({
-                "type":"object",
-                "properties":{
-                    "id":{"type":"integer"},
-                    "title":{"type":"string"},
-                    "body":{"type":"string"},
-                    "status":{"type":"string","enum":["active","met","removed"]},
-                    "level":{"type":"string","enum":["stakeholder","system"]},
                     "parent_id":{"type":"integer"}
                 },
-                "required":["id"]
-            }), requirements::update),
+                "required":["level","title","body"]
+            }), requirements::create).gate(Gate::Formal),
             #[cfg(feature = "formal")]
-            formal_tool("requirement_remove", PLAN, "Remove a requirement.", json!({
+            tool("requirement_read", PLAN_BUILD, "Read a requirement by id, or list/filter requirements by level and status when id is omitted.", json!({
+                "type":"object",
+                "properties":{
+                    "id":{"type":"integer"},
+                    "level":{"type":"string","enum":["stakeholder","system"]},
+                    "status":{"type":"string","enum":["active","met"]}
+                }
+            }), requirements::read).gate(Gate::Formal),
+            #[cfg(feature = "formal")]
+            tool("requirement_tree", PLAN_BUILD, "Show the requirement hierarchy with ticket coverage per requirement.", json!({
+                "type":"object",
+                "properties":{
+                    "status":{"type":"string","enum":["active","met"],"description":"Only show requirements with this status"}
+                }
+            }), requirements::tree).gate(Gate::Formal),
+            #[cfg(feature = "formal")]
+            tool("requirement_update", PLAN, "Update a requirement's title/body/status/level/parent.", json!({
+                "type":"object",
+                "properties":{
+                    "id":{"type":"integer"},
+                    "title":{"type":"string"},
+                    "body":{"type":"string"},
+                    "status":{"type":"string","enum":["active","met"]},
+                    "level":{"type":"string","enum":["stakeholder","system"]},
+                    "parent_id":{"type":["integer","null"],"description":"null clears it"}
+                },
+                "required":["id"]
+            }), requirements::update).gate(Gate::Formal),
+            #[cfg(feature = "formal")]
+            tool("requirement_remove", PLAN, "Remove a requirement.", json!({
                 "type":"object",
                 "properties":{"id":{"type":"integer"}},
                 "required":["id"]
-            }), requirements::remove),
+            }), requirements::remove).gate(Gate::Formal),
             #[cfg(feature = "formal")]
-            formal_tool("requirement_ask", PLAN_BUILD, "Ask the user a clarifying question about a requirement. Recorded in the DB.", json!({
+            tool("requirement_ask", PLAN_BUILD, "Ask the user a clarifying question about a requirement. Recorded in the DB.", json!({
                 "type":"object",
                 "properties":{
                     "question":{"type":"string"},
                     "requirement_id":{"type":"integer"}
                 },
                 "required":["question"]
-            }), requirements::ask),
-            skill_tool("skill_load", ALL_MODES, "Load a skill's instructions by name.", json!({
+            }), requirements::ask).gate(Gate::Formal),
+            tool("skill_load", ALL_MODES, "Load a skill's instructions by name.", json!({
                 "type":"object",
                 "properties":{"name":{"type":"string"}},
                 "required":["name"]
-            }), skills::load),
+            }), skills::load).gate(Gate::Skills),
             tool("spawn", PLAN_BUILD_EXPLORE, "Spawn a subagent in a given mode that only reports back.", json!({
                 "type":"object",
                 "properties":{
@@ -2087,21 +1556,16 @@ fn registry() -> &'static [Tool] {
                     "limit":{"type":"integer","description":"Default 20"}
                 }
             }), retro::instances),
-            tool("query_instance", RETRO, "Get all messages of one instance.", json!({
-                "type":"object",
-                "properties":{"instance_id":{"type":"string"},"limit":{"type":"integer"}},
-                "required":["instance_id"]
-            }), retro::instance),
-            tool("query_messages", RETRO, "Search recorded messages by text/role/instance.", json!({
+            tool("query_messages", RETRO, "Read recorded messages (latest N, oldest first). Filter by instance_id to read one conversation; add role/search to narrow.", json!({
                 "type":"object",
                 "properties":{
                     "instance_id":{"type":"string"},
                     "role":{"type":"string"},
                     "search":{"type":"string"},
-                    "limit":{"type":"integer","description":"Default 50"}
+                    "limit":{"type":"integer","description":"Default 50, max 2000"}
                 }
             }), retro::messages),
-            tool("query_tool_call", RETRO, "Query recorded tool calls (filter by name/errors/instance).", json!({
+            tool("query_tool_calls", RETRO, "Query recorded tool calls (filter by name/errors/instance).", json!({
                 "type":"object",
                 "properties":{
                     "instance_id":{"type":"string"},
@@ -2113,164 +1577,70 @@ fn registry() -> &'static [Tool] {
             tool("query_stats", RETRO, "Aggregate stats: tool usage, error rates, skill loads, token usage.", json!({
                 "type":"object","properties":{}
             }), retro::stats),
-            tool("list_skills", RETRO, "List all skills with descriptions and use counts.", json!({
-                "type":"object","properties":{}
-            }), skills::list),
-            tool("read_skill", RETRO, "Read a skill, optionally a specific version.", json!({
-                "type":"object",
-                "properties":{"name":{"type":"string"},"version":{"type":"integer"}},
-                "required":["name"]
-            }), skills::read),
-            tool("write_skill", RETRO, "Create or overwrite a skill (versioned).", json!({
-                "type":"object",
-                "properties":{
-                    "name":{"type":"string"},
-                    "description":{"type":"string"},
-                    "content":{"type":"string"},
-                    "reason":{"type":"string"}
-                },
-                "required":["name","content"]
-            }), skills::write),
-            tool("edit_skill", RETRO, "Edit a skill by text replacement (versioned).", json!({
-                "type":"object",
-                "properties":{
-                    "name":{"type":"string"},
-                    "oldText":{"type":"string"},
-                    "newText":{"type":"string"},
-                    "reason":{"type":"string"}
-                },
-                "required":["name","oldText","newText"]
-            }), skills::edit),
-            tool("skill_history", RETRO, "List versions of a skill.", json!({
-                "type":"object","properties":{"name":{"type":"string"}},"required":["name"]
-            }), skills::history),
-            tool("skill_rollback", RETRO, "Activate an older version of a skill.", json!({
-                "type":"object",
-                "properties":{"name":{"type":"string"},"version":{"type":"integer"}},
-                "required":["name","version"]
-            }), skills::rollback),
-            tool("prompt_read", RETRO, "Read the active extended system prompt for a mode. RETRO has no extended prompt.", json!({
-                "type":"object","properties":{"mode":{"type":"string","enum":["plan","build","explore"]}},"required":["mode"]
-            }), retro::prompt_read),
-            tool("prompt_edit", RETRO, "Replace the extended system prompt for a mode (versioned). Core prompt is not editable; RETRO has no extended prompt.", json!({
-                "type":"object",
-                "properties":{
-                    "mode":{"type":"string","enum":["plan","build","explore"]},
-                    "content":{"type":"string"},
-                    "reason":{"type":"string"}
-                },
-                "required":["mode","content"]
-            }), retro::prompt_edit),
-            tool("prompt_history", RETRO, "List versions of a mode's extended prompt. RETRO has no extended prompt.", json!({
-                "type":"object","properties":{"mode":{"type":"string","enum":["plan","build","explore"]}},"required":["mode"]
-            }), retro::prompt_history),
-            tool("prompt_rollback", RETRO, "Activate an older version of a mode's extended prompt. RETRO has no extended prompt.", json!({
-                "type":"object",
-                "properties":{"mode":{"type":"string","enum":["plan","build","explore"]},"version":{"type":"integer"}},
-                "required":["mode","version"]
-            }), retro::prompt_rollback),
         ]
     })
 }
 
-pub fn specs_for(mode: Mode, formal: bool, has_skills: bool) -> Vec<Tool> {
+pub fn specs_for(mode: Mode, formal: bool, has_skills: bool) -> Vec<Value> {
     registry()
         .iter()
         .filter(|t| t.available(mode, formal, has_skills))
-        .cloned()
+        .map(Tool::to_json)
         .collect()
 }
 
-pub fn dispatch(agent: &mut Agent, name: &str, args: &Value) -> (String, bool) {
-    let res: Result<String> = (|| {
-        let t = registry()
-            .iter()
-            .find(|t| t.name == name)
-            .ok_or_else(|| anyhow!("unknown tool `{name}`"))?;
-        let has_skills = t.gate & GATE_SKILLS == 0 || agent.db.has_skills()?;
-        if !t.available(agent.mode, agent.formal, has_skills) {
-            return Err(anyhow!("tool `{name}` is unavailable in the current mode"));
-        }
-        (t.handler)(agent, args)
-    })();
-    match res {
-        Ok(s) => (bounded_result(&agent.cfg, &agent.workspace, name, s), false),
-        Err(e) => (
-            bounded_result(&agent.cfg, &agent.workspace, name, format!("ERROR: {e:#}")),
-            true,
-        ),
+fn run_tool(agent: &mut Agent, name: &str, args: &Value) -> Result<String> {
+    let t = registry()
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| anyhow!("unknown tool `{name}`"))?;
+    // `skill_load` reports missing skills itself, so skills are not re-scanned here.
+    if !t.available(agent.mode, agent.formal, true) {
+        bail!("tool `{name}` is unavailable in the current mode");
     }
+    (t.handler)(agent, args)
+}
+
+pub fn dispatch(agent: &mut Agent, name: &str, args: &Value) -> (String, bool) {
+    let (text, is_error) = match run_tool(agent, name, args) {
+        Ok(s) => (s, false),
+        Err(e) => (format!("ERROR: {e:#}"), true),
+    };
+    (
+        bounded_result(&agent.cfg, &agent.workspace, name, text),
+        is_error,
+    )
 }
 
 fn bounded_result(cfg: &Config, workspace: &Path, name: &str, text: String) -> String {
     let max = cfg.tool_result_max_bytes;
-    let total = text.len();
-    if total <= max {
+    if text.len() <= max {
         return text;
     }
+    let clipped = crate::llm::truncate(&text, max);
     match spill_to_log(cfg, workspace, name, &text) {
-        Ok(path) => {
-            let shown = path
-                .strip_prefix(workspace)
-                .unwrap_or(&path)
-                .to_string_lossy();
-            format!(
-                "{}\n[full result ({total} bytes) written to {shown}; read it with the read tool]",
-                crate::llm::truncate(&text, max),
-            )
-        }
-        Err(_) => crate::llm::truncate(&text, max).into_owned(),
+        Ok(path) => format!(
+            "{clipped}\n[full result ({} bytes) written to {}; read it with the read tool]",
+            text.len(),
+            relative_path(workspace, &path),
+        ),
+        Err(_) => clipped.into_owned(),
     }
 }
 
-static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
-
 fn spill_to_log(cfg: &Config, workspace: &Path, name: &str, text: &str) -> Result<PathBuf> {
-    let dir = cfg.tmp_path(workspace);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
     let safe: String = name
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
         .collect();
-    let path = dir.join(format!("tool-{safe}-{ts}-{seq}.log"));
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    let path = tmp_file(&cfg.tmp_path(workspace), &format!("tool-{safe}"), "log");
+    write_file(&path, text)?;
     Ok(path)
 }
 
-/// Deserialize a tool payload once, so validation and handler inputs share one definition.
-pub fn parse_args<T: DeserializeOwned>(args: &Value) -> Result<T> {
-    serde_json::from_value(args.clone()).context("invalid tool arguments")
-}
-
-pub fn req_str(args: &Value, key: &str) -> Result<String> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .map(std::string::ToString::to_string)
-        .ok_or_else(|| anyhow!("missing required string argument `{key}`"))
-}
-
-pub fn opt_str(args: &Value, key: &str) -> Option<String> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .map(std::string::ToString::to_string)
-}
-
-pub fn opt_i64(args: &Value, key: &str) -> Option<i64> {
-    args.get(key).and_then(Value::as_i64)
-}
-
-pub fn opt_bool(args: &Value, key: &str) -> Option<bool> {
-    args.get(key).and_then(Value::as_bool)
+/// Deserialize a tool payload, so validation and handler inputs share one definition.
+pub fn parse_args<'a, T: Deserialize<'a>>(args: &'a Value) -> Result<T> {
+    T::deserialize(args).context("invalid tool arguments")
 }
 
 #[cfg(test)]
@@ -2278,17 +1648,7 @@ mod tests {
     use super::{bounded_result, specs_for};
     use crate::config::Config;
     use crate::storage::modes::Mode;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_workspace(tag: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!("genji-tools-{tag}-{nanos}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::storage::util::temp_dir as temp_workspace;
 
     #[test]
     fn small_results_are_returned_verbatim() {
@@ -2323,32 +1683,39 @@ mod tests {
     }
 
     fn names(mode: Mode, formal: bool) -> Vec<String> {
-        specs_for(mode, formal, true)
+        names_with(mode, formal, true)
+    }
+
+    fn names_with(mode: Mode, formal: bool, skills: bool) -> Vec<String> {
+        specs_for(mode, formal, skills)
             .into_iter()
-            .map(|s| s.name.to_string())
+            .map(|s| s["function"]["name"].as_str().unwrap().to_string())
             .collect()
     }
 
     #[test]
-    fn tool_gate_requires_all_selected_capabilities() {
-        let gated = super::gated_tool(
+    fn tool_gate_requires_its_capability() {
+        let gated = super::tool(
             "test",
             super::ALL_MODES,
-            super::GATE_FORMAL | super::GATE_SKILLS,
             "test",
             serde_json::json!({}),
             super::basic::read,
-        );
-        assert!(!gated.available(Mode::Build, false, true));
+        )
+        .gate(super::Gate::Skills);
         assert!(!gated.available(Mode::Build, true, false));
-        assert!(gated.available(Mode::Build, true, true));
-    }
-
-    fn names_without_skills(mode: Mode, formal: bool) -> Vec<String> {
-        specs_for(mode, formal, false)
-            .into_iter()
-            .map(|s| s.name.to_string())
-            .collect()
+        assert!(gated.available(Mode::Build, false, true));
+        let formal = super::tool(
+            "t",
+            super::PLAN,
+            "t",
+            serde_json::json!({}),
+            super::basic::read,
+        )
+        .gate(super::Gate::Formal);
+        assert!(!formal.available(Mode::Plan, false, true));
+        assert!(formal.available(Mode::Plan, true, false));
+        assert!(!formal.available(Mode::Build, true, true));
     }
 
     fn is_ticket_or_requirement(name: &str) -> bool {
@@ -2397,7 +1764,7 @@ mod tests {
     fn skill_load_hidden_without_skills() {
         for mode in [Mode::Plan, Mode::Build, Mode::Explore, Mode::Retro] {
             assert!(
-                !names_without_skills(mode, false)
+                !names_with(mode, false, false)
                     .iter()
                     .any(|n| n == "skill_load"),
                 "{mode:?} exposed skill_load with no skills"

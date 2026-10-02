@@ -2,7 +2,7 @@
 
 A mode is the pair of `(core system prompt, extended system prompt, tool set)`.
 The **core** prompt is compiled in and minimal; the **extended** prompt is
-stored in the database and versioned there. `retro` is the one exception:
+read from `.genji/prompts/<mode>.md`. `retro` is the one exception:
 it has no extended prompt (see [Retro mode](retro.md)), so it cannot rewrite its
 own instructions.
 
@@ -11,7 +11,7 @@ own instructions.
 | `plan` | Produce and persist an implementation plan | plans; requirements/tickets only with Formal |
 | `build` | Implement requested changes and verify | code; tickets only with Formal |
 | `explore` | Investigate and report; never touches the ticket system | read/inspect only |
-| `retro` | Query history and improve prompts/skills | prompt & skill editing |
+| `retro` | Query history and improve prompts/skills | prompt & skill files |
 
 The effective system prompt is:
 
@@ -20,14 +20,13 @@ The effective system prompt is:
 <mode core prompt>          # not editable
 <Formal guidance>              # only when --formal is on (plan/build)
 ## Extended guidance
-<editable extended prompt>  # versioned in DB; retro may edit it
+<editable extended prompt>  # .genji/prompts/<mode>.md; retro may edit it
 ```
 
 The `## Extended guidance` section is omitted for `retro`, which has no extended
-prompt. Extended prompts start empty and are edited in the database by letting
-retro mode call `prompt_edit`. Every change is recorded as a version and can be
-rolled back (`prompt_history` / `prompt_rollback`). `prompt_edit` rejects
-`mode: "retro"`.
+prompt, and when the prompt file is missing or empty. Extended prompts are plain
+files; edit them by hand or let retro mode do it, and keep them in git for
+history.
 
 ---
 
@@ -49,7 +48,7 @@ never exposed in `explore`, `retro`, or in `plan`/`build` runs without Formal. S
 | `ticket_close` (Formal) | ✓ | ✓ |  |  |
 | `requirement_create` `requirement_update` `requirement_remove` (Formal) | ✓ |  |  |  |
 | `requirement_read` `requirement_tree` `requirement_ask` (Formal) | ✓ | ✓ |  |  |
-| `query_*`, `*_skill`, `prompt_*` |  |  |  | ✓ |
+| `query_instances` `query_messages` `query_tool_calls` `query_stats` |  |  |  | ✓ |
 
 - `ls` respects `.gitignore`, `.ignore`, `.git/info/exclude` and global git
   ignores. Non-recursive by default; set `max_depth` to walk the tree

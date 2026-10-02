@@ -19,7 +19,7 @@
 | `max_cycles` | `30` | Max plan/build cycles |
 | `max_subagent_depth` | `2` | Subagent nesting limit |
 | `db_path` | `.genji/genji.db` | SQLite database |
-| `requirements_dir` / `plans_dir` / `tickets_dir` / `skills_dir` | `.genji/requirements` / `.genji/plans` / `.genji/tickets` / `.genji/skills` | Content dirs |
+| `requirements_dir` / `plans_dir` / `tickets_dir` / `skills_dir` / `prompts_dir` | `.genji/requirements` / `.genji/plans` / `.genji/tickets` / `.genji/skills` / `.genji/prompts` | Content dirs |
 | `tmp_dir` | `.genji/tmp` | Scratch space for bash/spawn output and spilled tool results |
 | `control_socket` | `.genji/control.sock` | Unix socket for mid-run steering |
 | `control_enabled` | `true` | Open the control socket for top-level runs |
@@ -40,16 +40,17 @@ Control subcommands `list`, `inspect <id>`, `instruct <id> <text>` and
   requirements/*.md        # requirements, level in frontmatter (ingested automatically)
   tickets/*.md             # all formal-mode tickets, including closed tickets
   config.json              # runtime configuration (created on first run)
-  genji.db                 # SQLite: instances, messages, prompts, and history
+  genji.db                 # SQLite: instances, messages, tool calls, and compactions
   plans/
     *.md                   # implementation plans written by plan mode
   skills/
     *.md                   # skills (frontmatter + body)
+  prompts/
+    <mode>.md              # extended system prompt per mode
   control.sock             # Unix socket for mid-run steering (while running)
   tmp/                     # scratch space for bash/spawn output and spilled tool results
 ```
 
-Extended system prompts are stored only in the database (see
-[Modes](modes.md)); there is no `prompts/` directory.
+Extended system prompts are the `prompts/<mode>.md` files (see [Modes](modes.md)).
 
 Everything is configurable (see the table above).

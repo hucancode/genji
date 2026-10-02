@@ -54,38 +54,15 @@ Event types:
 ## Agent-to-agent communication
 
 Subagents speak the machine form. The `spawn` tool runs a child genji and
-reads its JSONL event stream. The child's events are returned to the model as
-the `spawn` tool result: a JSON object with an `events` array. The subagent's
-final report is **the `report` field of its `instance_end` event** in that array.
-The returned stream is bounded so the `instance_end` event (and thus the report)
-can never be truncated away.
+reads its JSONL event stream, keeping only its identity (`instance_start`) and
+its final `instance_end`. The tool result is a JSON object with
+`subagent_instance`, `mode`, `status`, `exit_code`, `timed_out`, `duration_ms`
+and the subagent's `report`.
 
 Subagent events are **not** relayed into the parent's stdout stream, so the
-parent's stream stays a faithful record of that one agent. Every run instead
-appends its events to a per-instance trace file. `genji inspect` prints the path
-to that file:
-
-```bash
-genji inspect <subagent_instance>
-```
-
-## Event files
-
-Each instance writes its events to `<registry>/events/<instance>.jsonl` (by
-default `~/.genji/events/`), append-only and flushed per event. The process
-fails to start if this file cannot be opened. It covers runs whose events never
-appeared on the parent stream — most importantly subagents — and survives after
-the process exits.
-
-To follow a live run, tail its trace file. Obtain the trace path with
-`genji inspect <id>`:
-
-```bash
-tail -f ~/.genji/events/<instance>.jsonl
-```
-
-Events emitted before attaching remain available because the trace is the
-complete durable record.
+parent's stream stays a faithful record of that one agent. Every run records its
+messages and tool calls in the workspace SQLite database, which `genji inspect`
+and retro mode read.
 
 ## Example
 
@@ -120,31 +97,22 @@ genji instruct <id> "focus on the parser"
 
 ### `genji inspect <id>` — a brief summary
 
-`<id>` is an instance id: a live one from `genji list`, or a finished run
-(including a subagent) whose trace still exists. `inspect` prints a single JSON
-object to stdout and a short human summary to stderr — no trace. It reports the
-trace path, event count, whether the run ended, and, when available, the
-`instance_start` metadata (workspace, mode, model, parent, task) and the live
-instance fields (pid, uptime, status).
-
-For a **live** instance it also asks the control socket for the current context
-(`/context`) and adds a brief token/percentage breakdown (system prompt, system
-tools, turn messages). Context is pull-only: it is never written to the event
-trace, so a finished run has no context summary.
+`<id>` is an instance id (or unique prefix), live or finished. `inspect` reads
+the instance's record from the workspace database and prints a single JSON object
+to stdout and a short human summary to stderr: id, mode, model, parent, depth,
+task, status, tokens used, message count, start/end times and report. For a live
+instance (found via `genji list`, which also supplies its workspace) it adds pid,
+uptime, control socket and live status. For a finished instance, run it from the
+instance's workspace or pass `--workspace`.
 
 ```bash
-genji inspect 7ab121              # by live instance id
-genji inspect 18d9ef8d77430f7e    # by finished instance id (or unique prefix)
-# stdout: {"type":"instance","id":"…","trace":"…","events":12,"ended":true,"mode":"build",…}
+genji inspect 7ab121
+# stdout: {"id":"7ab121",…,"status":"done","tokens_used":40,"messages":12}
 # stderr:
-# id:      18d9ef8d77430f7e
-# trace:   ~/.genji/events/18d9ef8d77430f7e.jsonl
-# events:  12 (ended)
-# mode:    build  model: qwen2.5-coder-7b
-# context: 1234 / 32768 tokens (3.8%)
-#   system prompt: 500 (1.5%)
-#   system tools: 2000 (6.1%)
-#   turn messages: 2734 (8.3%)
+# id            7ab121
+# mode          build
+# status        done
+# …
 ```
 
 Errors (unknown ids, unreachable sockets, missing arguments) go to stderr with a
@@ -152,23 +120,12 @@ non-zero exit code.
 
 ### Following the stream
 
-The trace file *is* the event stream: append-only and flushed after every
-event. So to follow an instance, read its `trace:` path from `genji inspect <id>`
-and tail the file directly — no extra subcommand required:
+The stream is the process's stdout. Redirect it to a file to keep it, and tail
+that file to follow a run:
 
 ```bash
-genji inspect <id>
-#   …
-#   trace:   ~/.genji/events/<instance>.jsonl
-
-cat  ~/.genji/events/<instance>.jsonl     # replay the trace so far
-tail -f ~/.genji/events/<instance>.jsonl  # follow it live (Ctrl-C to stop)
-```
-
-Each line is a JSON object, so pipe through `jq` to filter:
-
-```bash
-tail -f ~/.genji/events/<instance>.jsonl | jq -c 'select(.type=="tool_call")'
+genji build "…" > run.jsonl &
+tail -f run.jsonl | jq -c 'select(.type=="tool_call")'
 ```
 
 The `instance_end` event is written last, so a follow that reaches it is complete.

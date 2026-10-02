@@ -1,23 +1,20 @@
 use anyhow::Result;
-#[cfg(feature = "formal")]
-use rusqlite::params;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::config::Config;
+use crate::config::{Config, ModelRuntime};
 use crate::llm::{self, ChatMessage, LlmClient, Role};
 use crate::socket::{Control, ControlPoll};
 use crate::storage::context::ContextComposer;
 use crate::storage::db::Db;
 use crate::storage::events::EventEmitter;
-use crate::storage::modes::{Mode, shared_preamble};
-use crate::storage::prompts;
-use crate::storage::registry;
+use crate::storage::modes::{Mode, SHARED_PREAMBLE};
 use crate::tools;
 
 const MAX_LLM_RETRIES: u32 = 3;
+const STOPPED_BY_USER: &str = "(stopped by user via control socket)";
 
 pub struct Agent {
     pub cfg: Config,
@@ -30,13 +27,12 @@ pub struct Agent {
     pub tokens_used: i64,
     pub token_limit: i64,
     pub started: Instant,
-    pub deadline: Instant,
     pub depth: u32,
     pub seq: i64,
     pub formal: bool,
     pub active_plan: Option<String>,
     pub control: Option<Arc<Control>>,
-    pub events: Arc<EventEmitter>,
+    pub events: EventEmitter,
     pub failed: bool,
 }
 
@@ -52,22 +48,27 @@ pub struct AgentParams {
     pub formal: bool,
     pub control: Option<Arc<Control>>,
     pub context: Arc<RwLock<ContextComposer>>,
+    /// Resolved runtime for `mode`.
+    pub runtime: ModelRuntime,
 }
 
 pub fn build_context(
     cfg: &Config,
-    db: &Db,
+    workspace: &Path,
     mode: Mode,
     formal: bool,
-) -> Result<Arc<RwLock<ContextComposer>>> {
-    let runtime = cfg.runtime_for_mode(mode)?;
-    let window = runtime.limits.context_window;
-    let system = build_system(db, mode, formal)?;
-    let has_skills = db.has_skills()?;
-    let tools = tools::specs_for(mode, formal, has_skills);
-    Ok(Arc::new(RwLock::new(ContextComposer::new(
-        system, tools, window,
-    ))))
+    context_window: i64,
+) -> Arc<RwLock<ContextComposer>> {
+    let system = build_system(cfg, workspace, mode, formal);
+    Arc::new(RwLock::new(ContextComposer::new(
+        system,
+        mode_tools(cfg, workspace, mode, formal),
+        context_window,
+    )))
+}
+
+fn mode_tools(cfg: &Config, workspace: &Path, mode: Mode, formal: bool) -> Vec<Value> {
+    tools::specs_for(mode, formal, tools::skills::any(cfg, workspace))
 }
 
 impl Agent {
@@ -84,15 +85,12 @@ impl Agent {
             formal,
             control,
             context,
+            runtime,
         } = params;
-        let runtime = cfg.runtime_for_mode(mode)?;
         let model = runtime.model.clone();
         let limits = runtime.limits;
         let llm = LlmClient::from_runtime(&cfg, runtime);
-        let events = Arc::new(EventEmitter::new(
-            instance_id.clone(),
-            Some(registry::events_path(&instance_id)),
-        )?);
+        let events = EventEmitter::new(instance_id.clone());
         db.instance_start(
             &instance_id,
             mode.as_str(),
@@ -109,7 +107,6 @@ impl Agent {
             depth,
             &task,
         );
-        let deadline = Instant::now() + Duration::from_secs(cfg.time_limit_secs.max(1));
         Ok(Agent {
             cfg,
             workspace,
@@ -121,7 +118,6 @@ impl Agent {
             tokens_used: 0,
             token_limit: limits.token_limit,
             started: Instant::now(),
-            deadline,
             depth,
             seq: 0,
             formal,
@@ -140,43 +136,35 @@ impl Agent {
         crate::storage::util::relative_path(&self.workspace, path)
     }
 
-    pub fn refresh_system_prompt(&mut self) -> Result<()> {
-        let system = self.compose_system()?;
-        self.context.write().unwrap().set_system(system);
-        Ok(())
-    }
-
-    fn compose_system(&self) -> Result<String> {
-        let mut system = build_system(&self.db, self.mode, self.formal)?;
-        if let Some(slug) = &self.active_plan {
-            let file = self
-                .cfg
-                .plans_path(&self.workspace)
-                .join(format!("{slug}.md"));
-            let path = self.display_path(&file);
-            let exists = std::fs::read_to_string(&file).is_ok_and(|c| !c.trim().is_empty());
-            let guidance = if exists {
-                if self.mode == Mode::Plan {
-                    "read it before acting, update it with `plan_write` when the approach \
-                     changes, and treat it as the source of truth."
-                } else {
-                    "read it before acting, treat it as the source of truth, and report any \
-                     changes it needs."
-                }
-            } else if self.mode == Mode::Plan {
-                "no plan file exists yet; create it with `plan_write` before acting, then \
-                 keep it up to date."
-            } else {
-                "no plan file exists yet; plan mode owns writing it, so continue and report \
-                 the plan it needs."
-            };
-            let verb = if exists { "Follow it" } else { "Populate it" };
-            system.push_str(&format!(
-                "\n\n## Active plan\n\n\
-                 The user selected plan `{slug}` at `{path}`. {verb}: {guidance}"
-            ));
-        }
-        Ok(system)
+    /// The system prompt plus the active-plan section. Plan mode updates the
+    /// plan (creating it when missing); other modes follow an existing plan and
+    /// ignore a missing one.
+    fn compose_system(&self) -> String {
+        let mut system = build_system(&self.cfg, &self.workspace, self.mode, self.formal);
+        let Some(slug) = &self.active_plan else {
+            return system;
+        };
+        let file = self.cfg.plan_file(&self.workspace, slug);
+        let path = self.display_path(&file);
+        let exists = std::fs::read_to_string(&file).is_ok_and(|c| !c.trim().is_empty());
+        let guidance = match (exists, self.mode == Mode::Plan) {
+            (true, true) => format!(
+                "Read it before acting, update it with `plan_write` (path `{path}`) when the \
+                 approach changes, and treat it as the source of truth."
+            ),
+            (true, false) => "Read it before acting, treat it as the source of truth, and \
+                              report any changes it needs."
+                .to_string(),
+            (false, true) => format!(
+                "No plan file exists yet; create it with `plan_write` (path `{path}`) before \
+                 acting, then keep it up to date."
+            ),
+            (false, false) => return system,
+        };
+        system.push_str(&format!(
+            "\n\n## Active plan\n\nThe user selected plan `{slug}` at `{path}`. {guidance}"
+        ));
+        system
     }
 
     #[cfg(feature = "formal")]
@@ -186,16 +174,14 @@ impl Agent {
         let limits = runtime.limits;
         self.token_limit = limits.token_limit;
         self.llm = LlmClient::from_runtime(&self.cfg, runtime);
-        let tools = tools::specs_for(mode, self.formal, self.db.has_skills()?);
-        let system = self.compose_system()?;
+        let tools = mode_tools(&self.cfg, &self.workspace, mode, self.formal);
+        let system = self.compose_system();
         self.context
             .write()
             .unwrap()
             .switch_mode(tools, system, limits.context_window);
-        self.db.conn.execute(
-            "UPDATE instances SET mode=? WHERE id=?",
-            params![mode.as_str(), self.instance_id],
-        )?;
+        self.db
+            .instance_set_mode(&self.instance_id, mode.as_str())?;
         self.events.mode(mode.as_str(), &self.llm.model);
         Ok(())
     }
@@ -241,14 +227,6 @@ impl Agent {
         Ok(())
     }
 
-    pub fn log_tool_result(
-        &mut self,
-        tool_call_id: &str,
-        content: impl Into<String>,
-    ) -> Result<()> {
-        self.log(ChatMessage::tool_result(tool_call_id, content))
-    }
-
     pub fn add_user(&mut self, text: &str) -> Result<()> {
         self.log(ChatMessage::user(text))
     }
@@ -260,7 +238,7 @@ impl Agent {
                 self.tokens_used, self.token_limit
             ));
         }
-        if Instant::now() >= self.deadline {
+        if self.started.elapsed().as_secs() >= self.cfg.time_limit_secs.max(1) {
             return Some(format!(
                 "time limit reached ({}s)",
                 self.cfg.time_limit_secs
@@ -278,12 +256,11 @@ impl Agent {
                 self.events.error(&format!("stopped: {reason}"));
                 return Ok(format!("(stopped: {reason})"));
             }
-            let poll = self.poll_control()?;
+            let poll = self.poll_control();
             if poll.stop {
-                let m = "(stopped by user via control socket)".to_string();
-                eprintln!("[control] {m}");
-                self.events.status(&m);
-                return Ok(m);
+                eprintln!("[control] {STOPPED_BY_USER}");
+                self.events.status(STOPPED_BY_USER);
+                return Ok(STOPPED_BY_USER.to_string());
             }
             if let Some(c) = &self.control {
                 let status = format!(
@@ -300,11 +277,10 @@ impl Agent {
                 self.events.status(&status);
             }
             self.maybe_compact()?;
-            let (messages, tools_json) = {
+            let result = {
                 let ctx = self.context.read().unwrap();
-                (ctx.messages().to_vec(), ctx.tools().to_vec())
+                self.llm.chat(ctx.messages(), ctx.tools())
             };
-            let result = self.llm.chat(&messages, &tools_json);
             let resp = match result {
                 Ok(r) => r,
                 Err(e) => return Ok(self.fail(format!("LLM request failed: {e:#}"))),
@@ -328,12 +304,11 @@ impl Agent {
                 );
                 eprintln!("[llm] {msg}");
                 self.events.error(&msg);
-                std::thread::sleep(Duration::from_millis(500 * u64::from(llm_retries)));
                 continue;
             }
             llm_retries = 0;
 
-            let assistant = resp.message.clone();
+            let assistant = resp.message;
             if assistant.tool_calls.is_empty() {
                 let text = if assistant.content.trim().is_empty() {
                     "(no output)".to_string()
@@ -341,11 +316,11 @@ impl Agent {
                     assistant.content.clone()
                 };
                 self.log(assistant)?;
-                let poll = self.poll_control()?;
+                let poll = self.poll_control();
                 if poll.stop {
-                    return Ok("(stopped by user via control socket)".to_string());
+                    return Ok(STOPPED_BY_USER.to_string());
                 }
-                if poll.injected > 0 {
+                if poll.injected {
                     continue;
                 }
                 return Ok(text);
@@ -397,7 +372,7 @@ impl Agent {
                     duration
                 );
             }
-            self.log_tool_result(&tc.id, result)?;
+            self.log(ChatMessage::tool_result(&tc.id, result))?;
         }
         Ok(())
     }
@@ -414,9 +389,9 @@ impl Agent {
         if self.failed { "failed" } else { "done" }
     }
 
-    fn poll_control(&mut self) -> Result<ControlPoll> {
+    fn poll_control(&mut self) -> ControlPoll {
         let Some(ctrl) = self.control.clone() else {
-            return Ok(ControlPoll::default());
+            return ControlPoll::default();
         };
         let mut out = ControlPoll::default();
         let plan = ctrl.active_plan();
@@ -426,7 +401,8 @@ impl Agent {
                 None => eprintln!("[control] plan cleared"),
             }
             self.active_plan = plan;
-            self.refresh_system_prompt()?;
+            let system = self.compose_system();
+            self.context.write().unwrap().set_system(system);
         }
         for ins in ctrl.drain() {
             eprintln!(
@@ -434,12 +410,12 @@ impl Agent {
                 llm::truncate(&ins, 160)
             );
             let _ = self.log(ChatMessage::user(format!("[instruction from user]\n{ins}")));
-            out.injected += 1;
+            out.injected = true;
         }
         if ctrl.stop_requested() {
             out.stop = true;
         }
-        Ok(out)
+        out
     }
 
     fn record_usage(&mut self, prompt: i64, completion: i64) {
@@ -477,18 +453,42 @@ impl Agent {
     }
 }
 
-pub fn build_system(db: &Db, mode: Mode, formal: bool) -> Result<String> {
-    let mut base = format!("{}\n{}", shared_preamble(), mode.core_prompt());
-    if formal {
-        let guidance = mode.formal_guidance();
-        if !guidance.trim().is_empty() {
-            base.push('\n');
-            base.push_str(guidance);
-        }
+/// Core prompt, optional formal guidance, and the user-editable extended prompt
+/// from `<prompts_dir>/<mode>.md` (retro has none).
+pub fn build_system(cfg: &Config, workspace: &Path, mode: Mode, formal: bool) -> String {
+    let mut base = format!("{}\n{}", SHARED_PREAMBLE, mode.core_prompt());
+    if formal && !mode.formal_guidance().trim().is_empty() {
+        base.push('\n');
+        base.push_str(mode.formal_guidance());
     }
-    let extended = prompts::load_extended(db, mode)?;
+    let extended = mode
+        .allows_extended()
+        .then(|| cfg.prompts_path(workspace).join(format!("{mode}.md")))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
     if extended.trim().is_empty() {
-        return Ok(base);
+        return base;
     }
-    Ok(format!("{base}\n\n## Extended guidance\n{extended}"))
+    format!("{base}\n\n## Extended guidance\n{extended}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_system;
+    use crate::config::Config;
+    use crate::storage::modes::Mode;
+
+    #[test]
+    fn extended_prompt_comes_from_the_prompts_dir() {
+        let ws = crate::storage::util::temp_dir("agent-prompts");
+        let cfg = Config::default();
+        let dir = cfg.prompts_path(&ws);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!build_system(&cfg, &ws, Mode::Build, false).contains("Extended guidance"));
+        std::fs::write(dir.join("build.md"), "Always run tests.").unwrap();
+        std::fs::write(dir.join("retro.md"), "ignored").unwrap();
+        assert!(build_system(&cfg, &ws, Mode::Build, false).ends_with("Always run tests."));
+        assert!(!build_system(&cfg, &ws, Mode::Retro, false).contains("ignored"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 }

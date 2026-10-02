@@ -1,17 +1,15 @@
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
-use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread;
 use std::time::Duration;
 
 use crate::storage::context::ContextComposer;
+use crate::storage::util::valid_slug;
 
 /// A control socket that lets a user inject instructions into a running agent.
 ///
@@ -20,7 +18,6 @@ use crate::storage::context::ContextComposer;
 /// - any other text -> queued as a user instruction
 /// - `/status` -> returns the agent's current status
 /// - `/context` -> returns the live context snapshot (messages + tools)
-/// - `/context stats` -> returns the computed token breakdown
 /// - `/stop` -> requests a graceful stop
 /// - `/setplan <slug>` -> follow/refine the plan `plans_dir/<slug>.md` (`off` clears)
 /// - `/ping` -> liveness check
@@ -30,19 +27,24 @@ use crate::storage::context::ContextComposer;
 pub struct Control {
     pub path: PathBuf,
     plans_dir: PathBuf,
-    queue: Mutex<VecDeque<String>>,
-    stop: AtomicBool,
-    shutdown: AtomicBool,
-    status: Mutex<String>,
-    plan: Mutex<Option<String>>,
+    state: Mutex<State>,
+    /// Signalled when an instruction is queued or a stop is requested.
+    wake: Condvar,
     context: Arc<RwLock<ContextComposer>>,
+}
+
+struct State {
+    queue: Vec<String>,
+    stop: bool,
+    status: String,
+    plan: Option<String>,
 }
 
 /// Result of polling the control socket at a safe point in the run loop.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ControlPoll {
     pub stop: bool,
-    pub injected: usize,
+    pub injected: bool,
 }
 
 impl Control {
@@ -72,137 +74,101 @@ impl Control {
             .with_context(|| format!("binding control socket {}", path.display()))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("securing control socket {}", path.display()))?;
-        listener.set_nonblocking(true)?;
         let ctrl = Arc::new(Control {
-            path: path.clone(),
+            path,
             plans_dir,
-            queue: Mutex::new(VecDeque::new()),
-            stop: AtomicBool::new(false),
-            shutdown: AtomicBool::new(false),
-            status: Mutex::new("starting".to_string()),
-            plan: Mutex::new(None),
+            state: Mutex::new(State {
+                queue: Vec::new(),
+                stop: false,
+                status: "starting".to_string(),
+                plan: None,
+            }),
+            wake: Condvar::new(),
             context,
         });
+        // Blocks in `accept` for the life of the process; `shutdown` removes the
+        // socket file and process exit ends the thread.
         let c = ctrl.clone();
         thread::Builder::new()
             .name("genji-control".into())
             .spawn(move || {
-                loop {
-                    if c.shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            let _ = handle(stream, &c);
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(50));
-                        }
-                        Err(_) => thread::sleep(Duration::from_millis(50)),
-                    }
+                for stream in listener.incoming().flatten() {
+                    let _ = handle(stream, &c);
                 }
-                let _ = std::fs::remove_file(&path);
             })?;
         Ok(ctrl)
     }
 
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap()
+    }
+
     /// Take all queued instructions (FIFO).
     pub fn drain(&self) -> Vec<String> {
-        let mut q = self.queue.lock().unwrap();
-        q.drain(..).collect()
+        std::mem::take(&mut self.state().queue)
+    }
+
+    /// Block until an instruction is queued (returned) or a stop is requested (`None`).
+    pub fn wait_for_instruction(&self) -> Option<Vec<String>> {
+        let mut st = self
+            .wake
+            .wait_while(self.state(), |st| st.queue.is_empty() && !st.stop)
+            .unwrap();
+        if st.stop {
+            return None;
+        }
+        Some(std::mem::take(&mut st.queue))
     }
 
     pub fn stop_requested(&self) -> bool {
-        self.stop.load(Ordering::SeqCst)
+        self.state().stop
     }
 
     /// The plan slug selected with `/setplan`, if any. The agent polls this so a
     /// user can point a running run at a specific plan without restarting it.
     pub fn active_plan(&self) -> Option<String> {
-        self.plan.lock().unwrap().clone()
-    }
-
-    fn set_plan(&self, slug: Option<String>) {
-        *self.plan.lock().unwrap() = slug;
+        self.state().plan.clone()
     }
 
     pub fn set_status(&self, s: impl Into<String>) {
-        *self.status.lock().unwrap() = s.into();
-    }
-
-    fn context_snapshot(&self) -> Value {
-        self.context.read().unwrap().snapshot()
-    }
-
-    fn context_stats(&self) -> Value {
-        self.context.read().unwrap().stats().to_json()
-    }
-
-    pub fn status(&self) -> String {
-        self.status.lock().unwrap().clone()
+        self.state().status = s.into();
     }
 
     pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-enum ControlCommand<'a> {
-    Status,
-    Context,
-    ContextStats,
-    Stop,
-    SetPlan(&'a str),
-    Ping,
-    Instruction(&'a str),
-    Empty,
-}
-
-fn parse_command(line: &str) -> ControlCommand<'_> {
-    match line {
-        "" => ControlCommand::Empty,
-        "/status" => ControlCommand::Status,
-        "/context" => ControlCommand::Context,
-        "/context stats" => ControlCommand::ContextStats,
-        "/stop" => ControlCommand::Stop,
-        "/ping" => ControlCommand::Ping,
-        "/setplan" | "/setplan " => ControlCommand::SetPlan(""),
-        value => value
-            .strip_prefix("/setplan ")
-            .map_or(ControlCommand::Instruction(value), |rest| {
-                ControlCommand::SetPlan(rest.trim())
-            }),
     }
 }
 
 fn handle(mut stream: UnixStream, c: &Control) -> Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
-    reader.read_line(&mut line)?;
+    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
     let line = line.trim();
-    let resp = match parse_command(line) {
-        ControlCommand::Empty => "error: empty command".to_string(),
-        ControlCommand::Status => format!("status: {}", c.status()),
-        ControlCommand::Context => {
-            serde_json::to_string(&c.context_snapshot()).unwrap_or_else(|e| format!("error: {e}"))
-        }
-        ControlCommand::ContextStats => {
-            serde_json::to_string(&c.context_stats()).unwrap_or_else(|e| format!("error: {e}"))
-        }
-        ControlCommand::Stop => {
-            c.stop.store(true, Ordering::SeqCst);
+    let resp = match line {
+        "" => "error: empty command".to_string(),
+        "/status" => format!("status: {}", c.state().status),
+        "/context" => serde_json::to_string(&c.context.read().unwrap().snapshot())
+            .unwrap_or_else(|e| format!("error: {e}")),
+        "/stop" => {
+            c.state().stop = true;
+            c.wake.notify_all();
             "stopping".to_string()
         }
-        ControlCommand::Ping => "pong".to_string(),
-        ControlCommand::Instruction(text) => {
-            let mut q = c.queue.lock().unwrap();
-            q.push_back(text.to_string());
-            eprintln!("[control] received user instruction ({} pending)", q.len());
-            format!("queued ({} pending)", q.len())
-        }
-        ControlCommand::SetPlan(slug) => set_plan_command(c, slug),
+        "/ping" => "pong".to_string(),
+        "/setplan" => set_plan_command(c, ""),
+        _ => match line.strip_prefix("/setplan ") {
+            Some(slug) => set_plan_command(c, slug.trim()),
+            None => {
+                let mut st = c.state();
+                st.queue.push(line.to_string());
+                c.wake.notify_all();
+                eprintln!(
+                    "[control] received user instruction ({} pending)",
+                    st.queue.len()
+                );
+                format!("queued ({} pending)", st.queue.len())
+            }
+        },
     };
     let _ = stream.write_all(format!("{resp}\n").as_bytes());
     let _ = stream.flush();
@@ -215,20 +181,21 @@ fn set_plan_command(c: &Control, slug: &str) -> String {
         return "error: usage: /setplan <slug>".to_string();
     }
     if slug.eq_ignore_ascii_case("off") {
-        c.set_plan(None);
+        c.state().plan = None;
         return "plan cleared".to_string();
     }
-    if !valid_plan_slug(slug) {
+    if !valid_slug(slug) {
         return format!("error: invalid plan slug `{slug}` (use letters, digits, '-' or '_')");
     }
-    c.set_plan(Some(slug.to_string()));
     let file = c.plans_dir.join(format!("{slug}.md"));
-    let mut q = c.queue.lock().unwrap();
+    let mut st = c.state();
+    st.plan = Some(slug.to_string());
     if let Some(instruction) = plan_instruction(&file, slug) {
-        q.push_back(instruction);
+        st.queue.push(instruction);
+        c.wake.notify_all();
         format!(
             "plan set to {slug} ({} pending, existing plan queued)",
-            q.len()
+            st.queue.len()
         )
     } else {
         format!("plan set to {slug} (empty; awaiting plan content)")
@@ -251,16 +218,6 @@ fn plan_instruction(plan_file: &Path, slug: &str) -> Option<String> {
     ))
 }
 
-/// A `/setplan` slug must be safe to use as a bare file name: letters, digits,
-/// `-` and `_`, at most 64 chars, and no path separators.
-fn valid_plan_slug(slug: &str) -> bool {
-    !slug.is_empty()
-        && slug.len() <= 64
-        && slug
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
 /// Client: connect to a running agent's control socket and send one line.
 pub fn send(path: &Path, msg: &str) -> Result<String> {
     let mut stream = UnixStream::connect(path).with_context(|| {
@@ -280,15 +237,13 @@ pub fn send(path: &Path, msg: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Control, plan_instruction, send, valid_plan_slug};
+    use super::{Control, plan_instruction, send};
     use crate::storage::context::ContextComposer;
+    use crate::storage::util::temp_dir;
     use std::sync::{Arc, RwLock};
 
     fn temp_file(tag: &str, content: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let path = std::env::temp_dir().join(format!("genji-control-{tag}-{nanos}.md"));
+        let path = temp_dir(&format!("control-{tag}")).join("plan.md");
         std::fs::write(&path, content).unwrap();
         path
     }
@@ -299,36 +254,22 @@ mod tests {
         let ins = plan_instruction(&file, "do-the-thing").expect("expected instruction");
         assert!(ins.contains("do-the-thing"));
         assert!(ins.contains(&file.display().to_string()));
-        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
     #[test]
     fn empty_or_missing_plan_queues_nothing() {
         let empty = temp_file("empty", "   \n\t");
         assert!(plan_instruction(&empty, "empty").is_none());
-        let _ = std::fs::remove_file(&empty);
+        let _ = std::fs::remove_dir_all(empty.parent().unwrap());
         assert!(
             plan_instruction(std::path::Path::new("/nonexistent/genji-plan.md"), "x").is_none()
         );
     }
 
     #[test]
-    fn plan_slugs_are_safe_file_names() {
-        assert!(valid_plan_slug("rate-limiting"));
-        assert!(valid_plan_slug("Plan_2"));
-        assert!(!valid_plan_slug(""));
-        assert!(!valid_plan_slug("../escape"));
-        assert!(!valid_plan_slug("a/b"));
-        assert!(!valid_plan_slug("has space"));
-        assert!(!valid_plan_slug(&"x".repeat(65)));
-    }
-
-    #[test]
     fn context_command_measures_the_shared_composer() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!("genji-control-ctx-{nanos}"));
+        let dir = temp_dir("control-ctx");
         let sock = dir.join("control.sock");
         let composer = Arc::new(RwLock::new(ContextComposer::new(
             "system".to_string(),
@@ -344,21 +285,6 @@ mod tests {
         );
         assert!(snapshot.contains("\"messages\""), "got: {snapshot}");
         assert!(snapshot.contains("\"system\""), "got: {snapshot}");
-        // The snapshot is a raw read; the token breakdown is opt-in.
-        assert!(
-            !snapshot.contains("system_prompt_tokens"),
-            "got: {snapshot}"
-        );
-
-        let breakdown = send(&sock, "/context stats").expect("send /context stats");
-        assert!(
-            breakdown.contains("\"context_window\":1000"),
-            "got: {breakdown}"
-        );
-        assert!(
-            breakdown.contains("\"system_prompt_tokens\""),
-            "got: {breakdown}"
-        );
 
         ctrl.shutdown();
         let _ = std::fs::remove_dir_all(&dir);

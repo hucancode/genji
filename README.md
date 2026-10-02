@@ -13,7 +13,6 @@ Manage running agents
 genji list                                   # list running instances
 genji inspect <id>                           # summary
 genji instruct <id> "text"                   # send an instruction to a running instance
-genji setplan <id> <slug>                    # follow/refine .genji/plans/<slug>.md
+genji setplan <id> <slug>                    # plan mode updates .genji/plans/<slug>.md, build mode follows it
 genji stop <id>... | all                     # graceful stop
-tail -f ~/.genji/events/<instance-id>.jsonl  # follow live events
 ```

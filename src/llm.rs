@@ -1,37 +1,21 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize, Serializer};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::borrow::Cow;
-use std::fmt;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::config::{Config, ModelRuntime, ProviderConfig};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    System,
-    User,
-    #[default]
-    Assistant,
-    Tool,
-}
-
-impl Role {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::User => "user",
-            Self::Assistant => "assistant",
-            Self::Tool => "tool",
-        }
-    }
-}
-
-impl fmt::Display for Role {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+crate::storage::string_enum! {
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub enum Role {
+        System => "system",
+        User => "user",
+        #[default]
+        Assistant => "assistant",
+        Tool => "tool",
     }
 }
 
@@ -97,7 +81,6 @@ struct ResponseChoice {
 
 #[derive(Debug, Default, Deserialize)]
 struct WireMessage {
-    #[serde(default)]
     content: Option<String>,
     reasoning_content: Option<String>,
     #[serde(default)]
@@ -161,17 +144,12 @@ impl ChatMessage {
     }
 
     pub fn est_tokens(&self) -> i64 {
-        let mut chars = self.content.chars().count();
-        if let Some(reasoning) = &self.reasoning_content {
-            chars = chars.saturating_add(reasoning.chars().count());
-        }
+        // Byte length over-counts non-ASCII text, which is fine for an estimate.
+        let mut bytes = self.content.len() + self.reasoning_content.as_ref().map_or(0, String::len);
         for call in &self.tool_calls {
-            chars = chars
-                .saturating_add(call.name.chars().count())
-                .saturating_add(call.arguments.chars().count())
-                .saturating_add(16);
+            bytes += call.name.len() + call.arguments.len() + 16;
         }
-        estimate_chars(chars)
+        estimate_chars(bytes)
     }
 }
 
@@ -181,7 +159,7 @@ pub fn estimate_chars(chars: usize) -> i64 {
         .saturating_add(4)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LlmResponse {
     pub message: ChatMessage,
     pub prompt_tokens: i64,
@@ -199,11 +177,27 @@ pub fn estimate_messages(messages: &[ChatMessage]) -> i64 {
     messages.iter().map(ChatMessage::est_tokens).sum::<i64>() + 8
 }
 
+/// Chat-completions request body, serialized straight from the live context.
+#[derive(Serialize)]
+struct Request<'a> {
+    model: &'a str,
+    messages: &'a [ChatMessage],
+    stream: bool,
+    #[serde(skip_serializing_if = "<[Value]>::is_empty")]
+    tools: &'a [Value],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+    #[serde(flatten)]
+    max_tokens: BTreeMap<&'a str, i64>,
+}
+
 pub struct LlmClient {
-    provider: ProviderConfig,
     pub model: String,
+    max_tokens_field: String,
     max_tokens: i64,
-    api_key: String,
+    send_tool_choice: bool,
+    url: String,
+    headers: Vec<(String, String)>,
     agent: ureq::Agent,
 }
 
@@ -213,145 +207,108 @@ impl LlmClient {
             .timeout(Duration::from_secs(cfg.time_limit_secs.max(60) + 120))
             .build();
         let api_key = runtime.provider.resolve_api_key();
+        let mut headers = Vec::new();
+        if !api_key.is_empty() {
+            headers.push(if runtime.provider.auth == "api-key" {
+                ("api-key".to_string(), api_key)
+            } else {
+                ("Authorization".to_string(), format!("Bearer {api_key}"))
+            });
+        }
+        headers.extend(runtime.provider.extra_headers.clone());
         Self {
-            provider: runtime.provider,
+            url: endpoint(&runtime.provider, &runtime.model),
+            headers,
+            max_tokens_field: runtime.provider.max_tokens_field,
+            send_tool_choice: runtime.provider.send_tool_choice,
             model: runtime.model,
             max_tokens: runtime.limits.max_output_tokens,
-            api_key,
             agent,
         }
     }
 
-    /// Build the endpoint URL for this provider kind.
-    ///
-    /// * openai-compatible (llama.cpp, `DeepSeek`, `OpenAI`, …): `{base}/chat/completions`
-    /// * azure: `{base}/openai/deployments/{deployment}/chat/completions?api-version=…`
-    fn url(&self) -> String {
-        let base = self.provider.base_url.trim_end_matches('/');
-        let mut url = if self.provider.is_azure() {
-            format!(
-                "{base}/openai/deployments/{}/chat/completions",
-                url_encode(&self.model)
-            )
-        } else {
-            format!("{base}/chat/completions")
-        };
-        let mut query: Vec<(String, String)> = Vec::new();
-        if self.provider.is_azure() && !self.provider.api_version.is_empty() {
-            query.push(("api-version".into(), self.provider.api_version.clone()));
-        }
-        query.extend(
-            self.provider
-                .extra_query
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone())),
-        );
-        if !query.is_empty() {
-            let qs = query
-                .iter()
-                .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
-                .collect::<Vec<_>>()
-                .join("&");
-            url.push('?');
-            url.push_str(&qs);
-        }
-        url
-    }
-
     pub fn chat(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<LlmResponse> {
-        let mut body = json!({
-            "model": self.model,
-            "messages": messages,
-            "stream": false,
-        });
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert(
-                self.provider.max_tokens_field.clone(),
-                json!(self.max_tokens),
-            );
-        }
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
-            if self.provider.send_tool_choice {
-                body["tool_choice"] = json!("auto");
-            }
-        }
-        let url = self.url();
-
-        let mut last_err: Option<anyhow::Error> = None;
+        let body = serde_json::to_vec(&Request {
+            model: &self.model,
+            messages,
+            stream: false,
+            tools,
+            tool_choice: (self.send_tool_choice && !tools.is_empty()).then_some("auto"),
+            max_tokens: BTreeMap::from([(self.max_tokens_field.as_str(), self.max_tokens)]),
+        })?;
         for attempt in 0..4u32 {
-            match self.post_once(&url, &body) {
+            match self.post_once(&body) {
                 Ok(resp) => return Ok(resp),
-                Err(e) => {
-                    let retryable = is_retryable(&e);
-                    last_err = Some(e);
-                    if !retryable || attempt == 3 {
-                        break;
-                    }
+                Err((e, true)) if attempt < 3 => {
                     let backoff = Duration::from_millis(800 * (1u64 << attempt));
                     eprintln!(
-                        "[llm] retry {}/3 after error, sleeping {:?}",
-                        attempt + 1,
-                        backoff
+                        "[llm] retry {}/3 after error ({e:#}), sleeping {backoff:?}",
+                        attempt + 1
                     );
                     std::thread::sleep(backoff);
                 }
+                Err((e, _)) => return Err(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow!("llm request failed")))
+        unreachable!("the final attempt always returns")
     }
 
-    fn post_once(&self, url: &str, body: &Value) -> Result<LlmResponse> {
-        let mut req = self.agent.post(url).set("Content-Type", "application/json");
-        if !self.api_key.is_empty() {
-            if self.provider.auth == "api-key" {
-                req = req.set("api-key", &self.api_key);
-            } else {
-                req = req.set("Authorization", &format!("Bearer {}", self.api_key));
-            }
-        }
-        for (k, v) in &self.provider.extra_headers {
+    /// One request; the error carries whether it is worth retrying.
+    fn post_once(&self, body: &[u8]) -> Result<LlmResponse, (anyhow::Error, bool)> {
+        let mut req = self
+            .agent
+            .post(&self.url)
+            .set("Content-Type", "application/json");
+        for (k, v) in &self.headers {
             req = req.set(k, v);
         }
-
-        let resp = req.send_json(body);
-        let value: Value = match resp {
-            Ok(r) => r.into_json::<Value>().context("decoding llm json")?,
+        match req.send_bytes(body) {
+            Ok(r) => {
+                let text = r
+                    .into_string()
+                    .map_err(|e| (anyhow!("reading llm response: {e}"), true))?;
+                parse_response(&text).map_err(|e| (e, false))
+            }
             Err(ureq::Error::Status(code, r)) => {
                 let txt = r.into_string().unwrap_or_default();
-                let msg = format!(
-                    "HTTP {}: {}",
-                    code,
-                    txt.chars().take(600).collect::<String>()
-                );
-                return Err(if code == 429 || code >= 500 {
-                    anyhow::Error::new(Retryable { msg })
-                } else {
-                    anyhow!(msg)
-                });
+                Err((
+                    anyhow!("HTTP {code}: {}", txt.chars().take(600).collect::<String>()),
+                    code == 429 || code >= 500,
+                ))
             }
-            Err(e) => {
-                return Err(anyhow::Error::new(Retryable {
-                    msg: format!("transport error: {e}"),
-                }));
-            }
-        };
-        parse_response(value)
+            Err(e) => Err((anyhow!("transport error: {e}"), true)),
+        }
     }
 }
 
-#[derive(Debug)]
-struct Retryable {
-    msg: String,
-}
-
-impl std::fmt::Display for Retryable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.msg)
+/// Endpoint URL for the provider kind.
+///
+/// * openai-compatible (llama.cpp, `DeepSeek`, `OpenAI`, …): `{base}/chat/completions`
+/// * azure: `{base}/openai/deployments/{deployment}/chat/completions?api-version=…`
+fn endpoint(provider: &ProviderConfig, model: &str) -> String {
+    let base = provider.base_url.trim_end_matches('/');
+    let mut url = if provider.is_azure() {
+        format!(
+            "{base}/openai/deployments/{}/chat/completions",
+            url_encode(model)
+        )
+    } else {
+        format!("{base}/chat/completions")
+    };
+    let api_version = (provider.is_azure() && !provider.api_version.is_empty())
+        .then_some(("api-version", &provider.api_version));
+    let query = api_version
+        .into_iter()
+        .chain(provider.extra_query.iter().map(|(k, v)| (k.as_str(), v)))
+        .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(&query);
     }
+    url
 }
-
-impl std::error::Error for Retryable {}
 
 fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -368,19 +325,14 @@ fn url_encode(s: &str) -> String {
     out
 }
 
-fn is_retryable(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<Retryable>().is_some()
-}
-
-fn parse_response(value: Value) -> Result<LlmResponse> {
-    let raw = value.to_string();
-    let parsed: WireResponse = serde_json::from_value(value).context("parsing llm response")?;
-    let choice = parsed.choices.into_iter().next().ok_or_else(|| {
-        anyhow!(
-            "llm response has no choices: {}",
-            truncate(&raw, 400)
-        )
-    })?;
+fn parse_response(text: &str) -> Result<LlmResponse> {
+    let parsed: WireResponse = serde_json::from_str(text)
+        .with_context(|| format!("parsing llm response: {}", truncate(text, 400)))?;
+    let choice = parsed
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("llm response has no choices: {}", truncate(text, 400)))?;
     let tool_calls = choice
         .message
         .tool_calls
@@ -433,7 +385,7 @@ pub fn truncate(s: &str, max: usize) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatMessage, truncate, url_encode};
+    use super::{ChatMessage, Request, truncate, url_encode};
 
     #[test]
     fn truncates_on_char_boundary() {
@@ -467,5 +419,28 @@ mod tests {
         assert!(!resp.is_truncated());
         resp.finish_reason = None;
         assert!(!resp.is_truncated());
+    }
+
+    #[test]
+    fn request_body_wire_format() {
+        let msgs = [ChatMessage::user("hi")];
+        let body = |tools: &[serde_json::Value], choice| {
+            serde_json::to_value(Request {
+                model: "m",
+                messages: &msgs,
+                stream: false,
+                tools,
+                tool_choice: choice,
+                max_tokens: std::collections::BTreeMap::from([("max_completion_tokens", 9)]),
+            })
+            .unwrap()
+        };
+        let bare = body(&[], None);
+        assert_eq!(bare["max_completion_tokens"], 9);
+        assert_eq!(bare["messages"][0]["content"], "hi");
+        assert!(bare.get("tools").is_none() && bare.get("tool_choice").is_none());
+        let with = body(&[serde_json::json!({"type": "function"})], Some("auto"));
+        assert_eq!(with["tools"][0]["type"], "function");
+        assert_eq!(with["tool_choice"], "auto");
     }
 }

@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::storage::util::{resolve_path, write_file};
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelsConfig {
@@ -42,20 +44,6 @@ pub struct EffectiveLimits {
     pub max_output_tokens: i64,
 }
 
-impl EffectiveLimits {
-    fn overlay(&mut self, overrides: &ModelLimits) {
-        if let Some(value) = overrides.token_limit {
-            self.token_limit = value;
-        }
-        if let Some(value) = overrides.context_window {
-            self.context_window = value;
-        }
-        if let Some(value) = overrides.max_output_tokens {
-            self.max_output_tokens = value;
-        }
-    }
-}
-
 /// Fully resolved provider, model, and limits for one agent mode.
 #[derive(Debug, Clone)]
 pub struct ModelRuntime {
@@ -87,17 +75,11 @@ pub struct ProviderConfig {
     pub models: ModelsConfig,
     /// "`max_tokens`" (default) or "`max_completion_tokens`" (some Azure/OpenAI reasoning models).
     pub max_tokens_field: String,
-    /// Override the top-level context window for this provider.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<i64>,
-    /// Override the top-level max output tokens for this provider.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<i64>,
-    /// Override the top-level run token budget for this provider.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_limit: Option<i64>,
+    /// Provider-wide overrides of the top-level limits.
+    #[serde(flatten)]
+    pub limits: ModelLimits,
     /// Per-model overrides, keyed by model/deployment name. Win over the
-    /// provider-level fields above and the top-level values.
+    /// provider-level limits and the top-level values.
     pub model_limits: BTreeMap<String, ModelLimits>,
     /// Send `tool_choice: "auto"` (some endpoints reject it).
     pub send_tool_choice: bool,
@@ -119,9 +101,7 @@ impl Default for ProviderConfig {
             model: String::new(),
             models: ModelsConfig::default(),
             max_tokens_field: "max_tokens".into(),
-            context_window: None,
-            max_output_tokens: None,
-            token_limit: None,
+            limits: ModelLimits::default(),
             model_limits: BTreeMap::new(),
             send_tool_choice: true,
             extra_headers: BTreeMap::new(),
@@ -145,7 +125,7 @@ impl ProviderConfig {
         {
             return v;
         }
-        let path = expand_tilde(&self.auth_file);
+        let path = crate::storage::util::expand_home(&self.auth_file);
         if let Ok(text) = std::fs::read_to_string(&path)
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
             && let Some(key) = v
@@ -181,6 +161,7 @@ pub struct Config {
     #[cfg(feature = "formal")]
     pub requirements_dir: String,
     pub plans_dir: String,
+    pub prompts_dir: String,
     #[cfg(feature = "formal")]
     pub tickets_dir: String,
     pub skills_dir: String,
@@ -233,6 +214,7 @@ impl Default for Config {
             #[cfg(feature = "formal")]
             requirements_dir: ".genji/requirements".into(),
             plans_dir: ".genji/plans".into(),
+            prompts_dir: ".genji/prompts".into(),
             #[cfg(feature = "formal")]
             tickets_dir: ".genji/tickets".into(),
             skills_dir: ".genji/skills".into(),
@@ -253,14 +235,9 @@ impl Config {
     pub fn load_or_create(workspace: &Path) -> Result<Self> {
         let path = Self::path_in(workspace);
         if !path.exists() {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
             let cfg = Config::default();
             let text = serde_json::to_string_pretty(&cfg)?;
-            std::fs::write(&path, format!("{text}\n"))
-                .with_context(|| format!("writing default config to {}", path.display()))?;
+            write_file(&path, format!("{text}\n"))?;
             eprintln!("[config] created default config at {}", path.display());
             return Ok(cfg);
         }
@@ -271,33 +248,65 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn workspace_path(workspace: &Path, rel: &str) -> PathBuf {
-        crate::storage::util::resolve_path(workspace, rel)
-    }
-
     pub fn db_file(&self, workspace: &Path) -> PathBuf {
-        Self::workspace_path(workspace, &self.db_path)
+        resolve_path(workspace, &self.db_path)
     }
 
     #[cfg(feature = "formal")]
     pub fn requirements_path(&self, workspace: &Path) -> PathBuf {
-        Self::workspace_path(workspace, &self.requirements_dir)
+        resolve_path(workspace, &self.requirements_dir)
     }
     pub fn plans_path(&self, workspace: &Path) -> PathBuf {
-        Self::workspace_path(workspace, &self.plans_dir)
+        resolve_path(workspace, &self.plans_dir)
     }
     #[cfg(feature = "formal")]
     pub fn tickets_path(&self, workspace: &Path) -> PathBuf {
-        Self::workspace_path(workspace, &self.tickets_dir)
+        resolve_path(workspace, &self.tickets_dir)
+    }
+    pub fn prompts_path(&self, workspace: &Path) -> PathBuf {
+        resolve_path(workspace, &self.prompts_dir)
     }
     pub fn skills_path(&self, workspace: &Path) -> PathBuf {
-        Self::workspace_path(workspace, &self.skills_dir)
+        resolve_path(workspace, &self.skills_dir)
     }
     pub fn tmp_path(&self, workspace: &Path) -> PathBuf {
-        Self::workspace_path(workspace, &self.tmp_dir)
+        resolve_path(workspace, &self.tmp_dir)
     }
     pub fn control_path(&self, workspace: &Path) -> PathBuf {
-        Self::workspace_path(workspace, &self.control_socket)
+        resolve_path(workspace, &self.control_socket)
+    }
+
+    /// Directories created at startup; formal mode adds requirements and tickets.
+    pub fn layout_dirs(&self, workspace: &Path, formal: bool) -> Vec<PathBuf> {
+        let mut dirs = vec![
+            self.plans_path(workspace),
+            self.skills_path(workspace),
+            self.prompts_path(workspace),
+        ];
+        dirs.extend(
+            self.formal_dirs(workspace, formal)
+                .into_iter()
+                .map(|(_, d)| d),
+        );
+        dirs
+    }
+
+    /// Formal-mode content directories with display labels (empty unless formal).
+    pub fn formal_dirs(&self, workspace: &Path, formal: bool) -> Vec<(&'static str, PathBuf)> {
+        #[cfg(feature = "formal")]
+        if formal {
+            return vec![
+                ("requirement(s)", self.requirements_path(workspace)),
+                ("ticket(s)", self.tickets_path(workspace)),
+            ];
+        }
+        let _ = (workspace, formal);
+        Vec::new()
+    }
+
+    /// `<plans_dir>/<slug>.md`.
+    pub fn plan_file(&self, workspace: &Path, slug: &str) -> PathBuf {
+        self.plans_path(workspace).join(format!("{slug}.md"))
     }
 
     pub fn resolve_active_provider(&self) -> Result<ProviderConfig> {
@@ -341,25 +350,15 @@ impl Config {
         })
     }
 
-    /// Resolve only the model name. Prefer [`Self::runtime_for_mode`] where the
-    /// provider and limits are also needed.
-    pub fn model_for_mode(&self, mode: crate::storage::modes::Mode) -> Result<String> {
-        Ok(self.runtime_for_mode(mode)?.model)
-    }
-
     fn limits_for(&self, p: &ProviderConfig, model: &str) -> EffectiveLimits {
-        let mut limits = EffectiveLimits {
-            token_limit: p.token_limit.unwrap_or(self.token_limit),
-            context_window: p.context_window.unwrap_or(self.context_window),
-            max_output_tokens: p.max_output_tokens.unwrap_or(self.max_output_tokens),
+        let m = p.model_limits.get(model);
+        let pick = |f: fn(&ModelLimits) -> Option<i64>, top: i64| {
+            m.and_then(f).or(f(&p.limits)).unwrap_or(top)
         };
-        if let Some(model_limits) = p.model_limits.get(model) {
-            limits.overlay(model_limits);
+        EffectiveLimits {
+            token_limit: pick(|l| l.token_limit, self.token_limit),
+            context_window: pick(|l| l.context_window, self.context_window),
+            max_output_tokens: pick(|l| l.max_output_tokens, self.max_output_tokens),
         }
-        limits
     }
-}
-
-pub fn expand_tilde(p: &str) -> PathBuf {
-    crate::storage::util::expand_home(p)
 }

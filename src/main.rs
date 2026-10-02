@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 
 use agent::{Agent, AgentParams};
 use config::Config;
-use serde_json::json;
+use serde_json::{Value, json};
 use storage::db::Db;
 use storage::modes::Mode;
+use storage::registry;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -74,15 +75,13 @@ enum Command {
         #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
         instruction: Vec<String>,
     },
+    /// Make an instance follow plan `<slug>`: plan mode updates it (creating it
+    /// when missing), build mode follows it (a missing plan is a no-op).
     Setplan {
         /// Instance id (see `genji list`).
         id: String,
         /// Plan slug (the `<slug>.md` file under the plans directory).
         slug: String,
-    },
-    Context {
-        /// Instance id (see `genji list`).
-        id: String,
     },
     Inspect {
         /// Instance id (see `genji list`).
@@ -92,6 +91,20 @@ enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+}
+
+impl Cli {
+    /// Whether formal (requirements + tickets) mode is on; always off without the feature.
+    fn formal(&self) -> bool {
+        #[cfg(feature = "formal")]
+        {
+            self.formal
+        }
+        #[cfg(not(feature = "formal"))]
+        {
+            false
+        }
+    }
 }
 
 fn resolve_workspace(cli: &Cli) -> Result<PathBuf> {
@@ -113,97 +126,66 @@ fn apply_config_overrides(cfg: &mut Config, cli: &Cli) {
 }
 
 impl Command {
-    fn execute(&self, cli: &Cli) -> Result<Option<()>> {
+    /// The agent mode and optional task for the agent-running commands.
+    fn mode(&self) -> Option<(Mode, Option<&str>)> {
         match self {
-            Self::List => Ok(Some(cmd_list()?)),
-            Self::Stop { ids } => Ok(Some(cmd_stop(ids)?)),
-            Self::Instruct { id, instruction } => {
-                Ok(Some(cmd_instruct(id, &instruction.join(" "))?))
-            }
-            Self::Setplan { id, slug } => Ok(Some(cmd_setplan(id, slug)?)),
-            Self::Context { id } => Ok(Some(cmd_context(id)?)),
-            Self::Inspect { id } => Ok(Some(cmd_inspect(id)?)),
-            Self::Reset { yes } => {
-                let workspace = resolve_workspace(cli)?;
-                Ok(Some(cmd_reset(&workspace, *yes)?))
-            }
-            Self::Plan { .. } | Self::Build { .. } | Self::Explore { .. } | Self::Retro { .. } => {
-                Ok(None)
-            }
+            Self::Plan { task } => Some((Mode::Plan, task.as_deref())),
+            Self::Build { task } => Some((Mode::Build, task.as_deref())),
+            Self::Explore { task } => Some((Mode::Explore, task.as_deref())),
+            Self::Retro { task } => Some((Mode::Retro, task.as_deref())),
+            _ => None,
         }
     }
-}
 
-fn ensure_layout(cfg: &Config, workspace: &std::path::Path, formal: bool) -> Result<()> {
-    #[cfg(feature = "formal")]
-    let mut dirs = vec![cfg.plans_path(workspace), cfg.skills_path(workspace)];
-    #[cfg(not(feature = "formal"))]
-    let dirs = vec![cfg.plans_path(workspace), cfg.skills_path(workspace)];
-    #[cfg(feature = "formal")]
-    if formal {
-        dirs.push(cfg.requirements_path(workspace));
-        dirs.push(cfg.tickets_path(workspace));
+    /// Run a management command. Returns `false` for the agent-running modes.
+    fn execute(&self, cli: &Cli) -> Result<bool> {
+        match self {
+            Self::List => cmd_list()?,
+            Self::Stop { ids } => cmd_stop(ids)?,
+            Self::Instruct { id, instruction } => cmd_instruct(id, &instruction.join(" "))?,
+            Self::Setplan { id, slug } => cmd_setplan(id, slug)?,
+            Self::Inspect { id } => cmd_inspect(id, cli)?,
+            Self::Reset { yes } => cmd_reset(&resolve_workspace(cli)?, *yes)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
-    #[cfg(not(feature = "formal"))]
-    let _ = formal;
-    for d in dirs {
-        std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
-    }
-    Ok(())
 }
 
-struct PreparedWorkspace {
-    cfg: Config,
-    db: Db,
-    formal: bool,
-}
-
-fn prepare_workspace(workspace: &Path, cli: &Cli) -> Result<PreparedWorkspace> {
+fn prepare_workspace(workspace: &Path, cli: &Cli) -> Result<(Config, Db, bool)> {
     let mut cfg = Config::load_or_create(workspace)?;
     apply_config_overrides(&mut cfg, cli);
-    #[cfg(feature = "formal")]
-    let formal = cli.formal;
-    #[cfg(not(feature = "formal"))]
-    let formal = false;
-    ensure_layout(&cfg, workspace, formal)?;
-
-    let db = Db::open(&cfg.db_file(workspace))?;
-    db.init_schema()?;
-    let synced = tools::skills::sync_skills(&db, &cfg.skills_path(workspace)).unwrap_or(0);
-    #[cfg(feature = "formal")]
-    if formal && cfg.auto_ingest_requirements {
-        let total = storage::reqmd::sync(&cfg, workspace)?;
-        if total > 0 && !cli.quiet_startup {
-            eprintln!(
-                "[requirements] loaded {total} md file(s) from {}",
-                cfg.requirements_path(workspace).display()
-            );
-        }
+    let formal = cli.formal();
+    for d in cfg.layout_dirs(workspace, formal) {
+        std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
     }
+    let db = Db::open(&cfg.db_file(workspace))?;
     #[cfg(feature = "formal")]
     if formal {
-        storage::ticketmd::sync(&cfg, workspace)?;
+        if cfg.auto_ingest_requirements {
+            let total = storage::reqmd::load_all(&cfg, workspace)?.len();
+            if total > 0 && !cli.quiet_startup {
+                eprintln!(
+                    "[requirements] loaded {total} md file(s) from {}",
+                    cfg.requirements_path(workspace).display()
+                );
+            }
+        }
+        storage::ticketmd::load_all(&cfg, workspace)?;
     }
-    storage::prompts::seed_prompts(&db)?;
-    if synced > 0 && !cli.quiet_startup {
-        eprintln!("[skills] synced {synced} skill file(s)");
-    }
-    Ok(PreparedWorkspace { cfg, db, formal })
+    Ok((cfg, db, formal))
 }
 
 const DEFAULT_TASK: &str = "Satisfy the active requirements in .genji/requirements/. Derive system requirements and tickets as needed.";
 
-fn selected_mode<'a>(
-    command: Option<&'a Command>,
-    task: Option<&'a str>,
-) -> (Mode, Option<&'a str>) {
-    match command {
-        Some(Command::Plan { task }) => (Mode::Plan, task.as_deref()),
-        Some(Command::Build { task }) => (Mode::Build, task.as_deref()),
-        Some(Command::Explore { task }) => (Mode::Explore, task.as_deref()),
-        Some(Command::Retro { task }) => (Mode::Retro, task.as_deref()),
-        _ => (Mode::Build, task),
+/// Whether formal mode is on and at least one requirement is still active.
+fn has_active_requirements(cfg: &Config, workspace: &Path, formal: bool) -> Result<bool> {
+    #[cfg(feature = "formal")]
+    if formal {
+        return Ok(storage::reqmd::active_count(cfg, workspace)? > 0);
     }
+    let _ = (cfg, workspace, formal);
+    Ok(false)
 }
 
 fn read_task(instructions_file: Option<&str>, task: Option<&str>) -> Result<Option<String>> {
@@ -214,32 +196,7 @@ fn read_task(instructions_file: Option<&str>, task: Option<&str>) -> Result<Opti
             return Ok(Some(text));
         }
     }
-    if let Some(t) = task
-        && !t.trim().is_empty()
-    {
-        return Ok(Some(t.to_string()));
-    }
-    Ok(None)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Startup {
-    Run(String),
-    Wait,
-}
-
-fn startup_action(
-    explicit_task: Option<String>,
-    active_requirements: i64,
-    formal: bool,
-) -> Startup {
-    if let Some(t) = explicit_task {
-        return Startup::Run(t);
-    }
-    if formal && active_requirements > 0 {
-        return Startup::Run(DEFAULT_TASK.to_string());
-    }
-    Startup::Wait
+    Ok(task.filter(|t| !t.trim().is_empty()).map(str::to_string))
 }
 
 fn wait_for_instruction(
@@ -255,87 +212,61 @@ fn wait_for_instruction(
         );
         eprintln!("[genji] send one with: genji instruct {id} \"<instruction>\"");
     }
-    loop {
-        if control.stop_requested() {
-            if !quiet {
-                eprintln!("[genji] stop requested before any instruction; exiting");
-            }
-            return Ok(None);
-        }
-        let queued = control.drain();
-        if !queued.is_empty() {
-            return Ok(Some(queued.join("\n")));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+    let instructions = control.wait_for_instruction();
+    if instructions.is_none() && !quiet {
+        eprintln!("[genji] stop requested before any instruction; exiting");
     }
+    Ok(instructions.map(|queued| queued.join("\n")))
 }
 
 #[cfg(feature = "formal")]
-fn mode_switch_instruction(mode: Mode) -> String {
+fn mode_switch_instruction(mode: Mode) -> &'static str {
     match mode {
-        Mode::Plan => "Now run in PLAN mode: assess progress against the requirements, update requirements/tickets, and stop when the plan is current.".into(),
-        Mode::Build => "Now run in BUILD mode: work the open tickets, verify your changes, and resolve tickets when done.".into(),
-        Mode::Explore => "Now run in EXPLORE mode: investigate and report findings.".into(),
-        Mode::Retro => "Now run in RETRO mode: analyze history and improve prompts/skills.".into(),
+        Mode::Plan => {
+            "Now run in PLAN mode: assess progress against the requirements, update requirements/tickets, and stop when the plan is current."
+        }
+        Mode::Build => {
+            "Now run in BUILD mode: work the open tickets, verify your changes, and resolve tickets when done."
+        }
+        Mode::Explore => "Now run in EXPLORE mode: investigate and report findings.",
+        Mode::Retro => "Now run in RETRO mode: analyze history and improve prompts/skills.",
     }
 }
 
-struct RunRequest {
-    params: AgentParams,
-    quiet: bool,
-}
-
-impl RunRequest {
-    fn into_agent(self, parent: Option<String>, depth: u32) -> Result<Agent> {
-        let mut params = self.params;
-        params.parent_instance = parent;
-        params.depth = depth;
-        Agent::new(params)
-    }
-}
-
-fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<String> {
-    let task = req.params.task.clone();
-    let instance_id = req.params.instance_id.clone();
-    let mode = req.params.mode;
-    let quiet = req.quiet;
-    let mut agent = req.into_agent(parent, depth)?;
+fn run_single(params: AgentParams, quiet: bool) -> Result<String> {
+    let task = params.task.clone();
+    let mut agent = Agent::new(params)?;
     if !quiet {
-        let model = &agent.llm.model;
         eprintln!(
             "[genji] mode={} model={} instance={} task={}",
-            mode.as_str(),
-            model,
-            instance_id,
+            agent.mode,
+            agent.llm.model,
+            agent.instance_id,
             llm::truncate(&task, 120)
         );
     }
     agent.add_user(&task)?;
     let report = agent.run_loop()?;
-    let status = agent.status();
-    agent.finish(status, &report)?;
+    agent.finish(agent.status(), &report)?;
     Ok(report)
 }
 
+/// Alternate plan and build until no requirement is active, the cycle budget
+/// runs out, the user stops the run, or the LLM fails.
 #[cfg(feature = "formal")]
-fn run_cycle(req: RunRequest) -> Result<String> {
-    let quiet = req.quiet;
-    let start_mode = req.params.mode;
-    let instance_id = req.params.instance_id.clone();
-    let task = req.params.task.clone();
-    let max_cycles = req.params.cfg.max_cycles;
+fn run_cycle(params: AgentParams, quiet: bool) -> Result<String> {
+    let task = params.task.clone();
+    let mut current = params.mode;
+    let max_cycles = params.cfg.max_cycles;
+    let mut agent = Agent::new(params)?;
     if !quiet {
         eprintln!(
-            "[genji] auto-cycle instance={} start={} max_cycles={}",
-            instance_id,
-            start_mode.as_str(),
-            max_cycles
+            "[genji] auto-cycle instance={} start={current} max_cycles={max_cycles}",
+            agent.instance_id
         );
     }
-    let mut agent = req.into_agent(None, 0)?;
     agent.add_user(&task)?;
 
-    let mut current = start_mode;
     let mut last_report = String::new();
     for cycle in 0..max_cycles {
         let active = storage::reqmd::active_count(&agent.cfg, &agent.workspace)?;
@@ -352,30 +283,24 @@ fn run_cycle(req: RunRequest) -> Result<String> {
         }
         if !quiet {
             eprintln!(
-                "[cycle {}/{}] mode={} active_requirements={} tokens={}",
+                "[cycle {}/{max_cycles}] mode={current} active_requirements={active} tokens={}",
                 cycle + 1,
-                max_cycles,
-                current.as_str(),
-                active,
                 agent.tokens_used
             );
         }
         agent.set_mode(current)?;
         if cycle > 0 {
-            agent.add_user(&mode_switch_instruction(current))?;
+            agent.add_user(mode_switch_instruction(current))?;
         }
-        let report = agent.run_loop()?;
-        let stopped = agent.control.as_ref().is_some_and(|c| c.stop_requested());
+        last_report = agent.run_loop()?;
         if !quiet {
             eprintln!(
-                "[cycle {}] {} done: {}",
+                "[cycle {}] {current} done: {}",
                 cycle + 1,
-                current.as_str(),
-                llm::truncate(&report, 300)
+                llm::truncate(&last_report, 300)
             );
         }
-        last_report = report;
-        if stopped {
+        if agent.control.as_ref().is_some_and(|c| c.stop_requested()) {
             eprintln!("[cycle] stop requested; ending cycle");
             break;
         }
@@ -389,20 +314,20 @@ fn run_cycle(req: RunRequest) -> Result<String> {
             Mode::Plan
         };
     }
-    let status = agent.status();
-    agent.finish(status, &last_report)?;
+    agent.finish(agent.status(), &last_report)?;
     Ok(last_report)
 }
 
+/// Keeps the control socket and registry entry alive; removes both on drop.
 struct InstanceGuard {
-    instance: storage::registry::Instance,
+    instance: registry::Instance,
     control: std::sync::Arc<socket::Control>,
 }
 
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
         self.control.shutdown();
-        storage::registry::remove(&self.instance.id);
+        registry::remove(&self.instance.id);
     }
 }
 
@@ -413,11 +338,7 @@ fn start_control(
     instance_id: &str,
     label: String,
     quiet: bool,
-    no_control: bool,
-) -> Result<Option<(std::sync::Arc<socket::Control>, InstanceGuard)>> {
-    if no_control || !cfg.control_enabled {
-        return Ok(None);
-    }
+) -> Result<InstanceGuard> {
     let control = socket::Control::start(
         cfg.control_path(workspace),
         cfg.plans_path(workspace),
@@ -426,22 +347,18 @@ fn start_control(
     if !quiet {
         eprintln!("[control] listening on {}", control.path.display());
     }
-    let instance = storage::registry::Instance {
+    let instance = registry::Instance {
         id: instance_id.to_string(),
         pid: std::process::id(),
         workspace: workspace.display().to_string(),
         control_socket: control.path.display().to_string(),
         label,
-        started_at: storage::registry::now_secs(),
+        started_at: storage::util::unix_secs(),
     };
     if let Err(e) = instance.save() {
         eprintln!("[registry] warning: could not register instance: {e:#}");
     }
-    let guard = InstanceGuard {
-        instance,
-        control: control.clone(),
-    };
-    Ok(Some((control, guard)))
+    Ok(InstanceGuard { instance, control })
 }
 
 fn format_uptime(secs: u64) -> String {
@@ -454,33 +371,11 @@ fn format_uptime(secs: u64) -> String {
     }
 }
 
-/// Strip the `status:` prefix the control protocol uses and trim whitespace.
-fn status_text(reply: &str) -> String {
-    reply
-        .strip_prefix("status:")
-        .unwrap_or(reply)
-        .trim()
-        .to_string()
-}
-
-fn query_status(socket: &str) -> String {
-    match socket::send(Path::new(socket), "/status") {
-        Ok(r) => status_text(&r),
-        Err(e) => format!("(unreachable: {e:#})"),
-    }
-}
-
 /// `genji list` — running instances with their live status. stdout is machine
 /// output (JSON); the human table is written to stderr.
 fn cmd_list() -> Result<()> {
-    let rows: Vec<(storage::registry::Instance, String)> = storage::registry::list_live()
-        .into_iter()
-        .map(|inst| {
-            let status = query_status(&inst.control_socket);
-            (inst, status)
-        })
-        .collect();
-    let arr: Vec<serde_json::Value> = rows
+    let rows = registry::list_live();
+    let arr: Vec<Value> = rows
         .iter()
         .map(|(inst, status)| {
             json!({
@@ -494,7 +389,6 @@ fn cmd_list() -> Result<()> {
             })
         })
         .collect();
-    // Terse machine output: just the instances, no `type`/wrapper boilerplate.
     println!("{}", serde_json::to_string(&arr)?);
     if rows.is_empty() {
         eprintln!("no running genji instances");
@@ -506,44 +400,38 @@ fn cmd_list() -> Result<()> {
     );
     for (inst, status) in &rows {
         eprintln!(
-            "{:<8} {:<7} {:<8} {:<38} {}",
+            "{:<8} {:<7} {:<8} {:<38} {status}",
             inst.id,
             inst.pid,
             format_uptime(inst.uptime_secs()),
             inst.workspace,
-            status
         );
     }
     Ok(())
 }
 
 fn cmd_stop(ids: &[String]) -> Result<()> {
-    let targets: Vec<String> = ids
+    let targets: Vec<&str> = ids
         .iter()
         .flat_map(|s| s.split(','))
-        .map(|s| s.trim().to_string())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
 
     if targets.is_empty() {
         eprintln!("warning: `genji stop` needs one or more instance ids, or `all`");
-        let instances = storage::registry::list_live();
+        let instances = registry::list_live();
         if instances.is_empty() {
             eprintln!("no running genji instances");
         } else {
             eprintln!("running instances:");
-            for inst in &instances {
-                eprintln!(
-                    "  {}  pid={}  {}{}",
-                    inst.id,
-                    inst.pid,
-                    inst.workspace,
-                    if inst.label.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  ({})", inst.label)
-                    }
-                );
+            for (inst, _) in &instances {
+                let label = if inst.label.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", inst.label)
+                };
+                eprintln!("  {}  pid={}  {}{label}", inst.id, inst.pid, inst.workspace);
             }
             eprintln!("use `genji stop all` or `genji stop <id>...`");
         }
@@ -551,49 +439,44 @@ fn cmd_stop(ids: &[String]) -> Result<()> {
     }
 
     let mut failed = false;
-    let instances = if targets.iter().any(|t| t == "all") {
-        storage::registry::list_live()
+    let instances: Vec<registry::Instance> = if targets.contains(&"all") {
+        registry::list_live()
+            .into_iter()
+            .map(|(inst, _)| inst)
+            .collect()
     } else {
-        let mut found = Vec::new();
-        for id in &targets {
-            match storage::registry::find(id) {
-                Ok(inst) => found.push(inst),
-                Err(e) => {
-                    eprintln!("{e:#}");
-                    failed = true;
-                }
-            }
-        }
-        found
+        targets
+            .iter()
+            .filter_map(|id| {
+                registry::find(id)
+                    .inspect_err(|e| {
+                        eprintln!("{e:#}");
+                        failed = true;
+                    })
+                    .ok()
+            })
+            .collect()
     };
-
     if instances.is_empty() && !failed {
         eprintln!("no running genji instances");
     }
-    let mut results: Vec<serde_json::Value> = Vec::new();
-    for inst in &instances {
-        match socket::send(Path::new(&inst.control_socket), "/stop") {
-            Ok(r) => {
-                eprintln!("stopping {} (pid {}): {}", inst.id, inst.pid, r);
-                results.push(json!({
-                    "id": inst.id,
-                    "pid": inst.pid,
-                    "ok": true,
-                    "message": r,
-                }));
-            }
-            Err(e) => {
-                eprintln!("failed to stop {}: {e:#}", inst.id);
-                results.push(json!({
-                    "id": inst.id,
-                    "pid": inst.pid,
-                    "ok": false,
-                    "message": format!("{e:#}"),
-                }));
-                failed = true;
-            }
-        }
-    }
+    let results: Vec<Value> = instances
+        .iter()
+        .map(|inst| {
+            let (ok, message) = match socket::send(Path::new(&inst.control_socket), "/stop") {
+                Ok(r) => {
+                    eprintln!("stopping {} (pid {}): {r}", inst.id, inst.pid);
+                    (true, r)
+                }
+                Err(e) => {
+                    eprintln!("failed to stop {}: {e:#}", inst.id);
+                    failed = true;
+                    (false, format!("{e:#}"))
+                }
+            };
+            json!({ "id": inst.id, "pid": inst.pid, "ok": ok, "message": message })
+        })
+        .collect();
     println!("{}", serde_json::to_string(&results)?);
     if failed {
         std::process::exit(1);
@@ -623,24 +506,16 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// `genji reset` — wipe the workspace database, plans, requirements, and open
-/// tickets, then recreate an empty database.
-///
-/// The whole `.genji/plans`, `.genji/requirements`, and `.genji/tickets` trees
-/// are removed along with the SQLite database (and its WAL/SHM sidecars); the
-/// config and skills are left untouched. The user is told how many files will
-/// be destroyed before anything is deleted.
+/// `genji reset` — wipe the workspace database and the plans (and, with the
+/// `formal` feature, requirements and tickets) trees, then recreate an empty
+/// database. Config, skills and prompts are left untouched. The user is told how
+/// many files will be destroyed before anything is deleted.
 fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
     let cfg = Config::load_or_create(workspace)?;
     let db_path = cfg.db_file(workspace);
-    let plans_dir = cfg.plans_path(workspace);
-    #[cfg(feature = "formal")]
-    let requirements_dir = cfg.requirements_path(workspace);
-    #[cfg(feature = "formal")]
-    let tickets_dir = cfg.tickets_path(workspace);
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let here = canon(workspace);
-    for inst in storage::registry::list_live() {
+    for (inst, _) in registry::list_live() {
         if canon(Path::new(&inst.workspace)) == here {
             bail!(
                 "instance {} (pid {}) is running in this workspace; stop it first with `genji stop {}`",
@@ -650,73 +525,34 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
             );
         }
     }
-    struct ResetTarget {
-        path: PathBuf,
-        label: &'static str,
-        recreate: bool,
-    }
-    let mut targets = db_files(&db_path)
+    let mut dirs = vec![("plan(s)", cfg.plans_path(workspace))];
+    dirs.extend(cfg.formal_dirs(workspace, true));
+    let db_existing: Vec<PathBuf> = db_files(&db_path)
         .into_iter()
-        .map(|path| ResetTarget { path, label: "database", recreate: false })
-        .collect::<Vec<_>>();
-    targets.push(ResetTarget { path: plans_dir.clone(), label: "plans", recreate: true });
-    #[cfg(feature = "formal")]
-    {
-        targets.push(ResetTarget { path: requirements_dir.clone(), label: "requirements", recreate: true });
-        targets.push(ResetTarget { path: tickets_dir.clone(), label: "tickets", recreate: true });
-    }
-    let mut db_existing = Vec::new();
-    let mut plan_files = Vec::new();
-    #[cfg(feature = "formal")]
-    let mut requirement_files = Vec::new();
-    #[cfg(feature = "formal")]
-    let mut ticket_files = Vec::new();
-    for target in &targets {
-        if target.recreate {
+        .filter(|p| p.exists())
+        .collect();
+    let dir_files: Vec<Vec<PathBuf>> = dirs
+        .iter()
+        .map(|(_, dir)| {
             let mut files = Vec::new();
-            collect_files(&target.path, &mut files);
-            match target.label {
-                "plans" => plan_files = files,
-                #[cfg(feature = "formal")]
-                "requirements" => requirement_files = files,
-                #[cfg(feature = "formal")]
-                "tickets" => ticket_files = files,
-                _ => unreachable!(),
-            }
-        } else if target.path.exists() {
-            db_existing.push(target.path.clone());
-        }
-    }
-    let total = db_existing.len() + plan_files.len()
-        + {
-            #[cfg(feature = "formal")]
-            { requirement_files.len() + ticket_files.len() }
-            #[cfg(not(feature = "formal"))]
-            { 0 }
-        };
+            collect_files(dir, &mut files);
+            files
+        })
+        .collect();
+    let total = db_existing.len() + dir_files.iter().map(Vec::len).sum::<usize>();
 
     if total == 0 {
-        eprintln!(
-            "[reset] nothing to delete; database, plans, requirements and tickets are already empty"
-        );
+        eprintln!("[reset] nothing to delete; database and content directories are already empty");
     } else {
-        #[cfg(feature = "formal")]
-        eprintln!(
-            "[reset] this will delete {total} file(s): {} database file(s), {} plan(s) in {}, {} requirement(s) in {}, {} open ticket(s) in {}",
-            db_existing.len(),
-            plan_files.len(),
-            plans_dir.display(),
-            requirement_files.len(),
-            requirements_dir.display(),
-            ticket_files.len(),
-            tickets_dir.display(),
+        let mut summary = vec![format!("{} database file(s)", db_existing.len())];
+        summary.extend(
+            dirs.iter().zip(&dir_files).map(|((label, dir), files)| {
+                format!("{} {label} in {}", files.len(), dir.display())
+            }),
         );
-        #[cfg(not(feature = "formal"))]
         eprintln!(
-            "[reset] this will delete {total} file(s): {} database file(s), {} plan(s) in {}",
-            db_existing.len(),
-            plan_files.len(),
-            plans_dir.display(),
+            "[reset] this will delete {total} file(s): {}",
+            summary.join(", ")
         );
         if !assume_yes {
             if !std::io::stdin().is_terminal() {
@@ -732,45 +568,25 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
                 return Ok(());
             }
         }
-        for target in &targets {
-            if !target.path.exists() {
-                continue;
-            }
-            if target.recreate {
-                std::fs::remove_dir_all(&target.path)
-                    .with_context(|| format!("deleting {}", target.path.display()))?;
-            } else {
-                std::fs::remove_file(&target.path)
-                    .with_context(|| format!("deleting {}", target.path.display()))?;
-            }
+        for file in &db_existing {
+            std::fs::remove_file(file).with_context(|| format!("deleting {}", file.display()))?;
+        }
+        for (_, dir) in dirs.iter().filter(|(_, dir)| dir.exists()) {
+            std::fs::remove_dir_all(dir).with_context(|| format!("deleting {}", dir.display()))?;
         }
         eprintln!("[reset] deleted {total} file(s)");
     }
-    for target in &targets {
-        if target.recreate {
-            std::fs::create_dir_all(&target.path)
-                .with_context(|| format!("creating {}", target.path.display()))?;
-        }
+    for (_, dir) in &dirs {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let db = Db::open(&db_path)?;
-    db.init_schema()?;
-    storage::prompts::seed_prompts(&db)?;
+    Db::open(&db_path)?;
     eprintln!(
         "[reset] initialized clean database at {}",
         db_path.display()
     );
-    #[cfg(feature = "formal")]
     let deleted: Vec<String> = db_existing
         .iter()
-        .chain(plan_files.iter())
-        .chain(requirement_files.iter())
-        .chain(ticket_files.iter())
-        .map(|p| p.display().to_string())
-        .collect();
-    #[cfg(not(feature = "formal"))]
-    let deleted: Vec<String> = db_existing
-        .iter()
-        .chain(plan_files.iter())
+        .chain(dir_files.iter().flatten())
         .map(|p| p.display().to_string())
         .collect();
     println!(
@@ -784,215 +600,88 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// Send one control-socket line to a live instance and return its reply.
+fn send_to(id: &str, msg: &str) -> Result<(registry::Instance, String)> {
+    let inst = registry::find(id)?;
+    let reply = socket::send(Path::new(&inst.control_socket), msg)?;
+    Ok((inst, reply))
+}
+
+fn print_message(id: &str, reply: &str, plan: Option<&str>) -> Result<()> {
+    let message = reply.strip_prefix("status:").unwrap_or(reply).trim();
+    let mut out = json!({ "id": id, "message": message });
+    if let Some(plan) = plan {
+        out["plan"] = json!(plan);
+    }
+    println!("{}", serde_json::to_string(&out)?);
+    eprintln!("{message}");
+    Ok(())
+}
+
 fn cmd_instruct(id: &str, instruction: &str) -> Result<()> {
     if instruction.trim().is_empty() {
         bail!("missing instruction (usage: genji instruct <id> <instruction>)");
     }
-    let inst = storage::registry::find(id)?;
-    let resp = socket::send(Path::new(&inst.control_socket), instruction)?;
-    let message = status_text(&resp);
-    println!(
-        "{}",
-        serde_json::to_string(&json!({ "id": inst.id, "message": message }))?
-    );
-    eprintln!("{message}");
-    Ok(())
+    let (inst, reply) = send_to(id, instruction)?;
+    // Structured replies (e.g. `/context`) are passed through unchanged.
+    if let Ok(value @ Value::Object(_)) = serde_json::from_str::<Value>(&reply) {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    print_message(&inst.id, &reply, None)
 }
 
 fn cmd_setplan(id: &str, slug: &str) -> Result<()> {
     if slug.trim().is_empty() {
         bail!("missing plan slug (usage: genji setplan <id> <slug>)");
     }
-    let inst = storage::registry::find(id)?;
-    let resp = socket::send(Path::new(&inst.control_socket), &format!("/setplan {slug}"))?;
-    let message = status_text(&resp);
-    println!(
-        "{}",
-        serde_json::to_string(&json!({ "id": inst.id, "plan": slug, "message": message }))?
-    );
-    eprintln!("{message}");
-    Ok(())
+    let (inst, reply) = send_to(id, &format!("/setplan {slug}"))?;
+    print_message(&inst.id, &reply, Some(slug))
 }
 
-fn cmd_context(id: &str) -> Result<()> {
-    let inst = storage::registry::find(id)?;
-    let resp = socket::send(Path::new(&inst.control_socket), "/context")?;
-    let value: serde_json::Value = serde_json::from_str(&resp)
-        .with_context(|| format!("unexpected /context reply: {resp}"))?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
-    Ok(())
-}
-
-fn find_trace(instance: &str) -> Result<std::path::PathBuf> {
-    let dir = storage::registry::events_dir();
-    let exact = storage::registry::events_path(instance);
-    if exact.exists() {
-        return Ok(exact);
-    }
-    let mut matches: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for entry in rd.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if stem.starts_with(instance) {
-                matches.push(p);
-            }
-        }
-    }
-    match matches.as_slice() {
-        [one] => Ok(one.clone()),
-        [] => bail!("no event trace for instance `{instance}`"),
-        many => {
-            let names: Vec<&str> = many
-                .iter()
-                .filter_map(|p| p.file_stem().and_then(|s| s.to_str()))
-                .collect();
-            bail!(
-                "instance id `{instance}` is ambiguous; matches: {} (use a longer prefix)",
-                names.join(", ")
-            )
-        }
-    }
-}
-
-struct TraceTarget {
-    instance_id: String,
-    trace_path: std::path::PathBuf,
-    instance: Option<storage::registry::Instance>,
-}
-
-fn resolve_target(id: &str) -> Result<TraceTarget> {
+/// `genji inspect` — recorded summary of an instance from the workspace
+/// database, plus live details when it is still running.
+fn cmd_inspect(id: &str, cli: &Cli) -> Result<()> {
     let id = id.trim();
-    if id.is_empty() {
-        bail!("missing instance id");
-    }
-    if let Ok(inst) = storage::registry::find(id) {
-        let trace_path = storage::registry::events_path(&inst.id);
-        return Ok(TraceTarget {
-            instance_id: inst.id.clone(),
-            trace_path,
-            instance: Some(inst),
-        });
-    }
-    Ok(TraceTarget {
-        instance_id: id.to_string(),
-        trace_path: find_trace(id)?,
-        instance: None,
-    })
-}
-
-fn read_trace(target: &TraceTarget) -> Result<Option<String>> {
-    if target.trace_path.exists() {
-        Ok(Some(
-            std::fs::read_to_string(&target.trace_path)
-                .with_context(|| format!("reading event trace {}", target.trace_path.display()))?,
-        ))
-    } else if target.instance.is_some() {
-        Ok(None)
-    } else {
-        bail!("no event trace for instance `{}`", target.instance_id)
-    }
-}
-
-fn trace_instance_start(text: &str) -> Option<serde_json::Value> {
-    text.lines().find_map(|l| {
-        let v: serde_json::Value = serde_json::from_str(l).ok()?;
-        (v.get("type").and_then(|t| t.as_str()) == Some("instance_start")).then_some(v)
-    })
-}
-
-fn is_instance_end(line: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line)
-        .ok()
-        .and_then(|v| {
-            v.get("type")
-                .and_then(|t| t.as_str())
-                .map(|t| t == "instance_end")
-        })
-        .unwrap_or(false)
-}
-
-fn query_context(socket: &str) -> Option<storage::context::ContextInfo> {
-    let reply = socket::send(Path::new(socket), "/context stats").ok()?;
-    let value: serde_json::Value = serde_json::from_str(&reply).ok()?;
-    Some(storage::context::ContextInfo::from_json(&value))
-}
-
-fn cmd_inspect(id: &str) -> Result<()> {
-    let target = resolve_target(id)?;
-    let text = read_trace(&target)?.unwrap_or_default();
-    let count = text.lines().filter(|l| !l.trim().is_empty()).count();
-    let ended = text.lines().any(is_instance_end);
-    let start = trace_instance_start(&text);
-    let status = target
-        .instance
-        .as_ref()
-        .map(|i| query_status(&i.control_socket));
-    let context = target
-        .instance
-        .as_ref()
-        .and_then(|i| query_context(&i.control_socket));
-
-    let mut obj = json!({
-        "type": "instance",
-        "id": id.trim(),
-        "trace": target.trace_path.display().to_string(),
-        "events": count,
-        "ended": ended,
-    });
-    let map = obj.as_object_mut().expect("object");
-    if let Some(info) = &context {
-        map.insert("context".into(), info.to_json());
-    }
-    if let Some(s) = &start {
-        for key in ["workspace", "mode", "model", "parent", "depth", "task"] {
-            if let Some(v) = s.get(key) {
-                map.insert(key.to_string(), v.clone());
-            }
-        }
-    }
-    if let Some(inst) = &target.instance {
+    let live = registry::find(id).ok();
+    let workspace = match &live {
+        Some(inst) => PathBuf::from(&inst.workspace),
+        None => resolve_workspace(cli)?,
+    };
+    let cfg = Config::load_or_create(&workspace)?;
+    let db = Db::open(&cfg.db_file(&workspace))?;
+    let mut obj = db.instance_summary(live.as_ref().map_or(id, |i| i.id.as_str()))?;
+    if let (Some(map), Some(inst)) = (obj.as_object_mut(), &live) {
         map.insert("pid".into(), json!(inst.pid));
         map.insert("label".into(), json!(inst.label));
-        map.entry("workspace".to_string())
-            .or_insert_with(|| json!(inst.workspace));
+        map.insert("workspace".into(), json!(inst.workspace));
         map.insert("control_socket".into(), json!(inst.control_socket));
         map.insert("uptime_secs".into(), json!(inst.uptime_secs()));
-        if let Some(st) = &status {
-            map.insert("status".into(), json!(st));
-        }
+        map.insert("live_status".into(), json!(inst.status()));
     }
     println!("{}", serde_json::to_string(&obj)?);
-    eprintln!("id:      {}", id.trim());
-    eprintln!("trace:   {}", target.trace_path.display());
-    eprintln!("events:  {count}{}", if ended { " (ended)" } else { "" });
-    if let Some(s) = &start {
-        let mode = s.get("mode").and_then(|v| v.as_str()).unwrap_or("?");
-        let model = s.get("model").and_then(|v| v.as_str()).unwrap_or("?");
-        let task = s.get("task").and_then(|v| v.as_str()).unwrap_or("");
-        eprintln!("mode:    {mode}  model: {model}");
-        if let Some(parent) = s.get("parent").and_then(|v| v.as_str()) {
-            eprintln!("parent:  {parent}");
-        }
-        if !task.is_empty() {
-            eprintln!("task:    {task}");
-        }
-    }
-    if let Some(inst) = &target.instance {
-        eprintln!(
-            "instance: {}  pid: {}  workspace: {}",
-            inst.id, inst.pid, inst.workspace
-        );
-    }
-    if let Some(st) = &status {
-        eprintln!("status:  {st}");
-    }
-    if let Some(info) = &context {
-        for line in info.summary().lines() {
-            eprintln!("{line}");
+    for key in [
+        "id",
+        "mode",
+        "model",
+        "parent",
+        "depth",
+        "task",
+        "status",
+        "live_status",
+        "tokens_used",
+        "messages",
+        "started_at",
+        "ended_at",
+        "pid",
+        "uptime_secs",
+        "control_socket",
+    ] {
+        if let Some(v) = obj.get(key).filter(|v| !v.is_null()) {
+            eprintln!(
+                "{key:<14}{}",
+                v.as_str().map_or_else(|| v.to_string(), String::from)
+            );
         }
     }
     Ok(())
@@ -1001,98 +690,95 @@ fn cmd_inspect(id: &str) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Some(command) = &cli.command
-        && command.execute(&cli)?.is_some() {
-            return Ok(());
-        }
+        && command.execute(&cli)?
+    {
+        return Ok(());
+    }
     let workspace = resolve_workspace(&cli)?;
-    let prepared = prepare_workspace(&workspace, &cli)?;
-    let PreparedWorkspace { cfg, db, formal } = prepared;
-    let (start_mode, task_arg) = selected_mode(cli.command.as_ref(), cli.task.as_deref());
+    let (cfg, db, formal) = prepare_workspace(&workspace, &cli)?;
+    let (start_mode, task_arg) = cli
+        .command
+        .as_ref()
+        .and_then(Command::mode)
+        .unwrap_or((Mode::Build, cli.task.as_deref()));
     let explicit_task = read_task(cli.instructions_file.as_deref(), task_arg)?;
     let quiet = cli.quiet_startup || cli.subagent;
-    let instance_id = storage::registry::new_id();
+    let instance_id = registry::new_id();
+    let runtime = cfg.runtime_for_mode(start_mode)?;
     if !quiet {
-        let p = cfg.resolve_active_provider()?;
         eprintln!(
             "[genji] provider={} kind={} base_url={} model={}",
-            cfg.provider,
-            p.kind,
-            p.base_url,
-            cfg.model_for_mode(start_mode)?
+            cfg.provider, runtime.provider.kind, runtime.provider.base_url, runtime.model
         );
     }
-    let context = agent::build_context(&cfg, &db, start_mode, formal)?;
+    let context = agent::build_context(
+        &cfg,
+        &workspace,
+        start_mode,
+        formal,
+        runtime.limits.context_window,
+    );
 
     // Top-level runs open a control socket so instructions can be injected
     // mid-run; subagents never do. Controllable runs also register themselves so
     // `genji list`/`stop`/`instruct`/`inspect` can find them from anywhere.
-    let control_registration = start_control(
-        &cfg,
-        &workspace,
-        context.clone(),
-        &instance_id,
-        cli.label.clone(),
-        quiet,
-        cli.no_control,
-    )?;
-    let control = control_registration.as_ref().map(|(control, _)| control.clone());
-    #[cfg(feature = "formal")]
-    let active_requirements = if formal {
-        storage::reqmd::active_count(&cfg, &workspace)?
+    let guard = if cli.no_control || !cfg.control_enabled {
+        None
     } else {
-        0
+        Some(start_control(
+            &cfg,
+            &workspace,
+            context.clone(),
+            &instance_id,
+            cli.label.clone(),
+            quiet,
+        )?)
     };
-    #[cfg(not(feature = "formal"))]
-    let active_requirements = 0;
-    let task = match startup_action(explicit_task, active_requirements, formal) {
-        Startup::Run(t) => t,
-        Startup::Wait => {
-            if let Some(c) = &control {
-                if let Some(t) = wait_for_instruction(c, &instance_id, quiet)? {
-                    t
-                } else {
-                    return Ok(());
-                }
-            } else {
-                if !quiet {
-                    eprintln!(
-                        "[genji] no instruction and no active requirements; \
-                     no control socket to wait on. Nothing to do."
-                    );
-                }
-                return Ok(());
+    let control = guard.as_ref().map(|g| g.control.clone());
+
+    let task = if let Some(t) = explicit_task {
+        t
+    } else {
+        if has_active_requirements(&cfg, &workspace, formal)? {
+            DEFAULT_TASK.to_string()
+        } else if let Some(c) = &control {
+            match wait_for_instruction(c, &instance_id, quiet)? {
+                Some(t) => t,
+                None => return Ok(()),
             }
+        } else {
+            if !quiet {
+                eprintln!(
+                    "[genji] no instruction and no active requirements; \
+                     no control socket to wait on. Nothing to do."
+                );
+            }
+            return Ok(());
         }
     };
 
-    let request = RunRequest {
-        params: AgentParams {
-            cfg,
-            workspace,
-            db,
-            instance_id,
-            parent_instance: None,
-            mode: start_mode,
-            depth: 0,
-            task,
-            formal,
-            control: control.clone(),
-            context,
-        },
-        quiet,
+    let params = AgentParams {
+        cfg,
+        workspace,
+        db,
+        instance_id,
+        parent_instance: cli.parent_instance.clone(),
+        mode: start_mode,
+        depth: cli.depth,
+        task,
+        formal,
+        control,
+        context,
+        runtime,
     };
     #[cfg(feature = "formal")]
-    let report = if formal {
-        run_cycle(request)?
+    let report = if formal && !cli.subagent {
+        run_cycle(params, quiet)?
     } else {
-        let parent = cli.parent_instance.clone();
-        run_single(request, parent, cli.depth)?
+        run_single(params, quiet)?
     };
     #[cfg(not(feature = "formal"))]
-    let report = {
-        let parent = cli.parent_instance.clone();
-        run_single(request, parent, cli.depth)?
-    };
+    let report = run_single(params, quiet)?;
 
     eprintln!("[report] {report}");
     Ok(())

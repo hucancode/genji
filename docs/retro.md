@@ -6,18 +6,17 @@ improve itself:
 | Tool | Purpose |
 |------|---------|
 | `query_instances` | list instances (mode, depth, tokens, status) |
-| `query_instance` | dump an instance's messages |
-| `query_messages` | search messages by role/text/instance |
-| `query_tool_call` | inspect tool calls (name, errors, duration, args/result) |
-| `query_stats` | aggregated tool usage, error rate, skill loads, tokens |
-| `list_skills` / `read_skill` | inspect skills and their version history |
-| `write_skill` / `edit_skill` | create/improve skills (versioned) |
-| `skill_history` / `skill_rollback` | browse / revert skill versions |
-| `prompt_read` / `prompt_edit` | read / edit the extended prompt for `plan`/`build`/`explore` |
-| `prompt_history` / `prompt_rollback` | browse / revert prompt versions |
+| `query_messages` | read recorded messages; filter by `instance_id` to read one conversation, or by role/text |
+| `query_tool_calls` | inspect tool calls (name, errors, duration, args/result) |
+| `query_stats` | aggregated tool usage, error rate, skill loads, tokens, compactions |
 
-Every prompt and skill change is appended to a version table, so any previous
-version can be restored. The core prompt is intentionally **not** editable, and
-neither is `retro` itself: its mode has no extended prompt (it is fixed so it
-cannot rewrite its own instructions). Retro may only change the extended part of
-the other modes.
+Retro changes behavior by editing plain files with the normal `read`/`write`/
+`edit` tools:
+
+- `.genji/prompts/<mode>.md` — the extended prompt for `plan`, `build` or
+  `explore`, appended to the system prompt under `## Extended guidance`.
+- `.genji/skills/<name>.md` — skills, see [Skills](skills.md).
+
+Keep these directories in git to review, diff and revert changes. The core
+prompts are compiled in and not editable, and `retro` has no extended prompt, so
+it cannot rewrite its own instructions.
