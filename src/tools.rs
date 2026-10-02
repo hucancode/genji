@@ -12,13 +12,12 @@ use crate::storage::modes::Mode;
 use std::path::Path;
 
 pub mod basic {
-    use anyhow::{Context, Result, anyhow, bail};
+    use anyhow::{Context, Result, bail};
     use serde::Deserialize;
     use serde_json::Value;
     use std::fmt::Write as _;
     use std::time::Duration;
 
-    use super::{opt_bool, opt_i64, opt_str, req_str};
     use crate::agent::Agent;
     use crate::storage::proc;
 
@@ -36,8 +35,7 @@ pub mod basic {
     }
 
     pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
-        let parsed: ReadArgs =
-            serde_json::from_value(args.clone()).context("invalid read arguments")?;
+        let parsed: ReadArgs = super::parse_args(args)?;
         let path = agent.resolve_path(&parsed.path);
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -62,8 +60,7 @@ pub mod basic {
     }
 
     pub fn write(agent: &mut Agent, args: &Value) -> Result<String> {
-        let parsed: WriteArgs =
-            serde_json::from_value(args.clone()).context("invalid write arguments")?;
+        let parsed: WriteArgs = super::parse_args(args)?;
         let path = agent.resolve_path(&parsed.path);
         let content = parsed.content;
         if let Some(parent) = path.parent() {
@@ -150,11 +147,10 @@ pub mod basic {
         let replace_all = parsed.replace_all.unwrap_or(false);
         let mut edits: Vec<(String, String)> = parsed.edits.unwrap_or_default()
             .into_iter().map(|e| (e.old_text, e.new_text)).collect();
-        if edits.is_empty() {
-            if let (Some(old), Some(new)) = (parsed.old_text, parsed.new_text) {
+        if edits.is_empty()
+            && let (Some(old), Some(new)) = (parsed.old_text, parsed.new_text) {
                 edits.push((old, new));
             }
-        }
         if edits.is_empty() {
             bail!("no edits supplied (provide `edits` array or `oldText`/`newText`)");
         }
@@ -235,8 +231,7 @@ pub mod basic {
     }
 
     pub fn bash(agent: &mut Agent, args: &Value) -> Result<String> {
-        let parsed: BashArgs =
-            serde_json::from_value(args.clone()).context("invalid bash arguments")?;
+        let parsed: BashArgs = super::parse_args(args)?;
         let command = parsed.command;
         let cwd = match parsed.cwd {
             Some(c) => agent.resolve_path(&c),
@@ -445,7 +440,7 @@ pub mod requirements {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
-    use super::{opt_i64, opt_str, req_str};
+
     use crate::agent::Agent;
     use crate::config::Config;
     use crate::storage::db::FieldPatch;
@@ -492,7 +487,14 @@ pub mod requirements {
     #[derive(Debug, Deserialize)]
     struct ReadArgs { id: Option<i64>, level: Option<String>, status: Option<String> }
     #[derive(Debug, Deserialize)]
-    struct UpdateArgs { id: i64, title: Option<String>, body: Option<String>, status: Option<String>, level: Option<String>, parent_id: Option<Option<i64>> }
+    struct UpdateArgs {
+        id: i64,
+        title: Option<String>,
+        body: Option<String>,
+        status: Option<String>,
+        level: Option<String>,
+        #[serde(default)] parent_id: FieldPatch<i64>,
+    }
     #[derive(Debug, Deserialize)]
     struct RemoveArgs { id: i64, hard: Option<bool> }
     #[derive(Debug, Deserialize)]
@@ -565,11 +567,7 @@ pub mod requirements {
         let id = parsed.id;
         let status = parsed.status.as_deref().map(parse_status_arg).transpose()?;
         let level = parsed.level.as_deref().map(parse_level_arg).transpose()?;
-        let parent_id = match parsed.parent_id {
-            None => FieldPatch::Keep,
-            Some(None) => FieldPatch::Clear,
-            Some(Some(v)) => FieldPatch::Set(v),
-        };
+        let parent_id = parsed.parent_id;
         if !reqmd::update(
             &agent.cfg,
             &agent.workspace,
@@ -1627,7 +1625,7 @@ pub mod tickets {
     use serde_json::Value;
     use std::path::Path;
 
-    use super::{opt_i64, opt_str, req_str};
+
     use crate::agent::Agent;
     use crate::storage::db::{FieldPatch, TicketEdit};
     use crate::storage::ticketmd::{self, Ticket, TicketStatus};
@@ -1671,7 +1669,16 @@ pub mod tickets {
     #[derive(Debug, Deserialize)]
     struct ClaimArgs { id: Option<i64>, requirement_id: Option<i64> }
     #[derive(Debug, Deserialize)]
-    struct UpdateArgs { id: i64, title: Option<String>, description: Option<String>, priority: Option<i64>, parent_id: Option<Option<i64>>, requirement_id: Option<Option<i64>>, status: Option<String>, resolution: Option<String> }
+    struct UpdateArgs {
+        id: i64,
+        title: Option<String>,
+        description: Option<String>,
+        priority: Option<i64>,
+        #[serde(default)] parent_id: FieldPatch<i64>,
+        #[serde(default)] requirement_id: FieldPatch<i64>,
+        status: Option<String>,
+        resolution: Option<String>,
+    }
     #[derive(Debug, Deserialize)]
     struct CloseArgs { id: i64, reason: Option<String> }
 
@@ -1776,14 +1783,8 @@ pub mod tickets {
             title: parsed.title,
             description: parsed.description,
             priority: parsed.priority.map(|p| p.clamp(1, 3)),
-            parent_id: args
-                .get("parent_id")
-                .map(|v| v.as_i64().map_or(FieldPatch::Clear, FieldPatch::Set))
-                .unwrap_or_default(),
-            requirement_id: args
-                .get("requirement_id")
-                .map(|v| v.as_i64().map_or(FieldPatch::Clear, FieldPatch::Set))
-                .unwrap_or_default(),
+            parent_id: parsed.parent_id,
+            requirement_id: parsed.requirement_id,
         };
         let resolution = parsed.resolution;
         ticketmd::update(
@@ -2003,8 +2004,8 @@ fn registry() -> &'static [Tool] {
                     "title":{"type":"string"},
                     "description":{"type":"string"},
                     "priority":{"type":"integer","description":"1=high, 2=normal, 3=low"},
-                    "parent_id":{"type":"integer"},
-                    "requirement_id":{"type":"integer"},
+                    "parent_id":{"type":["integer","null"],"description":"null clears it"},
+                    "requirement_id":{"type":["integer","null"],"description":"null clears it"},
                     "status":{"type":"string","enum":["open","in_progress","resolved","closed"]},
                     "resolution":{"type":"string"}
                 },
@@ -2023,7 +2024,7 @@ fn registry() -> &'static [Tool] {
                     "level":{"type":"string","enum":["stakeholder","system"]},
                     "title":{"type":"string"},
                     "body":{"type":"string"},
-                    "parent_id":{"type":"integer","description":"Parent requirement id"}
+                    "parent_id":{"type":["integer","null"],"description":"Parent requirement id; null clears it"}
                 },
                 "required":["level","title","body"]
             }), requirements::create),

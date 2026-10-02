@@ -152,7 +152,7 @@ pub mod context {
             json!({
                 "context_window": self.context_window,
                 "last_prompt_tokens": self.last_prompt_tokens,
-                "messages": self.messages.iter().map(super::super::llm::ChatMessage::to_json).collect::<Vec<_>>(),
+                "messages": self.messages,
                 "tools": self.tools(),
             })
         }
@@ -364,6 +364,8 @@ pub mod context {
 pub mod db {
     use anyhow::{Context, Result};
     use rusqlite::{Connection, OptionalExtension, params};
+    #[cfg(feature = "formal")]
+    use serde::de::DeserializeOwned;
     use std::path::Path;
 
     const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
@@ -375,6 +377,19 @@ pub mod db {
         Keep,
         Set(T),
         Clear,
+    }
+
+    #[cfg(feature = "formal")]
+    impl<'de, T: DeserializeOwned> serde::Deserialize<'de> for FieldPatch<T> {
+        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            match Option::<T>::deserialize(deserializer)? {
+                Some(value) => Ok(Self::Set(value)),
+                None => Ok(Self::Clear),
+            }
+        }
     }
 
     #[cfg(feature = "formal")]
@@ -400,7 +415,6 @@ pub mod db {
 
     #[derive(Debug, Clone)]
     pub struct SkillRow {
-        pub id: i64,
         pub name: String,
         pub path: String,
         pub description: String,
@@ -410,8 +424,6 @@ pub mod db {
 
     #[derive(Debug, Clone)]
     pub struct PromptVersionRow {
-        pub id: i64,
-        pub mode: String,
         pub version: i64,
         pub content: String,
         pub author: String,
@@ -556,22 +568,23 @@ pub mod db {
             Ok(id)
         }
 
+        fn skill_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillRow> {
+            Ok(SkillRow {
+                name: row.get(0)?,
+                path: row.get(1)?,
+                description: row.get(2)?,
+                content: row.get(3)?,
+                uses: row.get(4)?,
+            })
+        }
+
         pub fn skill_get(&self, name: &str) -> Result<Option<SkillRow>> {
             Ok(self
                 .conn
                 .query_row(
-                    "SELECT id,name,path,description,content,uses FROM skills WHERE name=?",
+                    "SELECT name,path,description,content,uses FROM skills WHERE name=?",
                     params![name],
-                    |r| {
-                        Ok(SkillRow {
-                            id: r.get(0)?,
-                            name: r.get(1)?,
-                            path: r.get(2)?,
-                            description: r.get(3)?,
-                            content: r.get(4)?,
-                            uses: r.get(5)?,
-                        })
-                    },
+                    Self::skill_from_row,
                 )
                 .optional()?)
         }
@@ -584,18 +597,9 @@ pub mod db {
 
         pub fn skill_list(&self) -> Result<Vec<SkillRow>> {
             let mut stmt = self.conn.prepare(
-                "SELECT id,name,path,description,content,uses FROM skills ORDER BY name",
+                "SELECT name,path,description,content,uses FROM skills ORDER BY name",
             )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(SkillRow {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    path: r.get(2)?,
-                    description: r.get(3)?,
-                    content: r.get(4)?,
-                    uses: r.get(5)?,
-                })
-            })?;
+            let rows = stmt.query_map([], Self::skill_from_row)?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         }
 
@@ -644,25 +648,25 @@ pub mod db {
             .optional()?)
         }
 
+        fn prompt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PromptVersionRow> {
+            Ok(PromptVersionRow {
+                version: row.get(0)?,
+                content: row.get(1)?,
+                author: row.get(2)?,
+                reason: row.get(3)?,
+                active: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        }
+
         pub fn prompt_active(&self, mode: &str) -> Result<Option<PromptVersionRow>> {
             Ok(self
             .conn
             .query_row(
-                "SELECT id,mode,version,content,author,reason,active,created_at FROM prompt_versions
+                "SELECT version,content,author,reason,active,created_at FROM prompt_versions
                  WHERE mode=? AND active=1 ORDER BY version DESC LIMIT 1",
                 params![mode],
-                |r| {
-                    Ok(PromptVersionRow {
-                        id: r.get(0)?,
-                        mode: r.get(1)?,
-                        version: r.get(2)?,
-                        content: r.get(3)?,
-                        author: r.get(4)?,
-                        reason: r.get(5)?,
-                        active: r.get(6)?,
-                        created_at: r.get(7)?,
-                    })
-                },
+                Self::prompt_from_row,
             )
             .optional()?)
         }
@@ -715,21 +719,10 @@ pub mod db {
 
         pub fn prompt_versions(&self, mode: &str) -> Result<Vec<PromptVersionRow>> {
             let mut stmt = self.conn.prepare(
-            "SELECT id,mode,version,content,author,reason,active,created_at FROM prompt_versions
+            "SELECT version,content,author,reason,active,created_at FROM prompt_versions
              WHERE mode=? ORDER BY version DESC",
         )?;
-            let rows = stmt.query_map(params![mode], |r| {
-                Ok(PromptVersionRow {
-                    id: r.get(0)?,
-                    mode: r.get(1)?,
-                    version: r.get(2)?,
-                    content: r.get(3)?,
-                    author: r.get(4)?,
-                    reason: r.get(5)?,
-                    active: r.get(6)?,
-                    created_at: r.get(7)?,
-                })
-            })?;
+            let rows = stmt.query_map(params![mode], Self::prompt_from_row)?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         }
 
@@ -1160,6 +1153,18 @@ pub mod proc {
         dir.join(format!(".{tag}-{}-{n}.tmp", std::process::id()))
     }
 
+    struct TempFiles {
+        paths: [PathBuf; 2],
+    }
+
+    impl Drop for TempFiles {
+        fn drop(&mut self) {
+            for path in &self.paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
     fn read_capped(path: &Path, cap: usize) -> String {
         let Ok(f) = File::open(path) else {
             return String::new();
@@ -1180,6 +1185,9 @@ pub mod proc {
         std::fs::create_dir_all(tmpdir).ok();
         let out_path = tmp_path(tmpdir, "out");
         let err_path = tmp_path(tmpdir, "err");
+        let _temp_files = TempFiles {
+            paths: [out_path.clone(), err_path.clone()],
+        };
         let out_file = File::create(&out_path).context("creating stdout temp")?;
         let err_file = File::create(&err_path).context("creating stderr temp")?;
 
@@ -1210,9 +1218,6 @@ pub mod proc {
 
         let stdout = read_capped(&out_path, max_read_bytes);
         let stderr = read_capped(&err_path, max_read_bytes);
-        let _ = std::fs::remove_file(&out_path);
-        let _ = std::fs::remove_file(&err_path);
-
         Ok(ProcResult {
             code,
             stdout,

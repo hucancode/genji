@@ -25,8 +25,6 @@ pub struct Agent {
     pub db: Db,
     pub instance_id: String,
     pub mode: Mode,
-    #[cfg(feature = "formal")]
-    pub model: String,
     pub llm: LlmClient,
     pub context: Arc<RwLock<ContextComposer>>,
     pub tokens_used: i64,
@@ -118,8 +116,6 @@ impl Agent {
             db,
             instance_id,
             mode,
-            #[cfg(feature = "formal")]
-            model,
             llm,
             context,
             tokens_used: 0,
@@ -187,7 +183,6 @@ impl Agent {
     pub fn set_mode(&mut self, mode: Mode) -> Result<()> {
         self.mode = mode;
         let runtime = self.cfg.runtime_for_mode(mode)?;
-        self.model = runtime.model.clone();
         let limits = runtime.limits;
         self.token_limit = limits.token_limit;
         self.llm = LlmClient::from_runtime(&self.cfg, runtime);
@@ -201,7 +196,7 @@ impl Agent {
             "UPDATE instances SET mode=? WHERE id=?",
             params![mode.as_str(), self.instance_id],
         )?;
-        self.events.mode(mode.as_str(), &self.model);
+        self.events.mode(mode.as_str(), &self.llm.model);
         Ok(())
     }
 

@@ -298,10 +298,10 @@ fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<Str
     let task = req.params.task.clone();
     let instance_id = req.params.instance_id.clone();
     let mode = req.params.mode;
-    let cfg = &req.params.cfg;
     let quiet = req.quiet;
+    let mut agent = req.into_agent(parent, depth)?;
     if !quiet {
-        let model = cfg.model_for_mode(mode)?;
+        let model = &agent.llm.model;
         eprintln!(
             "[genji] mode={} model={} instance={} task={}",
             mode.as_str(),
@@ -310,7 +310,6 @@ fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<Str
             llm::truncate(&task, 120)
         );
     }
-    let mut agent = req.into_agent(parent, depth)?;
     agent.add_user(&task)?;
     let report = agent.run_loop()?;
     let status = agent.status();
@@ -320,41 +319,20 @@ fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<Str
 
 #[cfg(feature = "formal")]
 fn run_cycle(req: RunRequest) -> Result<String> {
-    let RunRequest { params, quiet } = req;
-    let AgentParams {
-        cfg,
-        workspace,
-        db,
-        instance_id,
-        mode: start_mode,
-        task,
-        formal,
-        control,
-        context,
-        ..
-    } = params;
+    let quiet = req.quiet;
+    let start_mode = req.params.mode;
+    let instance_id = req.params.instance_id.clone();
+    let task = req.params.task.clone();
+    let max_cycles = req.params.cfg.max_cycles;
     if !quiet {
         eprintln!(
             "[genji] auto-cycle instance={} start={} max_cycles={}",
             instance_id,
             start_mode.as_str(),
-            cfg.max_cycles
+            max_cycles
         );
     }
-    let max_cycles = cfg.max_cycles;
-    let mut agent = Agent::new(AgentParams {
-        cfg,
-        workspace,
-        db,
-        instance_id,
-        parent_instance: None,
-        mode: start_mode,
-        depth: 0,
-        task: task.clone(),
-        formal,
-        control,
-        context,
-    })?;
+    let mut agent = req.into_agent(None, 0)?;
     agent.add_user(&task)?;
 
     let mut current = start_mode;
@@ -416,12 +394,54 @@ fn run_cycle(req: RunRequest) -> Result<String> {
     Ok(last_report)
 }
 
-struct InstanceGuard(storage::registry::Instance);
+struct InstanceGuard {
+    instance: storage::registry::Instance,
+    control: std::sync::Arc<socket::Control>,
+}
 
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
-        storage::registry::remove(&self.0.id);
+        self.control.shutdown();
+        storage::registry::remove(&self.instance.id);
     }
+}
+
+fn start_control(
+    cfg: &Config,
+    workspace: &Path,
+    context: std::sync::Arc<std::sync::RwLock<storage::context::ContextComposer>>,
+    instance_id: &str,
+    label: String,
+    quiet: bool,
+    no_control: bool,
+) -> Result<Option<(std::sync::Arc<socket::Control>, InstanceGuard)>> {
+    if no_control || !cfg.control_enabled {
+        return Ok(None);
+    }
+    let control = socket::Control::start(
+        cfg.control_path(workspace),
+        cfg.plans_path(workspace),
+        context,
+    )?;
+    if !quiet {
+        eprintln!("[control] listening on {}", control.path.display());
+    }
+    let instance = storage::registry::Instance {
+        id: instance_id.to_string(),
+        pid: std::process::id(),
+        workspace: workspace.display().to_string(),
+        control_socket: control.path.display().to_string(),
+        label,
+        started_at: storage::registry::now_secs(),
+    };
+    if let Err(e) = instance.save() {
+        eprintln!("[registry] warning: could not register instance: {e:#}");
+    }
+    let guard = InstanceGuard {
+        instance,
+        control: control.clone(),
+    };
+    Ok(Some((control, guard)))
 }
 
 fn format_uptime(secs: u64) -> String {
@@ -630,30 +650,50 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
             );
         }
     }
-    let db_existing: Vec<PathBuf> = db_files(&db_path)
+    struct ResetTarget {
+        path: PathBuf,
+        label: &'static str,
+        recreate: bool,
+    }
+    let mut targets = db_files(&db_path)
         .into_iter()
-        .filter(|p| p.exists())
-        .collect();
+        .map(|path| ResetTarget { path, label: "database", recreate: false })
+        .collect::<Vec<_>>();
+    targets.push(ResetTarget { path: plans_dir.clone(), label: "plans", recreate: true });
+    #[cfg(feature = "formal")]
+    {
+        targets.push(ResetTarget { path: requirements_dir.clone(), label: "requirements", recreate: true });
+        targets.push(ResetTarget { path: tickets_dir.clone(), label: "tickets", recreate: true });
+    }
+    let mut db_existing = Vec::new();
+    let mut plan_files = Vec::new();
     #[cfg(feature = "formal")]
     let mut requirement_files = Vec::new();
     #[cfg(feature = "formal")]
-    collect_files(&requirements_dir, &mut requirement_files);
-    let mut plan_files = Vec::new();
-    collect_files(&plans_dir, &mut plan_files);
-    #[cfg(feature = "formal")]
     let mut ticket_files = Vec::new();
-    #[cfg(feature = "formal")]
-    collect_files(&tickets_dir, &mut ticket_files);
-    let total = db_existing.len() + plan_files.len() + {
-        #[cfg(feature = "formal")]
-        {
-            requirement_files.len() + ticket_files.len()
+    for target in &targets {
+        if target.recreate {
+            let mut files = Vec::new();
+            collect_files(&target.path, &mut files);
+            match target.label {
+                "plans" => plan_files = files,
+                #[cfg(feature = "formal")]
+                "requirements" => requirement_files = files,
+                #[cfg(feature = "formal")]
+                "tickets" => ticket_files = files,
+                _ => unreachable!(),
+            }
+        } else if target.path.exists() {
+            db_existing.push(target.path.clone());
         }
-        #[cfg(not(feature = "formal"))]
-        {
-            0
-        }
-    };
+    }
+    let total = db_existing.len() + plan_files.len()
+        + {
+            #[cfg(feature = "formal")]
+            { requirement_files.len() + ticket_files.len() }
+            #[cfg(not(feature = "formal"))]
+            { 0 }
+        };
 
     if total == 0 {
         eprintln!(
@@ -692,30 +732,25 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
                 return Ok(());
             }
         }
-        for p in &db_existing {
-            std::fs::remove_file(p).with_context(|| format!("deleting {}", p.display()))?;
-        }
-        #[cfg(feature = "formal")]
-        if requirements_dir.exists() {
-            std::fs::remove_dir_all(&requirements_dir)
-                .with_context(|| format!("deleting {}", requirements_dir.display()))?;
-        }
-        if plans_dir.exists() {
-            std::fs::remove_dir_all(&plans_dir)
-                .with_context(|| format!("deleting {}", plans_dir.display()))?;
-        }
-        #[cfg(feature = "formal")]
-        if tickets_dir.exists() {
-            std::fs::remove_dir_all(&tickets_dir)
-                .with_context(|| format!("deleting {}", tickets_dir.display()))?;
+        for target in &targets {
+            if !target.path.exists() {
+                continue;
+            }
+            if target.recreate {
+                std::fs::remove_dir_all(&target.path)
+                    .with_context(|| format!("deleting {}", target.path.display()))?;
+            } else {
+                std::fs::remove_file(&target.path)
+                    .with_context(|| format!("deleting {}", target.path.display()))?;
+            }
         }
         eprintln!("[reset] deleted {total} file(s)");
     }
-    std::fs::create_dir_all(&plans_dir)
-        .with_context(|| format!("creating {}", plans_dir.display()))?;
-    #[cfg(feature = "formal")]
-    for d in [&requirements_dir, &tickets_dir] {
-        std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
+    for target in &targets {
+        if target.recreate {
+            std::fs::create_dir_all(&target.path)
+                .with_context(|| format!("creating {}", target.path.display()))?;
+        }
     }
     let db = Db::open(&db_path)?;
     db.init_schema()?;
@@ -965,11 +1000,10 @@ fn cmd_inspect(id: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(command) = &cli.command {
-        if command.execute(&cli)?.is_some() {
+    if let Some(command) = &cli.command
+        && command.execute(&cli)?.is_some() {
             return Ok(());
         }
-    }
     let workspace = resolve_workspace(&cli)?;
     let prepared = prepare_workspace(&workspace, &cli)?;
     let PreparedWorkspace { cfg, db, formal } = prepared;
@@ -992,32 +1026,16 @@ fn main() -> Result<()> {
     // Top-level runs open a control socket so instructions can be injected
     // mid-run; subagents never do. Controllable runs also register themselves so
     // `genji list`/`stop`/`instruct`/`inspect` can find them from anywhere.
-    let mut _instance_guard: Option<InstanceGuard> = None;
-    let control = if cli.no_control || !cfg.control_enabled {
-        None
-    } else {
-        let c = socket::Control::start(
-            cfg.control_path(&workspace),
-            cfg.plans_path(&workspace),
-            context.clone(),
-        )?;
-        if !quiet {
-            eprintln!("[control] listening on {}", c.path.display());
-        }
-        let inst = storage::registry::Instance {
-            id: instance_id.clone(),
-            pid: std::process::id(),
-            workspace: workspace.display().to_string(),
-            control_socket: c.path.display().to_string(),
-            label: cli.label.clone(),
-            started_at: storage::registry::now_secs(),
-        };
-        if let Err(e) = inst.save() {
-            eprintln!("[registry] warning: could not register instance: {e:#}");
-        }
-        _instance_guard = Some(InstanceGuard(inst));
-        Some(c)
-    };
+    let control_registration = start_control(
+        &cfg,
+        &workspace,
+        context.clone(),
+        &instance_id,
+        cli.label.clone(),
+        quiet,
+        cli.no_control,
+    )?;
+    let control = control_registration.as_ref().map(|(control, _)| control.clone());
     #[cfg(feature = "formal")]
     let active_requirements = if formal {
         storage::reqmd::active_count(&cfg, &workspace)?
@@ -1033,7 +1051,6 @@ fn main() -> Result<()> {
                 if let Some(t) = wait_for_instruction(c, &instance_id, quiet)? {
                     t
                 } else {
-                    c.shutdown();
                     return Ok(());
                 }
             } else {
@@ -1077,9 +1094,6 @@ fn main() -> Result<()> {
         run_single(request, parent, cli.depth)?
     };
 
-    if let Some(c) = &control {
-        c.shutdown();
-    }
     eprintln!("[report] {report}");
     Ok(())
 }

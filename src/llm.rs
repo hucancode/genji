@@ -160,10 +160,6 @@ impl ChatMessage {
         }
     }
 
-    pub fn to_json(&self) -> Value {
-        serde_json::to_value(self).expect("ChatMessage is serializable")
-    }
-
     pub fn est_tokens(&self) -> i64 {
         let mut chars = self.content.chars().count();
         if let Some(reasoning) = &self.reasoning_content {
@@ -263,10 +259,9 @@ impl LlmClient {
     }
 
     pub fn chat(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<LlmResponse> {
-        let msgs: Vec<Value> = messages.iter().map(ChatMessage::to_json).collect();
         let mut body = json!({
             "model": self.model,
-            "messages": msgs,
+            "messages": messages,
             "stream": false,
         });
         if let Some(obj) = body.as_object_mut() {
@@ -341,7 +336,7 @@ impl LlmClient {
                 }));
             }
         };
-        parse_response(&value)
+        parse_response(value)
     }
 }
 
@@ -377,13 +372,13 @@ fn is_retryable(e: &anyhow::Error) -> bool {
     e.downcast_ref::<Retryable>().is_some()
 }
 
-fn parse_response(value: &Value) -> Result<LlmResponse> {
-    let parsed: WireResponse =
-        serde_json::from_value(value.clone()).context("parsing llm response")?;
+fn parse_response(value: Value) -> Result<LlmResponse> {
+    let raw = value.to_string();
+    let parsed: WireResponse = serde_json::from_value(value).context("parsing llm response")?;
     let choice = parsed.choices.into_iter().next().ok_or_else(|| {
         anyhow!(
             "llm response has no choices: {}",
-            truncate(&value.to_string(), 400)
+            truncate(&raw, 400)
         )
     })?;
     let tool_calls = choice
