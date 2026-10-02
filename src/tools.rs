@@ -496,7 +496,7 @@ pub mod requirements {
         #[serde(default)] parent_id: FieldPatch<i64>,
     }
     #[derive(Debug, Deserialize)]
-    struct RemoveArgs { id: i64, hard: Option<bool> }
+    struct RemoveArgs { id: i64 }
     #[derive(Debug, Deserialize)]
     struct TreeArgs { status: Option<String> }
     #[derive(Debug, Deserialize)]
@@ -586,7 +586,6 @@ pub mod requirements {
     pub fn remove(agent: &mut Agent, args: &Value) -> Result<String> {
         let parsed: RemoveArgs = super::parse_args(args)?;
         let id = parsed.id;
-        let hard = parsed.hard.unwrap_or(false);
         if !reqmd::remove(&agent.cfg, &agent.workspace, id, hard)? {
             bail!("requirement #{id} not found");
         }
@@ -776,11 +775,6 @@ pub mod requirements {
                 read_requirements(&cfg, &ws, None, None, Some(RequirementStatus::Met)).unwrap();
             assert!(met.contains("#2 "), "{met}");
             assert!(!met.contains("#1 "), "{met}");
-
-            // A filter with no matches is an empty list, not an error.
-            let none =
-                read_requirements(&cfg, &ws, None, None, Some(RequirementStatus::Removed)).unwrap();
-            assert_eq!(none, "(no requirements)");
 
             // A missing id is an error, not an empty list.
             assert!(read_requirements(&cfg, &ws, Some(999), None, None).is_err());
@@ -2058,9 +2052,9 @@ fn registry() -> &'static [Tool] {
                 "required":["id"]
             }), requirements::update),
             #[cfg(feature = "formal")]
-            formal_tool("requirement_remove", PLAN, "Remove a requirement (soft by default).", json!({
+            formal_tool("requirement_remove", PLAN, "Remove a requirement.", json!({
                 "type":"object",
-                "properties":{"id":{"type":"integer"},"hard":{"type":"boolean"}},
+                "properties":{"id":{"type":"integer"}},
                 "required":["id"]
             }), requirements::remove),
             #[cfg(feature = "formal")]

@@ -1744,7 +1744,6 @@ pub mod reqmd {
         #[default]
         Active,
         Met,
-        Removed,
     }
 
     impl RequirementStatus {
@@ -1752,7 +1751,6 @@ pub mod reqmd {
             match self {
                 Self::Active => "active",
                 Self::Met => "met",
-                Self::Removed => "removed",
             }
         }
     }
@@ -1770,8 +1768,7 @@ pub mod reqmd {
             match s.trim().trim_matches('"').to_ascii_lowercase().as_str() {
                 "active" => Ok(Self::Active),
                 "met" => Ok(Self::Met),
-                "removed" => Ok(Self::Removed),
-                _ => Err("status must be active|met|removed"),
+                _ => Err("status must be active|met"),
             }
         }
     }
@@ -1947,25 +1944,13 @@ pub mod reqmd {
         Ok(true)
     }
 
-    pub fn remove(cfg: &Config, workspace: &Path, id: i64, hard: bool) -> Result<bool> {
+    pub fn remove(cfg: &Config, workspace: &Path, id: i64) -> Result<bool> {
         let Some(req) = load_by_id(cfg, workspace, id)? else {
             return Ok(false);
         };
-        if hard {
-            std::fs::remove_file(&req.path)
-                .with_context(|| format!("deleting {}", req.path.display()))?;
-            return Ok(true);
-        }
-        update(
-            cfg,
-            workspace,
-            id,
-            None,
-            None,
-            Some(RequirementStatus::Removed),
-            None,
-            FieldPatch::Keep,
-        )
+        std::fs::remove_file(&req.path)
+            .with_context(|| format!("deleting {}", req.path.display()))?;
+        return Ok(true);
     }
 
     pub fn sync(cfg: &Config, workspace: &Path) -> Result<usize> {
