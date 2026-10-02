@@ -7,14 +7,14 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, expand_tilde};
-use crate::context::ContextComposer;
-use crate::control::{Control, ControlPoll};
-use crate::db::Db;
-use crate::events::EventEmitter;
 use crate::llm::{self, ChatMessage, LlmClient};
-use crate::modes::{Mode, shared_preamble};
-use crate::prompts;
-use crate::registry;
+use crate::socket::{Control, ControlPoll};
+use crate::storage::context::ContextComposer;
+use crate::storage::db::Db;
+use crate::storage::events::EventEmitter;
+use crate::storage::modes::{Mode, shared_preamble};
+use crate::storage::prompts;
+use crate::storage::registry;
 use crate::tools;
 
 const MAX_LLM_RETRIES: u32 = 3;
@@ -28,9 +28,6 @@ pub struct Agent {
     #[cfg(feature = "formal")]
     pub model: String,
     pub llm: LlmClient,
-    /// Owns the system prompt, conversation turns, tool definitions, and the
-    /// context window accounting. Shared with the control socket so `/context`
-    /// can measure it on demand; the agent never touches the message vector.
     pub context: Arc<RwLock<ContextComposer>>,
     pub tokens_used: i64,
     pub token_limit: i64,
@@ -38,21 +35,13 @@ pub struct Agent {
     pub deadline: Instant,
     pub depth: u32,
     pub seq: i64,
-    /// Formal flag: enables the requirements/tickets tools and the auto plan/build
-    /// cycle. Off means a plain coding agent with no ticket system.
     pub formal: bool,
-    /// Plan slug selected by the user via the control socket (`/setplan`).
-    /// Surfaced in the system prompt so the model follows it; plan mode also
-    /// refines it.
     pub active_plan: Option<String>,
     pub control: Option<Arc<Control>>,
     pub events: Arc<EventEmitter>,
-    /// Set when a fatal LLM failure ends the run (see [`Agent::status`]).
     pub failed: bool,
 }
 
-/// Everything needed to start an agent run. Kept as a struct so construction
-/// stays a single, readable call and the model is resolved in one place.
 pub struct AgentParams {
     pub cfg: Config,
     pub workspace: PathBuf,
@@ -64,14 +53,9 @@ pub struct AgentParams {
     pub task: String,
     pub formal: bool,
     pub control: Option<Arc<Control>>,
-    /// The shared, live context. Built before the control socket so `/context`
-    /// can read it directly; the agent writes to it as the conversation grows.
     pub context: Arc<RwLock<ContextComposer>>,
 }
 
-/// Build the initial context for a mode: system prompt, tools, and window.
-/// Called before the control socket exists so both it and the agent share one
-/// composer.
 pub fn build_context(
     cfg: &Config,
     db: &Db,
@@ -103,13 +87,9 @@ impl Agent {
             control,
             context,
         } = params;
-        // The model is derived here, not passed in, so `Agent` and `set_mode`
-        // share one source of truth for model selection.
         let model = cfg.model_for_mode(mode);
         let limits = cfg.limits_for_model(&model);
         let llm = LlmClient::new(&cfg, &model)?;
-        // Open the durable event file before recording the run as started. The
-        // same events also go to stdout.
         let events = Arc::new(EventEmitter::new(
             instance_id.clone(),
             Some(registry::events_path(&instance_id)),
@@ -177,10 +157,6 @@ impl Agent {
         Ok(())
     }
 
-    /// The full system prompt: shared + core + Formal guidance + extended prompt,
-    /// plus a section for the user-selected plan when one is active. Works in
-    /// every mode; in build mode the model follows the plan rather than editing
-    /// it (`plan_write` is plan-only).
     fn compose_system(&self) -> Result<String> {
         let mut system = build_system(&self.db, self.mode, self.formal)?;
         if let Some(slug) = &self.active_plan {
@@ -223,7 +199,6 @@ impl Agent {
         let limits = self.cfg.limits_for_model(&self.model);
         self.token_limit = limits.token_limit;
         self.llm = LlmClient::new(&self.cfg, &self.model)?;
-        // The composer swaps tools, system prompt, and window together.
         let tools = tools::specs_for(mode, self.formal, !self.db.skill_list()?.is_empty());
         let system = self.compose_system()?;
         self.context
@@ -313,8 +288,6 @@ impl Agent {
         None
     }
 
-    /// Run turns until the model stops calling tools, or a budget/iteration
-    /// limit is hit. Returns the final assistant text.
     pub fn run_loop(&mut self) -> Result<String> {
         let mut iterations = 0usize;
         let mut llm_retries = 0u32;
@@ -324,9 +297,6 @@ impl Agent {
                 self.events.error(&format!("stopped: {reason}"));
                 return Ok(format!("(stopped: {reason})"));
             }
-
-            // Mid-run steering: safe here because all tool results from the
-            // previous assistant turn have already been appended.
             let poll = self.poll_control()?;
             if poll.stop {
                 let m = "(stopped by user via control socket)".to_string();
@@ -349,9 +319,6 @@ impl Agent {
                 self.events.status(&status);
             }
             self.maybe_compact()?;
-
-            // Never hold the shared context lock across blocking network I/O:
-            // `/context` must remain responsive while the provider is working.
             let (messages, tools_json) = {
                 let ctx = self.context.read().unwrap();
                 (ctx.messages().to_vec(), ctx.tools_json())
@@ -396,10 +363,7 @@ impl Agent {
                 } else {
                     assistant.content.clone()
                 };
-                // Preserve any reasoning in the log.
                 self.log(assistant)?;
-                // An instruction may have arrived while producing this final
-                // message; if so, keep going rather than ending the run.
                 let poll = self.poll_control()?;
                 if poll.stop {
                     return Ok("(stopped by user via control socket)".to_string());
@@ -465,7 +429,6 @@ impl Agent {
         msg
     }
 
-    /// Run outcome to record with [`Agent::finish`].
     pub fn status(&self) -> &'static str {
         if self.failed { "failed" } else { "done" }
     }
@@ -475,8 +438,6 @@ impl Agent {
             return Ok(ControlPoll::default());
         };
         let mut out = ControlPoll::default();
-        // Adopt a plan selected via `/setplan` before draining instructions, so
-        // the instruction queued with it is answered with the plan in context.
         let plan = ctrl.active_plan();
         if plan != self.active_plan {
             match &plan {
@@ -537,8 +498,6 @@ pub fn build_system(db: &Db, mode: Mode, formal: bool) -> Result<String> {
             base.push_str(guidance);
         }
     }
-    // `load_extended` is the single gate for which modes have an extended
-    // prompt; it returns empty for RETRO and for an unedited (empty) prompt.
     let extended = prompts::load_extended(db, mode)?;
     if extended.trim().is_empty() {
         return Ok(base);

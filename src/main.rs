@@ -1,20 +1,9 @@
 mod agent;
 mod config;
-mod context;
-mod control;
-mod db;
-mod events;
 mod llm;
-mod modes;
-mod proc;
-mod prompts;
-mod registry;
-#[cfg(feature = "formal")]
-mod reqmd;
-#[cfg(feature = "formal")]
-mod ticketmd;
+mod socket;
+mod storage;
 mod tools;
-mod util;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -24,9 +13,9 @@ use std::sync::{Arc, RwLock};
 
 use agent::{Agent, AgentParams};
 use config::Config;
-use db::Db;
-use modes::Mode;
 use serde_json::json;
+use storage::db::Db;
+use storage::modes::Mode;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -51,8 +40,6 @@ struct Cli {
     depth: u32,
     #[arg(long, global = true)]
     quiet_startup: bool,
-    /// Enable the requirements/tickets system and the automatic plan/build
-    /// cycle. Without it genji is a plain coding agent.
     #[cfg(feature = "formal")]
     #[arg(long, global = true)]
     formal: bool,
@@ -66,49 +53,34 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Produce an implementation plan before work begins.
     Plan {
-        /// The user request / task.
         task: Option<String>,
     },
-    /// Implement the requested changes and verify them.
     Build {
-        /// The user request / task.
         task: Option<String>,
     },
-    /// Investigate and report; no ticket/requirement tools.
     Explore {
-        /// The user request / task.
         task: Option<String>,
     },
-    /// Study recorded history and improve prompts/skills.
     Retro {
-        /// The user request / task.
         task: Option<String>,
     },
-    /// List running genji instances and their brief status.
     List,
-    /// Stop running genji instances (`all` stops every instance).
     Stop {
-        /// Instance ids (space- or comma-separated). Run with no ids for help.
         ids: Vec<String>,
     },
-    /// Send an instruction to a running genji instance.
     Instruct {
         /// Instance id (see `genji list`).
         id: String,
-        /// Instruction text to deliver.
         #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
         instruction: Vec<String>,
     },
-    /// Point a running instance at a plan to follow/refine (`/setplan <slug>`).
     Setplan {
         /// Instance id (see `genji list`).
         id: String,
         /// Plan slug (the `<slug>.md` file under the plans directory).
         slug: String,
     },
-    /// Show the context that will be sent to the model (`/context`).
     Context {
         /// Instance id (see `genji list`).
         id: String,
@@ -117,9 +89,7 @@ enum Command {
         /// Instance id (see `genji list`).
         id: String,
     },
-    /// Wipe the workspace database, plans, requirements, and open tickets, then start over.
     Reset {
-        /// Skip the confirmation prompt.
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -145,9 +115,6 @@ fn ensure_layout(cfg: &Config, workspace: &std::path::Path, formal: bool) -> Res
 
 const DEFAULT_TASK: &str = "Satisfy the active requirements in .genji/requirements/. Derive system requirements and tickets as needed.";
 
-/// Read the instruction supplied on the command line. Returns `None` when the
-/// user gave neither a task nor a non-empty instructions file, in which case
-/// genji should wait for one over the control socket.
 fn read_task(instructions_file: Option<&str>, task: Option<&str>) -> Result<Option<String>> {
     if let Some(f) = instructions_file {
         let text =
@@ -164,19 +131,12 @@ fn read_task(instructions_file: Option<&str>, task: Option<&str>) -> Result<Opti
     Ok(None)
 }
 
-/// What a top-level run should do once it has resolved its inputs.
 #[derive(Debug, PartialEq, Eq)]
 enum Startup {
-    /// Begin work with this task.
     Run(String),
-    /// Wait for an instruction over the control socket.
     Wait,
 }
 
-/// Decide how to start from the two inputs the user can provide: an explicit
-/// instruction and the presence of active requirements. An explicit instruction
-/// always wins; otherwise, with Formal on, active requirements are the work queue;
-/// nothing was provided and we wait for an instruction.
 fn startup_action(
     explicit_task: Option<String>,
     active_requirements: i64,
@@ -192,7 +152,7 @@ fn startup_action(
 }
 
 fn wait_for_instruction(
-    control: &control::Control,
+    control: &socket::Control,
     id: &str,
     quiet: bool,
 ) -> Result<Option<String>> {
@@ -229,8 +189,6 @@ fn mode_switch_instruction(mode: Mode) -> String {
     }
 }
 
-/// Inputs shared by every top-level run. One definition for how a run is
-/// described, whether it runs a single mode or cycles.
 struct RunRequest {
     cfg: Config,
     workspace: PathBuf,
@@ -240,8 +198,8 @@ struct RunRequest {
     task: String,
     formal: bool,
     quiet: bool,
-    control: Option<Arc<control::Control>>,
-    context: Arc<RwLock<context::ContextComposer>>,
+    control: Option<Arc<socket::Control>>,
+    context: Arc<RwLock<storage::context::ContextComposer>>,
 }
 
 fn run_single(req: RunRequest, parent: Option<String>, depth: u32) -> Result<String> {
@@ -328,7 +286,7 @@ fn run_cycle(req: RunRequest) -> Result<String> {
     let mut current = start_mode;
     let mut last_report = String::new();
     for cycle in 0..max_cycles {
-        let active = reqmd::active_count(&agent.cfg, &agent.workspace)?;
+        let active = storage::reqmd::active_count(&agent.cfg, &agent.workspace)?;
         agent
             .events
             .cycle(cycle + 1, max_cycles, current.as_str(), active);
@@ -388,13 +346,11 @@ fn run_cycle(req: RunRequest) -> Result<String> {
     Ok(last_report)
 }
 
-/// Removes this process's instance record when the run ends (including early
-/// returns and panics during unwinding).
-struct InstanceGuard(registry::Instance);
+struct InstanceGuard(storage::registry::Instance);
 
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
-        registry::remove(&self.0.id);
+        storage::registry::remove(&self.0.id);
     }
 }
 
@@ -418,25 +374,21 @@ fn status_text(reply: &str) -> String {
 }
 
 fn query_status(socket: &str) -> String {
-    match control::send(Path::new(socket), "/status") {
+    match socket::send(Path::new(socket), "/status") {
         Ok(r) => status_text(&r),
         Err(e) => format!("(unreachable: {e:#})"),
     }
 }
 
-/// `genji list` only shows live registry entries. Those are the top-level,
-/// controllable runs, so every listed row is a root instance and owns the
-/// workspace control socket.
-fn is_root_instance(_inst: &registry::Instance) -> bool {
+fn is_root_instance(_inst: &storage::registry::Instance) -> bool {
+    // TODO: fix this
     true
 }
 
 /// `genji list` — running instances with their live status. stdout is machine
 /// output (JSON); the human table is written to stderr.
 fn cmd_list() -> Result<()> {
-    // Probe each control socket once and reuse the status for both the machine
-    // output and the human table.
-    let rows: Vec<(registry::Instance, String)> = registry::list_live()
+    let rows: Vec<(storage::registry::Instance, String)> = storage::registry::list_live()
         .into_iter()
         .map(|inst| {
             let status = query_status(&inst.control_socket);
@@ -482,7 +434,6 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
-/// `genji stop [ids...|all]` — graceful stop over the control socket.
 fn cmd_stop(ids: &[String]) -> Result<()> {
     let targets: Vec<String> = ids
         .iter()
@@ -493,7 +444,7 @@ fn cmd_stop(ids: &[String]) -> Result<()> {
 
     if targets.is_empty() {
         eprintln!("warning: `genji stop` needs one or more instance ids, or `all`");
-        let instances = registry::list_live();
+        let instances = storage::registry::list_live();
         if instances.is_empty() {
             eprintln!("no running genji instances");
         } else {
@@ -518,11 +469,11 @@ fn cmd_stop(ids: &[String]) -> Result<()> {
 
     let mut failed = false;
     let instances = if targets.iter().any(|t| t == "all") {
-        registry::list_live()
+        storage::registry::list_live()
     } else {
         let mut found = Vec::new();
         for id in &targets {
-            match registry::find(id) {
+            match storage::registry::find(id) {
                 Ok(inst) => found.push(inst),
                 Err(e) => {
                     eprintln!("{e:#}");
@@ -538,7 +489,7 @@ fn cmd_stop(ids: &[String]) -> Result<()> {
     }
     let mut results: Vec<serde_json::Value> = Vec::new();
     for inst in &instances {
-        match control::send(Path::new(&inst.control_socket), "/stop") {
+        match socket::send(Path::new(&inst.control_socket), "/stop") {
             Ok(r) => {
                 eprintln!("stopping {} (pid {}): {}", inst.id, inst.pid, r);
                 results.push(json!({
@@ -567,7 +518,6 @@ fn cmd_stop(ids: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The SQLite database and its WAL/SHM companions.
 fn db_files(db_path: &Path) -> [PathBuf; 3] {
     let base = db_path.as_os_str().to_string_lossy();
     [
@@ -577,10 +527,6 @@ fn db_files(db_path: &Path) -> [PathBuf; 3] {
     ]
 }
 
-/// Recursively collect every entry under `dir` that is not a directory. A
-/// missing directory yields nothing, so callers do not have to check first.
-/// Symlinks to directories are collected, not followed, so a loop cannot hang
-/// the walk.
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -609,12 +555,9 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
     let requirements_dir = cfg.requirements_path(workspace);
     #[cfg(feature = "formal")]
     let tickets_dir = cfg.tickets_path(workspace);
-
-    // Deleting the database out from under a live instance would split its
-    // writes across the old (unlinked) and new files. Refuse instead.
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let here = canon(workspace);
-    for inst in registry::list_live() {
+    for inst in storage::registry::list_live() {
         if canon(Path::new(&inst.workspace)) == here {
             bail!(
                 "instance {} (pid {}) is running in this workspace; stop it first with `genji stop {}`",
@@ -624,9 +567,6 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
             );
         }
     }
-
-    // Everything reset will destroy: the database (plus WAL/SHM) and every
-    // file under the plans and requirements trees.
     let db_existing: Vec<PathBuf> = db_files(&db_path)
         .into_iter()
         .filter(|p| p.exists())
@@ -708,9 +648,6 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
         }
         eprintln!("[reset] deleted {total} file(s)");
     }
-
-    // Recreate the layout and a clean, ready database so the next run starts
-    // from an empty workspace.
     std::fs::create_dir_all(&plans_dir)
         .with_context(|| format!("creating {}", plans_dir.display()))?;
     #[cfg(feature = "formal")]
@@ -719,12 +656,11 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
     }
     let db = Db::open(&db_path)?;
     db.init_schema()?;
-    prompts::seed_prompts(&db)?;
+    storage::prompts::seed_prompts(&db)?;
     eprintln!(
         "[reset] initialized clean database at {}",
         db_path.display()
     );
-
     #[cfg(feature = "formal")]
     let deleted: Vec<String> = db_existing
         .iter()
@@ -750,14 +686,12 @@ fn cmd_reset(workspace: &Path, assume_yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// `genji instruct <id> <instruction>` — queue text for a running instance.
-/// stdout is machine output (JSON); the human message goes to stderr.
 fn cmd_instruct(id: &str, instruction: &str) -> Result<()> {
     if instruction.trim().is_empty() {
         bail!("missing instruction (usage: genji instruct <id> <instruction>)");
     }
-    let inst = registry::find(id)?;
-    let resp = control::send(Path::new(&inst.control_socket), instruction)?;
+    let inst = storage::registry::find(id)?;
+    let resp = socket::send(Path::new(&inst.control_socket), instruction)?;
     let message = status_text(&resp);
     println!(
         "{}",
@@ -767,14 +701,12 @@ fn cmd_instruct(id: &str, instruction: &str) -> Result<()> {
     Ok(())
 }
 
-/// `genji setplan <id> <slug>` — select the plan a running instance follows.
-/// stdout is machine output (JSON); the human message goes to stderr.
 fn cmd_setplan(id: &str, slug: &str) -> Result<()> {
     if slug.trim().is_empty() {
         bail!("missing plan slug (usage: genji setplan <id> <slug>)");
     }
-    let inst = registry::find(id)?;
-    let resp = control::send(Path::new(&inst.control_socket), &format!("/setplan {slug}"))?;
+    let inst = storage::registry::find(id)?;
+    let resp = socket::send(Path::new(&inst.control_socket), &format!("/setplan {slug}"))?;
     let message = status_text(&resp);
     println!(
         "{}",
@@ -784,22 +716,18 @@ fn cmd_setplan(id: &str, slug: &str) -> Result<()> {
     Ok(())
 }
 
-/// `genji context <id>` — dump the live context the model will receive next:
-/// the system prompt, tool definitions, and conversation turns. stdout is the
-/// snapshot JSON, read directly from the running composer.
 fn cmd_context(id: &str) -> Result<()> {
-    let inst = registry::find(id)?;
-    let resp = control::send(Path::new(&inst.control_socket), "/context")?;
+    let inst = storage::registry::find(id)?;
+    let resp = socket::send(Path::new(&inst.control_socket), "/context")?;
     let value: serde_json::Value = serde_json::from_str(&resp)
         .with_context(|| format!("unexpected /context reply: {resp}"))?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 
-/// Resolve an instance id (exact, else a unique prefix) to its trace file.
 fn find_trace(instance: &str) -> Result<std::path::PathBuf> {
-    let dir = registry::events_dir();
-    let exact = registry::events_path(instance);
+    let dir = storage::registry::events_dir();
+    let exact = storage::registry::events_path(instance);
     if exact.exists() {
         return Ok(exact);
     }
@@ -832,23 +760,19 @@ fn find_trace(instance: &str) -> Result<std::path::PathBuf> {
     }
 }
 
-/// A resolved `inspect`/`follow` target: an instance id and its trace, plus the
-/// live instance record when the id named one.
 struct TraceTarget {
     instance_id: String,
     trace_path: std::path::PathBuf,
-    instance: Option<registry::Instance>,
+    instance: Option<storage::registry::Instance>,
 }
 
-/// Resolve `<id>` as a live instance id, else as a recorded (finished) instance
-/// id whose trace still exists.
 fn resolve_target(id: &str) -> Result<TraceTarget> {
     let id = id.trim();
     if id.is_empty() {
         bail!("missing instance id");
     }
-    if let Ok(inst) = registry::find(id) {
-        let trace_path = registry::events_path(&inst.id);
+    if let Ok(inst) = storage::registry::find(id) {
+        let trace_path = storage::registry::events_path(&inst.id);
         return Ok(TraceTarget {
             instance_id: inst.id.clone(),
             trace_path,
@@ -862,7 +786,6 @@ fn resolve_target(id: &str) -> Result<TraceTarget> {
     })
 }
 
-/// Read a target's trace. A missing file is empty for a live instance.
 fn read_trace(target: &TraceTarget) -> Result<Option<String>> {
     if target.trace_path.exists() {
         Ok(Some(
@@ -876,7 +799,6 @@ fn read_trace(target: &TraceTarget) -> Result<Option<String>> {
     }
 }
 
-/// The `instance_start` event of a trace, if present.
 fn trace_instance_start(text: &str) -> Option<serde_json::Value> {
     text.lines().find_map(|l| {
         let v: serde_json::Value = serde_json::from_str(l).ok()?;
@@ -884,7 +806,6 @@ fn trace_instance_start(text: &str) -> Option<serde_json::Value> {
     })
 }
 
-/// True when a trace line is an `instance_end` event.
 fn is_instance_end(line: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(line)
         .ok()
@@ -896,19 +817,12 @@ fn is_instance_end(line: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Ask a live instance for its computed context size breakdown. Returns `None`
-/// when the instance is not answering or has not built a snapshot yet. Context
-/// is pull-only: `genji inspect` requests it, it is never broadcast to the trace.
-fn query_context(socket: &str) -> Option<context::ContextInfo> {
-    let reply = control::send(Path::new(socket), "/context stats").ok()?;
+fn query_context(socket: &str) -> Option<storage::context::ContextInfo> {
+    let reply = socket::send(Path::new(socket), "/context stats").ok()?;
     let value: serde_json::Value = serde_json::from_str(&reply).ok()?;
-    Some(context::ContextInfo::from_json(&value))
+    Some(storage::context::ContextInfo::from_json(&value))
 }
 
-/// `genji inspect <id>` — a brief summary of an instance.
-///
-/// stdout is a single JSON object; the human-readable view goes to stderr. Use
-/// `genji follow <id>` to stream the event trace itself.
 fn cmd_inspect(id: &str) -> Result<()> {
     let target = resolve_target(id)?;
     let text = read_trace(&target)?.unwrap_or_default();
@@ -954,8 +868,6 @@ fn cmd_inspect(id: &str) -> Result<()> {
         }
     }
     println!("{}", serde_json::to_string(&obj)?);
-
-    // Human summary.
     eprintln!("id:      {}", id.trim());
     eprintln!("trace:   {}", target.trace_path.display());
     eprintln!("events:  {count}{}", if ended { " (ended)" } else { "" });
@@ -990,9 +902,6 @@ fn cmd_inspect(id: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    // Instance-management subcommands are thin clients over the registry/control
-    // socket; handle them before loading config or touching the workspace.
     match &cli.command {
         Some(Command::List) => return cmd_list(),
         Some(Command::Stop { ids }) => return cmd_stop(ids),
@@ -1037,7 +946,7 @@ fn main() -> Result<()> {
     let synced = tools::skills::sync_skills(&db, &cfg.skills_path(&workspace)).unwrap_or(0);
     #[cfg(feature = "formal")]
     if formal && cfg.auto_ingest_requirements {
-        let total = reqmd::sync(&cfg, &workspace)?;
+        let total = storage::reqmd::sync(&cfg, &workspace)?;
         if total > 0 && !cli.quiet_startup {
             eprintln!(
                 "[requirements] loaded {total} md file(s) from {}",
@@ -1047,15 +956,12 @@ fn main() -> Result<()> {
     }
     #[cfg(feature = "formal")]
     if formal {
-        ticketmd::sync(&cfg, &workspace)?;
+        storage::ticketmd::sync(&cfg, &workspace)?;
     }
-    prompts::seed_prompts(&db)?;
+    storage::prompts::seed_prompts(&db)?;
     if synced > 0 && !cli.quiet_startup {
         eprintln!("[skills] synced {synced} skill file(s)");
     }
-
-    // With no mode subcommand we default to build mode. The requirements/tickets
-    // system (and the automatic plan/build cycle) is opt-in via `--formal`.
     let (start_mode, task_arg): (Mode, Option<&str>) = match &cli.command {
         Some(Command::Plan { task }) => (Mode::Plan, task.as_deref()),
         Some(Command::Build { task }) => (Mode::Build, task.as_deref()),
@@ -1064,17 +970,11 @@ fn main() -> Result<()> {
         Some(_) => unreachable!("instance subcommand handled above"),
         None => (Mode::Build, cli.task.as_deref()),
     };
-    // Formal always runs the auto plan/build cycle; a plain run is a single mode.
     let explicit_task = read_task(cli.instructions_file.as_deref(), task_arg)?;
     let quiet = cli.quiet_startup || cli.subagent;
-    // One id per run: the instance id. It names the registry record, the event
-    // trace that `genji inspect` reads, and the DB record, and every event is
-    // tagged with it. Subagents get one too even though they do not register.
-    let instance_id = registry::new_id();
-    // Materialise the trace up front so `genji inspect` works even before the
-    // first event (for example while an instance waits for an instruction).
+    let instance_id = storage::registry::new_id();
     {
-        let trace = registry::events_path(&instance_id);
+        let trace = storage::registry::events_path(&instance_id);
         if let Some(parent) = trace.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -1094,12 +994,6 @@ fn main() -> Result<()> {
             cfg.model_for_mode(start_mode)
         );
     }
-    // Per-model limits (token budget, context window, max output) are resolved
-    // for the active model via `cfg.limits_for_model`, so a profile or model
-    // switch carries its own budget. Nothing to patch globally here.
-
-    // Build the context before the control socket so both share one composer:
-    // the agent writes to it, `/context` takes a read guard and measures it.
     let context = agent::build_context(&cfg, &db, start_mode, formal)?;
 
     // Top-level runs open a control socket so instructions can be injected
@@ -1109,7 +1003,7 @@ fn main() -> Result<()> {
     let control = if cli.no_control || !cfg.control_enabled {
         None
     } else {
-        let c = control::Control::start(
+        let c = socket::Control::start(
             cfg.control_path(&workspace),
             cfg.plans_path(&workspace),
             context.clone(),
@@ -1117,13 +1011,13 @@ fn main() -> Result<()> {
         if !quiet {
             eprintln!("[control] listening on {}", c.path.display());
         }
-        let inst = registry::Instance {
+        let inst = storage::registry::Instance {
             id: instance_id.clone(),
             pid: std::process::id(),
             workspace: workspace.display().to_string(),
             control_socket: c.path.display().to_string(),
             label: cli.label.clone(),
-            started_at: registry::now_secs(),
+            started_at: storage::registry::now_secs(),
         };
         if let Err(e) = inst.save() {
             eprintln!("[registry] warning: could not register instance: {e:#}");
@@ -1131,12 +1025,9 @@ fn main() -> Result<()> {
         _instance_guard = Some(InstanceGuard(inst));
         Some(c)
     };
-
-    // Start from an explicit instruction when given, else the active
-    // requirements, else wait for an instruction on the control socket.
     #[cfg(feature = "formal")]
     let active_requirements = if formal {
-        reqmd::active_count(&cfg, &workspace)?
+        storage::reqmd::active_count(&cfg, &workspace)?
     } else {
         0
     };
@@ -1152,8 +1043,6 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
             },
-            // No control socket to wait on and no work to do: there is no way
-            // to receive an instruction, so exit cleanly.
             None => {
                 if !quiet {
                     eprintln!(
@@ -1194,9 +1083,6 @@ fn main() -> Result<()> {
     if let Some(c) = &control {
         c.shutdown();
     }
-    // stdout carries the machine event stream; the final report is delivered in
-    // the `instance_end` event. Mirror it to stderr so humans still see the
-    // answer without having to parse the events.
     eprintln!("[report] {report}");
     Ok(())
 }

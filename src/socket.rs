@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::context::ContextComposer;
+use crate::storage::context::ContextComposer;
 
 /// A control socket that lets a user inject instructions into a running agent.
 ///
@@ -258,7 +258,7 @@ pub fn send(path: &Path, msg: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{Control, plan_instruction, send, valid_plan_slug};
-    use crate::context::ContextComposer;
+    use crate::storage::context::ContextComposer;
     use std::sync::{Arc, RwLock};
 
     fn temp_file(tag: &str, content: &str) -> std::path::PathBuf {

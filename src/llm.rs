@@ -80,7 +80,6 @@ impl ChatMessage {
         Value::Object(obj)
     }
 
-    /// Rough token estimate (≈4 chars/token) used for compaction decisions.
     pub fn est_tokens(&self) -> i64 {
         let mut n = self.content.chars().count();
         if let Some(r) = &self.reasoning_content {
@@ -102,8 +101,6 @@ pub struct LlmResponse {
 }
 
 impl LlmResponse {
-    /// True when the provider stopped early because it hit the output cap,
-    /// leaving the answer and/or tool calls incomplete.
     pub fn is_truncated(&self) -> bool {
         self.finish_reason.as_deref() == Some("length")
     }
@@ -170,7 +167,6 @@ impl LlmClient {
         url
     }
 
-    /// OpenAI-compatible chat completion with tool definitions.
     pub fn chat(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<LlmResponse> {
         let msgs: Vec<Value> = messages.iter().map(|m| m.to_json()).collect();
         let mut body = json!({
@@ -217,8 +213,6 @@ impl LlmClient {
 
     fn post_once(&self, url: &str, body: &Value) -> Result<LlmResponse> {
         let mut req = self.agent.post(url).set("Content-Type", "application/json");
-
-        // Auth: local servers usually need none, so only send when we have a key.
         let key = self.provider.resolve_api_key();
         if !key.is_empty() {
             if self.provider.auth == "api-key" {
@@ -241,8 +235,6 @@ impl LlmClient {
                     code,
                     txt.chars().take(600).collect::<String>()
                 );
-                // Retryability is decided where the status code is known, not
-                // re-parsed from the message later.
                 return Err(if code == 429 || code >= 500 {
                     anyhow::Error::new(Retryable { msg })
                 } else {
@@ -259,8 +251,6 @@ impl LlmClient {
     }
 }
 
-/// Wraps an error the client may retry. `chat` detects it via downcast instead
-/// of matching on the rendered message.
 #[derive(Debug)]
 struct Retryable {
     msg: String,
@@ -274,7 +264,6 @@ impl std::fmt::Display for Retryable {
 
 impl std::error::Error for Retryable {}
 
-/// Minimal percent-encoding for query-string keys/values.
 fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {

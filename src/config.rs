@@ -13,8 +13,8 @@ pub struct ModelsConfig {
 }
 
 impl ModelsConfig {
-    pub fn for_mode(&self, mode: crate::modes::Mode) -> &str {
-        use crate::modes::Mode::*;
+    pub fn for_mode(&self, mode: crate::storage::modes::Mode) -> &str {
+        use crate::storage::modes::Mode::*;
         match mode {
             Plan => &self.plan,
             Build => &self.build,
@@ -24,12 +24,9 @@ impl ModelsConfig {
     }
 }
 
-/// Per-model limits. Keyed by model/deployment name so that switching models
-/// (per mode, per run) carries the right token budget and context size.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelLimits {
-    /// Max cumulative tokens for a run on this model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,7 +113,6 @@ impl ProviderConfig {
         self.kind.eq_ignore_ascii_case("azure")
     }
 
-    /// Explicit key → env var → auth file. Empty for local servers with no auth.
     pub fn resolve_api_key(&self) -> String {
         if !self.api_key.is_empty() {
             return self.api_key.clone();
@@ -232,7 +228,6 @@ impl Config {
         workspace.join(".genji/config.json")
     }
 
-    /// Load config from disk, creating it with defaults if missing.
     pub fn load_or_create(workspace: &Path) -> Result<Self> {
         let path = Self::path_in(workspace);
         if !path.exists() {
@@ -288,8 +283,6 @@ impl Config {
         self.workspace_path(workspace, &self.control_socket)
     }
 
-    /// Return the configured provider profile. A profile is required; there is
-    /// intentionally no flat/legacy configuration fallback.
     pub fn resolve_active_provider(&self) -> ProviderConfig {
         let mut provider = self
             .providers
@@ -310,7 +303,7 @@ impl Config {
         provider
     }
 
-    pub fn model_for_mode(&self, mode: crate::modes::Mode) -> String {
+    pub fn model_for_mode(&self, mode: crate::storage::modes::Mode) -> String {
         let p = self.resolve_active_provider();
         if !p.model.trim().is_empty() {
             return p.model;
