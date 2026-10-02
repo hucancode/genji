@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -126,30 +127,33 @@ pub mod basic {
         Ok(out)
     }
 
+    #[derive(Debug, Deserialize)]
+    struct EditArgs {
+        path: String,
+        edits: Option<Vec<EditEntry>>,
+        #[serde(rename = "oldText", alias = "old_text")] old_text: Option<String>,
+        #[serde(rename = "newText", alias = "new_text")] new_text: Option<String>,
+        replace_all: Option<bool>,
+    }
+    #[derive(Debug, Deserialize)]
+    struct EditEntry {
+        #[serde(rename = "oldText", alias = "old_text")] old_text: String,
+        #[serde(rename = "newText", alias = "new_text")] new_text: String,
+    }
+
     pub fn edit(agent: &mut Agent, args: &Value) -> Result<String> {
-        let path = agent.resolve_path(&req_str(args, "path")?);
+        let parsed: EditArgs = super::parse_args(args)?;
+        let path = agent.resolve_path(&parsed.path);
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
 
-        let replace_all = opt_bool(args, "replace_all").unwrap_or(false);
-        let mut edits: Vec<(String, String)> = Vec::new();
-        if let Some(arr) = args.get("edits").and_then(|v| v.as_array()) {
-            for e in arr {
-                let old = e
-                    .get("oldText")
-                    .or_else(|| e.get("old_text"))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("edit entry missing oldText"))?;
-                let new = e
-                    .get("newText")
-                    .or_else(|| e.get("new_text"))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("edit entry missing newText"))?;
-                edits.push((old.to_string(), new.to_string()));
+        let replace_all = parsed.replace_all.unwrap_or(false);
+        let mut edits: Vec<(String, String)> = parsed.edits.unwrap_or_default()
+            .into_iter().map(|e| (e.old_text, e.new_text)).collect();
+        if edits.is_empty() {
+            if let (Some(old), Some(new)) = (parsed.old_text, parsed.new_text) {
+                edits.push((old, new));
             }
-        } else if let (Some(old), Some(new)) = (opt_str(args, "oldText"), opt_str(args, "newText"))
-        {
-            edits.push((old, new));
         }
         if edits.is_empty() {
             bail!("no edits supplied (provide `edits` array or `oldText`/`newText`)");
@@ -167,14 +171,18 @@ pub mod basic {
         ))
     }
 
+    #[derive(Debug, Deserialize)]
+    struct LsArgs { path: Option<String>, show_hidden: Option<bool>, max_depth: Option<i64> }
+
     pub fn ls(agent: &mut Agent, args: &Value) -> Result<String> {
-        let rel = opt_str(args, "path").unwrap_or_else(|| ".".into());
+        let parsed: LsArgs = super::parse_args(args)?;
+        let rel = parsed.path.unwrap_or_else(|| ".".into());
         let root = agent.resolve_path(&rel);
         if !root.exists() {
             bail!("path does not exist: {}", root.display());
         }
-        let show_hidden = opt_bool(args, "show_hidden").unwrap_or(false);
-        let max_depth = opt_i64(args, "max_depth").unwrap_or(0).max(0);
+        let show_hidden = parsed.show_hidden.unwrap_or(false);
+        let max_depth = parsed.max_depth.unwrap_or(0).max(0);
 
         let mut builder = ignore::WalkBuilder::new(&root);
         builder
@@ -325,10 +333,11 @@ pub mod basic {
 }
 pub mod plans {
     use anyhow::{Context, Result};
+    use serde::Deserialize;
     use serde_json::Value;
     use std::path::{Path, PathBuf};
 
-    use super::{opt_str, req_str};
+    use super::parse_args;
     use crate::agent::Agent;
     use crate::config::Config;
     use crate::storage::util::slugify;
@@ -362,10 +371,14 @@ pub mod plans {
         Ok(path)
     }
 
+    #[derive(Debug, Deserialize)]
+    struct WriteArgs { title: String, content: String, path: Option<String> }
+
     pub fn write(agent: &mut Agent, args: &Value) -> Result<String> {
-        let title = req_str(args, "title")?;
-        let content = req_str(args, "content")?;
-        let explicit = opt_str(args, "path");
+        let parsed: WriteArgs = parse_args(args)?;
+        let title = parsed.title;
+        let content = parsed.content;
+        let explicit = parsed.path;
         let path = write_plan(
             &agent.cfg,
             &agent.workspace,
@@ -427,6 +440,7 @@ pub mod plans {
 #[cfg(feature = "formal")]
 pub mod requirements {
     use anyhow::{Result, bail};
+    use serde::Deserialize;
     use serde_json::Value;
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
@@ -473,11 +487,25 @@ pub mod requirements {
             .map_err(|_| anyhow::anyhow!("status must be active|met|removed"))
     }
 
+    #[derive(Debug, Deserialize)]
+    struct CreateArgs { level: String, title: String, body: String, parent_id: Option<i64> }
+    #[derive(Debug, Deserialize)]
+    struct ReadArgs { id: Option<i64>, level: Option<String>, status: Option<String> }
+    #[derive(Debug, Deserialize)]
+    struct UpdateArgs { id: i64, title: Option<String>, body: Option<String>, status: Option<String>, level: Option<String>, parent_id: Option<Option<i64>> }
+    #[derive(Debug, Deserialize)]
+    struct RemoveArgs { id: i64, hard: Option<bool> }
+    #[derive(Debug, Deserialize)]
+    struct TreeArgs { status: Option<String> }
+    #[derive(Debug, Deserialize)]
+    struct AskArgs { question: String, requirement_id: Option<i64> }
+
     pub fn create(agent: &mut Agent, args: &Value) -> Result<String> {
-        let level = parse_level_arg(&req_str(args, "level")?)?;
-        let title = req_str(args, "title")?;
-        let body = req_str(args, "body")?;
-        let parent_id = opt_i64(args, "parent_id");
+        let parsed: CreateArgs = super::parse_args(args)?;
+        let level = parse_level_arg(&parsed.level)?;
+        let title = parsed.title;
+        let body = parsed.body;
+        let parent_id = parsed.parent_id;
         let r = reqmd::create(
             &agent.cfg,
             &agent.workspace,
@@ -526,39 +554,28 @@ pub mod requirements {
     }
 
     pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
-        let level = opt_str(args, "level")
-            .map(|level| parse_level_arg(&level))
-            .transpose()?;
-        let status = opt_str(args, "status")
-            .map(|status| parse_status_arg(&status))
-            .transpose()?;
-        read_requirements(
-            &agent.cfg,
-            &agent.workspace,
-            opt_i64(args, "id"),
-            level,
-            status,
-        )
+        let parsed: ReadArgs = super::parse_args(args)?;
+        let level = parsed.level.as_deref().map(parse_level_arg).transpose()?;
+        let status = parsed.status.as_deref().map(parse_status_arg).transpose()?;
+        read_requirements(&agent.cfg, &agent.workspace, parsed.id, level, status)
     }
 
     pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
-        let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
-        let status = opt_str(args, "status")
-            .map(|status| parse_status_arg(&status))
-            .transpose()?;
-        let level = opt_str(args, "level")
-            .map(|level| parse_level_arg(&level))
-            .transpose()?;
-        let parent_id = args
-            .get("parent_id")
-            .map(|v| v.as_i64().map_or(FieldPatch::Clear, FieldPatch::Set))
-            .unwrap_or(FieldPatch::Keep);
+        let parsed: UpdateArgs = super::parse_args(args)?;
+        let id = parsed.id;
+        let status = parsed.status.as_deref().map(parse_status_arg).transpose()?;
+        let level = parsed.level.as_deref().map(parse_level_arg).transpose()?;
+        let parent_id = match parsed.parent_id {
+            None => FieldPatch::Keep,
+            Some(None) => FieldPatch::Clear,
+            Some(Some(v)) => FieldPatch::Set(v),
+        };
         if !reqmd::update(
             &agent.cfg,
             &agent.workspace,
             id,
-            opt_str(args, "title").as_deref(),
-            opt_str(args, "body").as_deref(),
+            parsed.title.as_deref(),
+            parsed.body.as_deref(),
             status,
             level,
             parent_id,
@@ -569,8 +586,9 @@ pub mod requirements {
     }
 
     pub fn remove(agent: &mut Agent, args: &Value) -> Result<String> {
-        let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
-        let hard = args.get("hard").and_then(Value::as_bool).unwrap_or(false);
+        let parsed: RemoveArgs = super::parse_args(args)?;
+        let id = parsed.id;
+        let hard = parsed.hard.unwrap_or(false);
         if !reqmd::remove(&agent.cfg, &agent.workspace, id, hard)? {
             bail!("requirement #{id} not found");
         }
@@ -581,9 +599,9 @@ pub mod requirements {
     }
 
     pub fn tree(agent: &mut Agent, args: &Value) -> Result<String> {
-        let filter = opt_str(args, "status")
-            .map(|status| parse_status_arg(&status))
-            .transpose()?;
+        let parsed: TreeArgs = super::parse_args(args)?;
+        let filter = parsed.status.as_deref()
+            .map(parse_status_arg).transpose()?;
         let reqs: Vec<Requirement> = reqmd::load_all(&agent.cfg, &agent.workspace)?
             .into_iter()
             .filter(|r| filter.is_none_or(|s| r.status == s))
@@ -667,8 +685,9 @@ pub mod requirements {
     }
 
     pub fn ask(agent: &mut Agent, args: &Value) -> Result<String> {
-        let question = req_str(args, "question")?;
-        let requirement_id = opt_i64(args, "requirement_id");
+        let parsed: AskArgs = super::parse_args(args)?;
+        let question = parsed.question;
+        let requirement_id = parsed.requirement_id;
         let qid = agent
             .db
             .question_ask(requirement_id, &agent.instance_id, &question)?;
@@ -1615,6 +1634,7 @@ pub mod spawn {
 #[cfg(feature = "formal")]
 pub mod tickets {
     use anyhow::{Result, bail};
+    use serde::Deserialize;
     use serde_json::Value;
     use std::path::Path;
 
@@ -1655,12 +1675,24 @@ pub mod tickets {
         s
     }
 
+    #[derive(Debug, Deserialize)]
+    struct CreateArgs { title: String, description: Option<String>, priority: Option<i64>, parent_id: Option<i64>, requirement_id: Option<i64> }
+    #[derive(Debug, Deserialize)]
+    struct ReadArgs { id: Option<i64>, status: Option<String>, requirement_id: Option<i64> }
+    #[derive(Debug, Deserialize)]
+    struct ClaimArgs { id: Option<i64>, requirement_id: Option<i64> }
+    #[derive(Debug, Deserialize)]
+    struct UpdateArgs { id: i64, title: Option<String>, description: Option<String>, priority: Option<i64>, parent_id: Option<Option<i64>>, requirement_id: Option<Option<i64>>, status: Option<String>, resolution: Option<String> }
+    #[derive(Debug, Deserialize)]
+    struct CloseArgs { id: i64, reason: Option<String> }
+
     pub fn create(agent: &mut Agent, args: &Value) -> Result<String> {
-        let title = req_str(args, "title")?;
-        let description = opt_str(args, "description").unwrap_or_default();
-        let priority = opt_i64(args, "priority").unwrap_or(2).clamp(1, 3);
-        let parent_id = opt_i64(args, "parent_id");
-        let requirement_id = opt_i64(args, "requirement_id");
+        let parsed: CreateArgs = super::parse_args(args)?;
+        let title = parsed.title;
+        let description = parsed.description.unwrap_or_default();
+        let priority = parsed.priority.unwrap_or(2).clamp(1, 3);
+        let parent_id = parsed.parent_id;
+        let requirement_id = parsed.requirement_id;
         let mode = agent.mode.as_str().to_string();
         let t = ticketmd::create(
             &agent.cfg,
@@ -1676,16 +1708,16 @@ pub mod tickets {
     }
 
     pub fn read(agent: &mut Agent, args: &Value) -> Result<String> {
-        if let Some(id) = opt_i64(args, "id") {
+        let parsed: ReadArgs = super::parse_args(args)?;
+        if let Some(id) = parsed.id {
             return match find(agent, id)? {
                 Some(t) => Ok(fmt_ticket(&t, &agent.workspace)),
                 None => bail!("ticket #{id} not found"),
             };
         }
-        let status = opt_str(args, "status")
-            .map(|status| parse_ticket_status(&status))
-            .transpose()?;
-        let requirement_id = opt_i64(args, "requirement_id");
+        let status = parsed.status.as_deref()
+            .map(parse_ticket_status).transpose()?;
+        let requirement_id = parsed.requirement_id;
         let tickets: Vec<Ticket> = ticketmd::load_all(&agent.cfg, &agent.workspace)?
             .into_iter()
             .filter(|t| status.is_none_or(|s| t.status == s))
@@ -1703,8 +1735,9 @@ pub mod tickets {
     }
 
     pub fn claim(agent: &mut Agent, args: &Value) -> Result<String> {
-        let id = opt_i64(args, "id");
-        let requirement_id = opt_i64(args, "requirement_id");
+        let parsed: ClaimArgs = super::parse_args(args)?;
+        let id = parsed.id;
+        let requirement_id = parsed.requirement_id;
         let ticket = match id {
             Some(id) => find(agent, id)?,
             None => list_all(agent)?.into_iter().find(|t| {
@@ -1746,14 +1779,14 @@ pub mod tickets {
     }
 
     pub fn update(agent: &mut Agent, args: &Value) -> Result<String> {
-        let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
-        let status = opt_str(args, "status")
-            .map(|status| parse_ticket_status(&status))
-            .transpose()?;
+        let parsed: UpdateArgs = super::parse_args(args)?;
+        let id = parsed.id;
+        let status = parsed.status.as_deref()
+            .map(parse_ticket_status).transpose()?;
         let edit = TicketEdit {
-            title: opt_str(args, "title"),
-            description: opt_str(args, "description"),
-            priority: opt_i64(args, "priority").map(|p| p.clamp(1, 3)),
+            title: parsed.title,
+            description: parsed.description,
+            priority: parsed.priority.map(|p| p.clamp(1, 3)),
             parent_id: args
                 .get("parent_id")
                 .map(|v| v.as_i64().map_or(FieldPatch::Clear, FieldPatch::Set))
@@ -1763,7 +1796,7 @@ pub mod tickets {
                 .map(|v| v.as_i64().map_or(FieldPatch::Clear, FieldPatch::Set))
                 .unwrap_or_default(),
         };
-        let resolution = opt_str(args, "resolution");
+        let resolution = parsed.resolution;
         ticketmd::update(
             &agent.cfg,
             &agent.workspace,
@@ -1777,8 +1810,9 @@ pub mod tickets {
     }
 
     pub fn close(agent: &mut Agent, args: &Value) -> Result<String> {
-        let id = opt_i64(args, "id").ok_or_else(|| anyhow::anyhow!("missing id"))?;
-        let reason = opt_str(args, "reason");
+        let parsed: CloseArgs = super::parse_args(args)?;
+        let id = parsed.id;
+        let reason = parsed.reason;
         ticketmd::update(
             &agent.cfg,
             &agent.workspace,
@@ -2227,6 +2261,11 @@ fn spill_to_log(cfg: &Config, workspace: &Path, name: &str, text: &str) -> Resul
     let path = dir.join(format!("tool-{safe}-{ts}-{seq}.log"));
     std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
+}
+
+/// Deserialize a tool payload once, so validation and handler inputs share one definition.
+pub fn parse_args<T: DeserializeOwned>(args: &Value) -> Result<T> {
+    serde_json::from_value(args.clone()).context("invalid tool arguments")
 }
 
 pub fn req_str(args: &Value, key: &str) -> Result<String> {
