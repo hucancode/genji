@@ -1414,7 +1414,6 @@ pub mod util {
 
     #[cfg(feature = "formal")]
     use anyhow::{Context, Result};
-    #[cfg(feature = "formal")]
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1497,23 +1496,43 @@ pub mod util {
 
     #[cfg(feature = "formal")]
     pub fn assign_missing_ids(raws: &mut [MarkdownDocument]) -> Vec<bool> {
-        let mut next_id = raws
-            .iter()
-            .filter_map(|raw| meta_i64(&raw.meta, "id"))
-            .max()
-            .unwrap_or(0)
-            + 1;
+        let mut next = next_id(raws, |raw| meta_i64(&raw.meta, "id").unwrap_or(0));
         raws.iter_mut()
             .map(|raw| {
                 if meta_i64(&raw.meta, "id").is_some() {
                     false
                 } else {
-                    raw.meta.insert("id".into(), next_id.to_string());
-                    next_id += 1;
+                    raw.meta.insert("id".into(), next.to_string());
+                    next = next.saturating_add(1);
                     true
                 }
             })
             .collect()
+    }
+
+    #[cfg(feature = "formal")]
+    pub fn document_title(doc: &MarkdownDocument, fallback: &str) -> String {
+        nonempty_meta(&doc.meta, "title")
+            .or_else(|| doc.heading.clone())
+            .or_else(|| {
+                doc.path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| fallback.to_owned())
+    }
+
+    #[cfg(feature = "formal")]
+    pub fn next_id<T>(items: &[T], id: impl Fn(&T) -> i64) -> i64 {
+        items.iter().map(id).max().unwrap_or(0).saturating_add(1)
+    }
+
+    #[cfg(feature = "formal")]
+    pub fn timestamps(meta: &BTreeMap<String, String>) -> (String, String) {
+        let created = nonempty_meta(meta, "created").unwrap_or_else(|| unix_secs().to_string());
+        let updated = nonempty_meta(meta, "updated").unwrap_or_else(|| created.clone());
+        (created, updated)
     }
 
     #[cfg(feature = "formal")]
@@ -1527,7 +1546,7 @@ pub mod util {
     }
 
     #[cfg(feature = "formal")]
-    pub fn replace_backing_file(old_path: &Path, new_path: &Path, text: &str) -> Result<()> {
+    pub fn persist_renamed(old_path: &Path, new_path: &Path, text: &str) -> Result<()> {
         write_markdown(new_path, text)?;
         if new_path != old_path && old_path.exists() {
             let _ = std::fs::remove_file(old_path);
@@ -1570,8 +1589,7 @@ pub mod util {
             .collect()
     }
 
-    #[cfg(feature = "formal")]
-    fn split_frontmatter(text: &str) -> (BTreeMap<String, String>, String) {
+    pub fn split_frontmatter(text: &str) -> (BTreeMap<String, String>, String) {
         let mut meta = BTreeMap::new();
         if let Some(rest) = text.strip_prefix("---\n")
             && let Some(index) = rest.find("\n---")
@@ -1676,8 +1694,8 @@ pub mod reqmd {
     use crate::config::Config;
     use crate::storage::db::FieldPatch;
     use crate::storage::util::{
-        assign_missing_ids, load_markdown_dir, meta_i64, nonempty_meta, relative_path,
-        replace_backing_file, slugify, write_markdown,
+        assign_missing_ids, document_title, load_markdown_dir, meta_i64, next_id, nonempty_meta,
+        persist_renamed, relative_path, slugify, timestamps, write_markdown,
     };
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1773,22 +1791,6 @@ pub mod reqmd {
         }
     }
 
-    fn now_secs() -> String {
-        crate::storage::util::unix_secs().to_string()
-    }
-
-    fn title_for(raw: &crate::storage::util::MarkdownDocument, fallback: &str) -> String {
-        nonempty_meta(&raw.meta, "title")
-            .or_else(|| raw.heading.clone())
-            .unwrap_or_else(|| {
-                raw.path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(fallback)
-                    .to_string()
-            })
-    }
-
     fn render(r: &Requirement) -> String {
         let mut s = String::new();
         s.push_str("---\n");
@@ -1833,15 +1835,13 @@ pub mod reqmd {
             let level = nonempty_meta(&raw.meta, "level")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_default();
-            let title = title_for(&raw, "requirement");
+            let title = document_title(&raw, "requirement");
             let status = nonempty_meta(&raw.meta, "status")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_default();
             let parent_id = meta_i64(&raw.meta, "parent");
             let source = nonempty_meta(&raw.meta, "source").unwrap_or_else(|| "user_md".into());
-            let created_at = nonempty_meta(&raw.meta, "created").unwrap_or_else(now_secs);
-            let updated_at =
-                nonempty_meta(&raw.meta, "updated").unwrap_or_else(|| created_at.clone());
+            let (created_at, updated_at) = timestamps(&raw.meta);
 
             let req = Requirement {
                 id,
@@ -1885,13 +1885,8 @@ pub mod reqmd {
         parent_id: Option<i64>,
         source: &str,
     ) -> Result<Requirement> {
-        let id = load_all(cfg, workspace)?
-            .iter()
-            .map(|r| r.id)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let now = now_secs();
+        let id = next_id(&load_all(cfg, workspace)?, |r| r.id);
+        let now = crate::storage::util::unix_secs().to_string();
         let mut req = Requirement {
             id,
             level,
@@ -1938,12 +1933,12 @@ pub mod reqmd {
             req.status = status;
         }
         parent_id.apply_to(&mut req.parent_id);
-        req.updated_at = now_secs();
+        req.updated_at = crate::storage::util::unix_secs().to_string();
 
         let old_path = req.path.clone();
         let new_path = path_for(cfg, workspace, &req);
         req.path = new_path.clone();
-        replace_backing_file(&old_path, &new_path, &render(&req))?;
+        persist_renamed(&old_path, &new_path, &render(&req))?;
         Ok(true)
     }
 
@@ -2164,8 +2159,8 @@ pub mod ticketmd {
     use crate::config::Config;
     use crate::storage::db::TicketEdit;
     use crate::storage::util::{
-        assign_missing_ids, load_markdown_dir, meta_i64, nonempty_meta, relative_path,
-        replace_backing_file, slugify, write_markdown,
+        assign_missing_ids, document_title, load_markdown_dir, meta_i64, next_id, nonempty_meta,
+        persist_renamed, relative_path, slugify, timestamps, write_markdown,
     };
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2239,22 +2234,6 @@ pub mod ticketmd {
         }
     }
 
-    fn now_secs() -> String {
-        crate::storage::util::unix_secs().to_string()
-    }
-
-    fn title_for(raw: &crate::storage::util::MarkdownDocument, fallback: &str) -> String {
-        nonempty_meta(&raw.meta, "title")
-            .or_else(|| raw.heading.clone())
-            .unwrap_or_else(|| {
-                raw.path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(fallback)
-                    .to_string()
-            })
-    }
-
     fn render(t: &Ticket) -> String {
         let mut s = String::new();
         s.push_str("---\n");
@@ -2301,7 +2280,7 @@ pub mod ticketmd {
         let mut out = Vec::new();
         for (raw, assigned_id) in raws.into_iter().zip(assigned) {
             let id = meta_i64(&raw.meta, "id").expect("assign_missing_ids must populate ids");
-            let title = title_for(&raw, "ticket");
+            let title = document_title(&raw, "ticket");
             let status = nonempty_meta(&raw.meta, "status")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_default();
@@ -2310,9 +2289,7 @@ pub mod ticketmd {
             let requirement_id = meta_i64(&raw.meta, "requirement");
             let mode = nonempty_meta(&raw.meta, "mode");
             let resolution = nonempty_meta(&raw.meta, "resolution");
-            let created_at = nonempty_meta(&raw.meta, "created").unwrap_or_else(now_secs);
-            let updated_at =
-                nonempty_meta(&raw.meta, "updated").unwrap_or_else(|| created_at.clone());
+            let (created_at, updated_at) = timestamps(&raw.meta);
 
             let ticket = Ticket {
                 id,
@@ -2353,13 +2330,8 @@ pub mod ticketmd {
         requirement_id: Option<i64>,
         mode: &str,
     ) -> Result<Ticket> {
-        let now = now_secs();
-        let id = load_all(cfg, workspace)?
-            .iter()
-            .map(|ticket| ticket.id)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+        let id = next_id(&load_all(cfg, workspace)?, |ticket| ticket.id);
+        let now = crate::storage::util::unix_secs().to_string();
         let mut ticket = Ticket {
             id,
             title: title.to_string(),
@@ -2409,12 +2381,12 @@ pub mod ticketmd {
         if let Some(r) = resolution {
             ticket.resolution = Some(r.to_string());
         }
-        ticket.updated_at = now_secs();
+        ticket.updated_at = crate::storage::util::unix_secs().to_string();
 
         let old_path = ticket.path.clone();
         let new_path = path_for(cfg, workspace, &ticket);
         ticket.path = new_path.clone();
-        replace_backing_file(&old_path, &new_path, &render(&ticket))?;
+        persist_renamed(&old_path, &new_path, &render(&ticket))?;
         Ok(Some(ticket))
     }
 

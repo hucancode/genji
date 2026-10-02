@@ -1069,26 +1069,15 @@ pub mod skills {
     use super::{opt_i64, opt_str, req_str};
     use crate::agent::Agent;
     use crate::storage::db::Db;
+    use crate::storage::util::split_frontmatter;
 
     pub fn parse_skill(text: &str, fallback_name: &str) -> (String, String, String) {
-        let mut name = fallback_name.to_string();
-        let mut description = String::new();
-        let body;
-        if let Some(rest) = text.strip_prefix("---\n")
-            && let Some(idx) = rest.find("\n---")
-        {
-            let front = &rest[..idx];
-            for line in front.lines() {
-                if let Some(v) = line.strip_prefix("name:") {
-                    name = v.trim().trim_matches('"').to_string();
-                } else if let Some(v) = line.strip_prefix("description:") {
-                    description = v.trim().trim_matches('"').to_string();
-                }
-            }
-            body = rest[idx + 4..].trim_start_matches('\n').to_string();
-            return (name, description, body);
-        }
-        body = text.to_string();
+        let (meta, body) = split_frontmatter(text);
+        let name = meta
+            .get("name")
+            .cloned()
+            .unwrap_or_else(|| fallback_name.to_string());
+        let description = meta.get("description").cloned().unwrap_or_default();
         (name, description, body)
     }
 
