@@ -10,7 +10,7 @@ use crate::storage::modes::Mode;
 use crate::storage::util::{relative_path, tmp_file, write_file};
 
 pub mod basic {
-    use anyhow::{Context, Result, bail};
+    use anyhow::{Context, Result, anyhow, bail};
     use serde::Deserialize;
     use serde_json::Value;
     use std::fmt::Write as _;
@@ -68,21 +68,39 @@ pub mod basic {
         ))
     }
 
-    fn find_unique(hay: &str, needle: &str) -> Result<usize> {
+    /// Byte range of the one line window in `hay` equal to `needle` line by
+    /// line, ignoring leading and trailing whitespace on each line.
+    fn find_fuzzy(hay: &str, needle: &str) -> Option<(usize, usize)> {
+        let want: Vec<&str> = needle.trim_matches('\n').lines().map(str::trim).collect();
+        let mut lines = Vec::new();
+        let mut at = 0;
+        for l in hay.split_inclusive('\n') {
+            let indent = l.len() - l.trim_start().len();
+            let end = at + l.trim_end().len().max(indent);
+            lines.push((at + indent, end, l.trim()));
+            at += l.len();
+        }
+        let mut hits = lines
+            .windows(want.len())
+            .filter(|w| w.iter().map(|l| l.2).eq(want.iter().copied()));
+        match (hits.next(), hits.next()) {
+            (Some(w), None) => Some((w[0].0, w[w.len() - 1].1)),
+            _ => None,
+        }
+    }
+
+    fn find_unique(hay: &str, needle: &str) -> Result<(usize, usize)> {
         if needle.is_empty() {
             bail!("oldText must not be empty");
         }
         let mut it = hay.match_indices(needle);
+        let shown = || needle.chars().take(60).collect::<String>();
         match (it.next(), it.next()) {
-            (Some((i, _)), None) => Ok(i),
-            (None, _) => bail!(
-                "oldText not found: {:?}",
-                needle.chars().take(60).collect::<String>()
-            ),
-            (Some(_), Some(_)) => bail!(
-                "oldText is not unique: {:?}",
-                needle.chars().take(60).collect::<String>()
-            ),
+            (Some((i, _)), None) => Ok((i, i + needle.len())),
+            (None, _) => {
+                find_fuzzy(hay, needle).ok_or_else(|| anyhow!("oldText not found: {:?}", shown()))
+            }
+            (Some(_), Some(_)) => bail!("oldText is not unique: {:?}", shown()),
         }
     }
 
@@ -100,8 +118,8 @@ pub mod basic {
         }
         let mut ranges = Vec::new();
         for (old, new) in edits {
-            let start = find_unique(content, old)?;
-            ranges.push((start, start + old.len(), new));
+            let (start, end) = find_unique(content, old)?;
+            ranges.push((start, end, new));
         }
         ranges.sort_by_key(|r| r.0);
         if ranges.windows(2).any(|w| w[0].1 > w[1].0) {
@@ -305,6 +323,25 @@ pub mod basic {
                 ("cde".to_string(), "y".to_string()),
             ];
             assert!(apply_edits("abcdef", &edits, false).is_err());
+        }
+
+        #[test]
+        fn whitespace_insensitive_fallback() {
+            let src = "fn a() {\n    let x = 1;\n    let y = 2;\n}\n";
+            let edits = [(
+                "let x = 1;\nlet y = 2;".to_string(),
+                "let z = 3;".to_string(),
+            )];
+            assert_eq!(
+                apply_edits(src, &edits, false).unwrap(),
+                "fn a() {\n    let z = 3;\n}\n"
+            );
+        }
+
+        #[test]
+        fn fuzzy_still_requires_uniqueness() {
+            let src = "  a\n  b\n    a\n    b\n";
+            assert!(apply_edits(src, &[("a\nb".to_string(), "c".to_string())], false).is_err());
         }
 
         #[test]
@@ -1527,7 +1564,7 @@ fn registry() -> &'static [Tool] {
                 "required":["id"]
             }), requirements::remove).gate(Gate::Formal),
             #[cfg(feature = "formal")]
-            tool("requirement_ask", PLAN_BUILD, "Ask the user a clarifying question about a requirement. Recorded in the DB.", json!({
+            tool("requirement_ask", PLAN, "Raise a formal question about an ambiguous requirement for a human to resolve. Recorded in the DB.", json!({
                 "type":"object",
                 "properties":{
                     "question":{"type":"string"},

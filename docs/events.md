@@ -43,7 +43,7 @@ Event types:
 | `assistant` | `content`, `reasoning` | the model produces a message |
 | `tool_call` | `id`, `name`, `arguments` (or `raw_arguments` when not valid JSON) | the model requests a tool |
 | `tool_result` | `id`, `name`, `is_error`, `duration_ms`, `result` | a tool finishes |
-| `tokens` | `used`, `prompt`, `completion` | after each model call |
+| `tokens` | `used`, `prompt`, `completion`, `cached` | after each model call |
 | `status` | `status` | progress/status text (also mirrored on stderr) |
 | `compaction` | `removed`, `before`, `after`, `summary` | history is compacted |
 | `error` | `message` | recoverable/terminal problems (budget, LLM, loop limit) |

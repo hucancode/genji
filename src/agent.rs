@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -14,6 +15,9 @@ use crate::storage::modes::{Mode, SHARED_PREAMBLE};
 use crate::tools;
 
 const MAX_LLM_RETRIES: u32 = 3;
+/// Process exit code: 0 done, 1 LLM failure, 2 stopped by a limit or the user.
+pub static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
+const MAX_REPEATED_CALLS: usize = 3;
 const STOPPED_BY_USER: &str = "(stopped by user via control socket)";
 
 pub struct Agent {
@@ -34,6 +38,8 @@ pub struct Agent {
     pub control: Option<Arc<Control>>,
     pub events: EventEmitter,
     pub failed: bool,
+    last_call: Option<(String, String)>,
+    repeats: usize,
 }
 
 pub struct AgentParams {
@@ -125,6 +131,8 @@ impl Agent {
             control,
             events,
             failed: false,
+            last_call: None,
+            repeats: 0,
         })
     }
 
@@ -250,16 +258,19 @@ impl Agent {
     pub fn run_loop(&mut self) -> Result<String> {
         let mut iterations = 0usize;
         let mut llm_retries = 0u32;
+        let mut overflow_retried = false;
         loop {
             if let Some(reason) = self.budget_exceeded() {
                 eprintln!("[budget] {reason}");
                 self.events.error(&format!("stopped: {reason}"));
+                EXIT_CODE.store(2, Ordering::Relaxed);
                 return Ok(format!("(stopped: {reason})"));
             }
             let poll = self.poll_control();
             if poll.stop {
                 eprintln!("[control] {STOPPED_BY_USER}");
                 self.events.status(STOPPED_BY_USER);
+                EXIT_CODE.store(2, Ordering::Relaxed);
                 return Ok(STOPPED_BY_USER.to_string());
             }
             if let Some(c) = &self.control {
@@ -276,13 +287,19 @@ impl Agent {
                 c.set_status(status.clone());
                 self.events.status(&status);
             }
-            self.maybe_compact()?;
+            self.maybe_compact(self.cfg.compact_threshold)?;
             let result = {
                 let ctx = self.context.read().unwrap();
                 self.llm.chat(ctx.messages(), ctx.tools())
             };
             let resp = match result {
                 Ok(r) => r,
+                Err(e) if !overflow_retried && is_context_overflow(&format!("{e:#}")) => {
+                    overflow_retried = true;
+                    eprintln!("[llm] context overflow; compacting and retrying");
+                    self.maybe_compact(0.0)?;
+                    continue;
+                }
                 Err(e) => return Ok(self.fail(format!("LLM request failed: {e:#}"))),
             };
             self.record_usage(resp.prompt_tokens, resp.completion_tokens);
@@ -290,8 +307,12 @@ impl Agent {
                 .write()
                 .unwrap()
                 .set_last_prompt_tokens(resp.prompt_tokens);
-            self.events
-                .tokens(self.tokens_used, resp.prompt_tokens, resp.completion_tokens);
+            self.events.tokens(
+                self.tokens_used,
+                resp.prompt_tokens,
+                resp.completion_tokens,
+                resp.cached_tokens,
+            );
             if resp.is_truncated() {
                 if llm_retries >= MAX_LLM_RETRIES {
                     return Ok(self.fail(format!(
@@ -304,6 +325,11 @@ impl Agent {
                 );
                 eprintln!("[llm] {msg}");
                 self.events.error(&msg);
+                self.log(ChatMessage::assistant(resp.message.content))?;
+                self.add_user(
+                    "Your last response was cut off by the output limit. Continue with smaller \
+                     steps: split large writes into several edits.",
+                )?;
                 continue;
             }
             llm_retries = 0;
@@ -340,6 +366,7 @@ impl Agent {
                 );
                 eprintln!("[loop] {msg}");
                 self.events.error(&msg);
+                EXIT_CODE.store(2, Ordering::Relaxed);
                 return Ok(msg);
             }
         }
@@ -372,6 +399,21 @@ impl Agent {
                     duration
                 );
             }
+            let key = (tc.name.clone(), tc.arguments.clone());
+            self.repeats = if self.last_call.as_ref() == Some(&key) {
+                self.repeats + 1
+            } else {
+                1
+            };
+            self.last_call = Some(key);
+            let result = if self.repeats >= MAX_REPEATED_CALLS {
+                format!(
+                    "{result}\n[the same call has now run {} times in a row; change approach]",
+                    self.repeats
+                )
+            } else {
+                result
+            };
             self.log(ChatMessage::tool_result(&tc.id, result))?;
         }
         Ok(())
@@ -382,6 +424,7 @@ impl Agent {
         self.events.error(&msg);
         let _ = self.log(ChatMessage::assistant(&msg));
         self.failed = true;
+        EXIT_CODE.store(1, Ordering::Relaxed);
         msg
     }
 
@@ -425,9 +468,9 @@ impl Agent {
             .instance_set_tokens(&self.instance_id, self.tokens_used);
     }
 
-    fn maybe_compact(&mut self) -> Result<()> {
+    fn maybe_compact(&mut self, threshold: f64) -> Result<()> {
         let compacted = self.context.write().unwrap().maybe_compact(
-            self.cfg.compact_threshold,
+            threshold,
             self.cfg.compact_keep_recent,
             &self.llm,
         )?;
@@ -453,6 +496,15 @@ impl Agent {
     }
 }
 
+fn is_context_overflow(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("context_length")
+        || e.contains("context length")
+        || e.contains("maximum context")
+        || e.contains("too many tokens")
+        || e.contains("exceeds the context")
+}
+
 /// Core prompt, optional formal guidance, and the user-editable extended prompt
 /// from `<prompts_dir>/<mode>.md` (retro has none).
 pub fn build_system(cfg: &Config, workspace: &Path, mode: Mode, formal: bool) -> String {
@@ -466,6 +518,21 @@ pub fn build_system(cfg: &Config, workspace: &Path, mode: Mode, formal: bool) ->
         .then(|| cfg.prompts_path(workspace).join(format!("{mode}.md")))
         .and_then(|path| std::fs::read_to_string(path).ok())
         .unwrap_or_default();
+    base.push_str(&format!(
+        "\n\n## Environment\ncwd: {}\nos: {}\ngit repo: {}",
+        workspace.display(),
+        std::env::consts::OS,
+        workspace.join(".git").exists()
+    ));
+    if let Ok(doc) = ["AGENTS.md", "CLAUDE.md"]
+        .iter()
+        .map(|n| std::fs::read_to_string(workspace.join(n)))
+        .find(Result::is_ok)
+        .unwrap_or_else(|| Ok(String::new()))
+        && !doc.trim().is_empty()
+    {
+        base.push_str(&format!("\n\n## Project instructions\n{doc}"));
+    }
     if extended.trim().is_empty() {
         return base;
     }
@@ -474,7 +541,7 @@ pub fn build_system(cfg: &Config, workspace: &Path, mode: Mode, formal: bool) ->
 
 #[cfg(test)]
 mod tests {
-    use super::build_system;
+    use super::{build_system, is_context_overflow};
     use crate::config::Config;
     use crate::storage::modes::Mode;
 
@@ -490,5 +557,14 @@ mod tests {
         assert!(build_system(&cfg, &ws, Mode::Build, false).ends_with("Always run tests."));
         assert!(!build_system(&cfg, &ws, Mode::Retro, false).contains("ignored"));
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn detects_context_overflow_errors() {
+        assert!(is_context_overflow(
+            "HTTP 400: {\"code\":\"context_length_exceeded\"}"
+        ));
+        assert!(is_context_overflow("exceeds the context window of 8192"));
+        assert!(!is_context_overflow("HTTP 401: invalid api key"));
     }
 }

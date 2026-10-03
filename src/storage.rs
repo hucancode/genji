@@ -137,11 +137,34 @@ pub mod context {
             llm: &LlmClient,
         ) -> Result<Option<Compaction>> {
             let threshold = (self.context_window as f64 * threshold_fraction) as i64;
-            if self.est_tokens() >= threshold {
-                self.compact(keep, llm)
-            } else {
-                Ok(None)
+            if self.est_tokens() < threshold {
+                return Ok(None);
             }
+            if self.prune_old_results(keep) {
+                self.last_prompt_tokens = 0;
+                self.prompt_len = 0;
+                if llm::estimate_messages(&self.messages) < threshold {
+                    return Ok(None);
+                }
+            }
+            self.compact(keep, llm)
+        }
+
+        fn prune_old_results(&mut self, keep: usize) -> bool {
+            const MAX: usize = 1000;
+            let old = self.messages.len().saturating_sub(keep.max(2));
+            let mut changed = false;
+            for m in &mut self.messages[..old] {
+                if m.role == Role::Tool && m.content.len() > MAX {
+                    m.content = format!(
+                        "{}\n[older output elided: {} bytes; re-run the tool if needed]",
+                        llm::truncate(&m.content, MAX / 2),
+                        m.content.len()
+                    );
+                    changed = true;
+                }
+            }
+            changed
         }
 
         pub fn compact(&mut self, keep: usize, llm: &LlmClient) -> Result<Option<Compaction>> {
@@ -242,6 +265,18 @@ pub mod context {
         }
 
         #[test]
+        fn prunes_only_old_bulky_tool_results() {
+            let mut c = ContextComposer::new("sys".into(), vec![], 100);
+            c.push(ChatMessage::tool_result("1", "x".repeat(5000)));
+            c.push(ChatMessage::user("mid"));
+            c.push(ChatMessage::tool_result("2", "y".repeat(5000)));
+            assert!(c.prune_old_results(2));
+            assert!(c.messages()[1].content.len() < 1000);
+            assert_eq!(c.messages()[3].content.len(), 5000);
+            assert!(!c.prune_old_results(2));
+        }
+
+        #[test]
         fn switch_mode_replaces_system_and_tools() {
             let mut ctx = ContextComposer::new("old".to_string(), vec![tool("read")], 1000);
             ctx.push(ChatMessage::user("keep me"));
@@ -258,6 +293,8 @@ pub mod db {
     use rusqlite::{Connection, params};
     use serde_json::{Value, json};
     use std::path::Path;
+
+    use crate::llm::{ChatMessage, Role, ToolCall};
 
     const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 
@@ -328,6 +365,52 @@ pub mod db {
         }
 
         /// Summary of the single instance whose id starts with `prefix`.
+        /// The recorded conversation of the instance matching `prefix`, minus the
+        /// system prompt. A tail whose tool calls never got results is dropped,
+        /// since the API rejects it.
+        pub fn history(&self, prefix: &str) -> Result<Vec<ChatMessage>> {
+            let id = self.instance_summary(prefix)?["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let mut stmt = self.conn.prepare(
+                "SELECT role,content,tool_calls,tool_call_id,reasoning FROM messages
+                 WHERE instance_id=? AND role!='system' ORDER BY seq",
+            )?;
+            let mut out: Vec<ChatMessage> = stmt
+                .query_map(params![id], |r| {
+                    let calls: Vec<Value> = r
+                        .get::<_, Option<String>>(2)?
+                        .and_then(|j| serde_json::from_str(&j).ok())
+                        .unwrap_or_default();
+                    let text = |v: &Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
+                    Ok(ChatMessage {
+                        role: r.get::<_, String>(0)?.parse().unwrap_or_default(),
+                        content: r.get(1)?,
+                        tool_calls: calls
+                            .iter()
+                            .map(|c| ToolCall {
+                                id: text(c, "id"),
+                                name: text(c, "name"),
+                                arguments: text(c, "arguments"),
+                            })
+                            .collect(),
+                        tool_call_id: r.get(3)?,
+                        reasoning_content: r.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let dangling = (0..out.len()).find(|&i| {
+                let n = out[i].tool_calls.len();
+                n > 0
+                    && !out
+                        .get(i + 1..i + 1 + n)
+                        .is_some_and(|r| r.len() == n && r.iter().all(|m| m.role == Role::Tool))
+            });
+            out.truncate(dangling.unwrap_or(out.len()));
+            Ok(out)
+        }
+
         pub fn instance_summary(&self, prefix: &str) -> Result<Value> {
             let mut stmt = self.conn.prepare(
                 "SELECT i.id,i.mode,i.model,i.parent_instance,i.depth,i.task,i.status,i.tokens_used,
@@ -526,12 +609,13 @@ pub mod events {
             }));
         }
 
-        pub fn tokens(&self, used: i64, prompt: i64, completion: i64) {
+        pub fn tokens(&self, used: i64, prompt: i64, completion: i64, cached: i64) {
             self.emit(json!({
                 "type": "tokens",
                 "used": used,
                 "prompt": prompt,
                 "completion": completion,
+                "cached": cached,
             }));
         }
 
@@ -679,7 +763,8 @@ pub mod modes {
 pub mod proc {
     use anyhow::{Context, Result};
     use std::fs::File;
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::process::CommandExt;
     use std::path::Path;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -695,13 +780,29 @@ pub mod proc {
         pub duration_ms: u64,
     }
 
+    /// Read a file, keeping the head and the tail when it exceeds `cap` bytes:
+    /// build and test failures usually sit at the end.
     fn read_capped(path: &Path, cap: usize) -> String {
-        let Ok(f) = File::open(path) else {
+        let Ok(mut f) = File::open(path) else {
             return String::new();
         };
-        let mut buf = Vec::new();
-        let _ = f.take(cap as u64).read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
+        let len = f.metadata().map_or(0, |m| m.len());
+        let half = (cap / 2) as u64;
+        let mut head = Vec::new();
+        let mut tail = Vec::new();
+        if len <= cap as u64 {
+            let _ = f.read_to_end(&mut head);
+        } else {
+            let _ = (&mut f).take(half).read_to_end(&mut head);
+            let _ = f.seek(SeekFrom::Start(len - half));
+            let _ = f.read_to_end(&mut tail);
+        }
+        let mut out = String::from_utf8_lossy(&head).into_owned();
+        if !tail.is_empty() {
+            out.push_str(&format!("\n… [{} bytes omitted] …\n", len - 2 * half));
+            out.push_str(&String::from_utf8_lossy(&tail));
+        }
+        out
     }
 
     /// Run `program`, capturing at most `max_read_bytes` of each output stream.
@@ -721,6 +822,7 @@ pub mod proc {
 
         let start = Instant::now();
         let mut child = Command::new(program)
+            .process_group(0)
             .args(args)
             .current_dir(cwd)
             .stdin(Stdio::null())
@@ -735,6 +837,10 @@ pub mod proc {
                 break status.code();
             }
             if start.elapsed() >= timeout {
+                // Kill the whole group so grandchildren do not outlive the timeout.
+                let _ = Command::new("bash")
+                    .args(["-c", &format!("kill -KILL -- -{}", child.id())])
+                    .status();
                 let _ = child.kill();
                 let _ = child.wait();
                 timed_out = true;
@@ -752,6 +858,75 @@ pub mod proc {
         })
     }
 }
+#[cfg(test)]
+mod history_tests {
+    use super::db::Db;
+    use crate::llm::Role;
+
+    #[test]
+    fn history_round_trips_and_drops_dangling_tool_calls() {
+        let ws = super::util::temp_dir("history");
+        let db = Db::open(&ws.join("t.db")).unwrap();
+        db.instance_start("abc123", "build", None, "task", "m", 0)
+            .unwrap();
+        let calls = r#"[{"id":"c1","name":"read","arguments":"{}"}]"#;
+        let add = |seq, role, content, calls, id| {
+            db.message_add("abc123", seq, role, content, calls, id, None)
+                .unwrap();
+        };
+        add(0, "system", "sys", None, None);
+        add(1, "user", "hi", None, None);
+        add(2, "assistant", "", Some(calls), None);
+        add(3, "tool", "ok", None, Some("c1"));
+        add(4, "assistant", "", Some(calls), None);
+        let h = db.history("abc").unwrap();
+        let roles: Vec<Role> = h.iter().map(|m| m.role).collect();
+        assert_eq!(roles, [Role::User, Role::Assistant, Role::Tool]);
+        assert_eq!(h[1].tool_calls[0].name, "read");
+        assert_eq!(h[2].tool_call_id.as_deref(), Some("c1"));
+        assert!(db.history("zzz").is_err());
+    }
+}
+
+#[cfg(test)]
+mod proc_tests {
+    use super::proc::run_capture;
+    use std::time::Duration;
+
+    fn run(script: &str, timeout: u64, cap: usize) -> super::proc::ProcResult {
+        let ws = super::util::temp_dir("proc");
+        run_capture(
+            "bash",
+            &["-c".into(), script.into()],
+            &ws,
+            &ws,
+            Duration::from_secs(timeout),
+            cap,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn long_output_keeps_head_and_tail() {
+        let r = run("seq 1 5000", 10, 200);
+        assert!(r.stdout.starts_with("1\n2\n"));
+        assert!(r.stdout.trim_end().ends_with("5000"));
+        assert!(r.stdout.contains("bytes omitted"));
+    }
+
+    #[test]
+    fn timeout_kills_grandchildren() {
+        let r = run("sleep 4242 & wait", 1, 1000);
+        assert!(r.timed_out);
+        let alive = std::process::Command::new("pgrep")
+            .args(["-f", "sleep 4242"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive);
+    }
+}
+
 pub mod registry {
     //! A lightweight registry of running genji instances.
 

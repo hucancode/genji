@@ -103,6 +103,14 @@ struct WireFunction {
 struct Usage {
     prompt_tokens: i64,
     completion_tokens: i64,
+    #[serde(default)]
+    prompt_tokens_details: PromptDetails,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PromptDetails {
+    #[serde(default)]
+    cached_tokens: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +172,7 @@ pub struct LlmResponse {
     pub message: ChatMessage,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub cached_tokens: i64,
     pub finish_reason: Option<String>,
 }
 
@@ -364,6 +373,7 @@ fn parse_response(text: &str) -> Result<LlmResponse> {
         },
         prompt_tokens: parsed.usage.prompt_tokens,
         completion_tokens: parsed.usage.completion_tokens,
+        cached_tokens: parsed.usage.prompt_tokens_details.cached_tokens,
         finish_reason: choice.finish_reason,
     })
 }
@@ -407,11 +417,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_cached_tokens() {
+        let body = r#"{"choices":[{"message":{"content":"x"}}],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":8}}}"#;
+        assert_eq!(super::parse_response(body).unwrap().cached_tokens, 8);
+    }
+
+    #[test]
     fn detects_truncation() {
         let mut resp = super::LlmResponse {
             message: ChatMessage::default(),
             prompt_tokens: 0,
             completion_tokens: 0,
+            cached_tokens: 0,
             finish_reason: Some("length".into()),
         };
         assert!(resp.is_truncated());

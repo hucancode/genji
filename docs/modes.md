@@ -47,7 +47,8 @@ never exposed in `explore`, `retro`, or in `plan`/`build` runs without Formal. S
 | `ticket_read` `ticket_claim` `ticket_update` (Formal) | ✓ | ✓ |  |  |
 | `ticket_close` (Formal) | ✓ | ✓ |  |  |
 | `requirement_create` `requirement_update` `requirement_remove` (Formal) | ✓ |  |  |  |
-| `requirement_read` `requirement_tree` `requirement_ask` (Formal) | ✓ | ✓ |  |  |
+| `requirement_read` `requirement_tree` (Formal) | ✓ | ✓ |  |  |
+| `requirement_ask` (Formal) | ✓ |  |  |  |
 | `query_instances` `query_messages` `query_tool_calls` `query_stats` |  |  |  | ✓ |
 
 - `ls` respects `.gitignore`, `.ignore`, `.git/info/exclude` and global git
@@ -56,6 +57,15 @@ never exposed in `explore`, `retro`, or in `plan`/`build` runs without Formal. S
 - `bash` runs `bash -c <command>` in the workspace with a timeout.
 - Tool results longer than `tool_result_max_bytes` are truncated (head + marker).
   See [Context management](context-management.md).
+
+---
+
+## Autonomy
+
+`plan` and `build` differ in how they treat ambiguity. `plan` raises it: open
+questions go in the plan file (or, with Formal, `requirement_ask`) for a human
+to resolve. `build` never stops on ambiguity, existing or newly found: it assumes
+the most reasonable reading, continues, and reports its assumptions.
 
 ---
 

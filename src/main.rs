@@ -34,6 +34,9 @@ struct Cli {
     parent_instance: Option<String>,
     #[arg(long, hide = true, global = true)]
     instructions_file: Option<String>,
+    /// Continue from the recorded conversation of an earlier instance (id or prefix).
+    #[arg(long, global = true)]
+    resume: Option<String>,
     #[arg(long, default_value = "", global = true)]
     label: String,
     #[arg(long, default_value_t = 0, hide = true, global = true)]
@@ -190,8 +193,12 @@ fn has_active_requirements(cfg: &Config, workspace: &Path, formal: bool) -> Resu
 
 fn read_task(instructions_file: Option<&str>, task: Option<&str>) -> Result<Option<String>> {
     if let Some(f) = instructions_file {
-        let text =
-            std::fs::read_to_string(f).with_context(|| format!("reading instructions file {f}"))?;
+        let text = if f == "-" {
+            std::io::read_to_string(std::io::stdin())
+        } else {
+            std::fs::read_to_string(f)
+        }
+        .with_context(|| format!("reading instructions file {f}"))?;
         if !text.trim().is_empty() {
             return Ok(Some(text));
         }
@@ -701,7 +708,11 @@ fn main() -> Result<()> {
         .as_ref()
         .and_then(Command::mode)
         .unwrap_or((Mode::Build, cli.task.as_deref()));
-    let explicit_task = read_task(cli.instructions_file.as_deref(), task_arg)?;
+    let explicit_task = read_task(cli.instructions_file.as_deref(), task_arg)?.or_else(|| {
+        cli.resume
+            .as_ref()
+            .map(|_| "Continue from where you left off.".to_string())
+    });
     let quiet = cli.quiet_startup || cli.subagent;
     let instance_id = registry::new_id();
     let runtime = cfg.runtime_for_mode(start_mode)?;
@@ -718,6 +729,13 @@ fn main() -> Result<()> {
         formal,
         runtime.limits.context_window,
     );
+
+    if let Some(prev) = &cli.resume {
+        let mut ctx = context.write().unwrap();
+        for msg in db.history(prev)? {
+            ctx.push(msg);
+        }
+    }
 
     // Top-level runs open a control socket so instructions can be injected
     // mid-run; subagents never do. Controllable runs also register themselves so
@@ -781,5 +799,5 @@ fn main() -> Result<()> {
     let report = run_single(params, quiet)?;
 
     eprintln!("[report] {report}");
-    Ok(())
+    std::process::exit(agent::EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed));
 }

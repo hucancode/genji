@@ -33,7 +33,7 @@ requirement_read    {id?, level?, status?}   # by id: one requirement; no id: li
 requirement_tree    {status?}                     # hierarchy + ticket coverage
 requirement_update  {id, title?, body?, status?, level?, parent_id?}
 requirement_remove  {id, hard?}
-requirement_ask     {question, requirement_id?}   # recorded in DB
+requirement_ask     {question, requirement_id?}   # plan only; recorded in DB for a human to resolve
 
 ticket_create       {title, description?, priority?, parent_id?, requirement_id?}
 ticket_read         {id?, status?, requirement_id?}  # by id: any ticket; no id: actionable files only
