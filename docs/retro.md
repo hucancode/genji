@@ -1,22 +1,12 @@
-# Retro mode
+# Retro
 
-`genji retro` gives the agent tools to study its own recorded behavior and
-improve itself:
+`genji retro` studies recorded sessions and improves the agent itself. It has
+`read write edit ls bash` and queries `.genji/sessions/*.jsonl` with `jq` and
+`grep` (format: [Events](events.md)).
 
-| Tool | Purpose |
-|------|---------|
-| `query_instances` | list instances (mode, depth, tokens, status) |
-| `query_messages` | read recorded messages; filter by `instance_id` to read one conversation, or by role/text |
-| `query_tool_calls` | inspect tool calls (name, errors, duration, args/result) |
-| `query_stats` | aggregated tool usage, error rate, skill loads, tokens, compactions |
+Improvements are plain files, tracked by git:
 
-Retro changes behavior by editing plain files with the normal `read`/`write`/
-`edit` tools:
+- `.genji/agents/<name>.md`: agents, see [Agents](agents.md)
+- `.genji/skills/<name>.md`: skills, see [Skills](skills.md)
 
-- `.genji/prompts/<mode>.md` — the extended prompt for `plan`, `build` or
-  `explore`, appended to the system prompt under `## Extended guidance`.
-- `.genji/skills/<name>.md` — skills, see [Skills](skills.md).
-
-Keep these directories in git to review, diff and revert changes. The core
-prompts are compiled in and not editable, and `retro` has no extended prompt, so
-it cannot rewrite its own instructions.
+Keep them in git to review, diff and revert.

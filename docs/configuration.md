@@ -4,54 +4,31 @@
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `provider` | `local` | Active provider profile name (also the auth-file key when no profile matches) |
-| `providers` | `{ local }` | Named endpoint profiles — see [Providers](providers.md) |
-| `token_limit` | `4000000` | Fallback max tokens per run (prompt + completion); a provider or per-model limit overrides it |
+| `provider` | `local` | Active provider profile |
+| `providers` | `{ local }` | Named endpoint profiles, see [Providers](providers.md) |
 | `time_limit_secs` | `1800` | Max wall-clock time per run |
 | `compact_threshold` | `0.70` | Fraction of `context_window` that triggers compaction |
 | `compact_keep_recent` | `6` | Messages kept verbatim during compaction |
-| `context_window` | `32768` | Fallback model context size, used with the threshold |
-| `max_output_tokens` | `8192` | Fallback `max_tokens` sent to the API |
-| `tool_result_max_bytes` | `24000` | Inline limit for tool results; larger results are spilled to `tmp_dir` and truncated with a pointer to the log |
+| `tool_result_max_bytes` | `24000` | Inline limit for tool results; larger ones are clipped and the full text goes to `.genji/tmp` |
 | `bash_timeout_secs` | `120` | Default `bash` timeout |
 | `spawn_timeout_secs` | `900` | Subagent timeout |
-| `max_tool_iterations` | `80` | Max tool rounds per mode run |
+| `max_tool_iterations` | `80` | Max tool rounds per run |
 | `llm_max_retries` | `6` | Retries per model request on transport errors, 408/409/429/5xx and unparseable responses (exponential backoff, honors `Retry-After`) |
-| `max_cycles` | `30` | Max plan/build cycles |
 | `max_subagent_depth` | `2` | Subagent nesting limit |
-| `db_path` | `.genji/genji.db` | SQLite database |
-| `requirements_dir` / `plans_dir` / `tickets_dir` / `skills_dir` / `prompts_dir` | `.genji/requirements` / `.genji/plans` / `.genji/tickets` / `.genji/skills` / `.genji/prompts` | Content dirs |
-| `tmp_dir` | `.genji/tmp` | Scratch space for bash/spawn output and spilled tool results |
-| `control_socket` | `.genji/control.sock` | Unix socket for mid-run steering |
 | `control_enabled` | `true` | Open the control socket for top-level runs |
-| `auto_ingest_requirements` | `true` | Load `.genji/requirements/**/*.md` on Formal startup |
 
-CLI flag `--workspace <dir>` overrides config.
-Control subcommands `list`, `inspect <id>`, `instruct <id> <text>` and
-`stop <id>...|all` steer running agents (these do not start an agent).
-
----
+`--workspace <dir>` selects the workspace; `--provider <name>` selects a profile.
 
 ## Directory layout
 
-`genji` is workspace-relative. Running it in a directory creates:
-
 ```
 .genji/
-  requirements/*.md        # requirements, level in frontmatter (ingested automatically)
-  tickets/*.md             # all formal-mode tickets, including closed tickets
-  config.json              # runtime configuration (created on first run)
-  genji.db                 # SQLite: instances, messages, tool calls, and compactions
-  plans/
-    *.md                   # implementation plans written by plan mode
-  skills/
-    *.md                   # skills (frontmatter + body)
-  prompts/
-    <mode>.md              # extended system prompt per mode
-  control.sock             # Unix socket for mid-run steering (while running)
-  tmp/                     # scratch space for bash/spawn output and spilled tool results
+  config.json          # this file
+  agents/*.md          # agents (add or replace built-ins)
+  skills/*.md          # skills
+  plans/*.md           # plans written with plan_write
+  sessions/<id>.jsonl  # one operation log per instance
+  requirements/, tickets/, claims/   # used by the formal skill
+  control.sock         # control socket while running
+  tmp/                 # scratch space and spilled tool results
 ```
-
-Extended system prompts are the `prompts/<mode>.md` files (see [Modes](modes.md)).
-
-Everything is configurable (see the table above).

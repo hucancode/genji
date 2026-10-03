@@ -1,24 +1,17 @@
 # Skills
 
-Skills are markdown files in `.genji/skills/<name>.md` with simple frontmatter:
+A skill is a markdown file with a `description` in the frontmatter:
 
 ```markdown
 ---
 description: House style for Rust changes
 ---
-- Run `cargo fmt` and `cargo clippy -- -D warnings` before resolving a ticket.
-- Prefer standard library over new dependencies.
+- Run `cargo fmt` and `cargo clippy -- -D warnings` before finishing.
+- Prefer the standard library over new dependencies.
 ```
 
-The file name (without `.md`) is the skill name. Agents call `skill_load(name)`
-to add a skill to their system prompt under `## Loaded skills`; the tool is
-offered only when at least one skill file exists. Loaded skills survive
-compaction and resume. Each load changes the system prompt, so the provider's
-prompt cache restarts once.
+Lookup: `.genji/skills/<name>.md`, then the built-in skills (`formal`, see
+[Formal skill](formal.md)). A workspace file shadows a built-in of the same name.
 
-`skill_load` is not part of the conversation: neither the call nor its result is
-sent to the model. A turn that only loads skills leaves no message. An unknown
-name is reported to the model as a one-request hint listing the available
-skills. Loads are recorded with the other tool calls and appear as
-`tool_call`/`tool_result` events, so `query_stats` and event consumers see them.
-Retro mode edits skill files directly. See [Retro mode](retro.md).
+- **On demand:** the system prompt lists every skill (name — description). An agent with `skill_load` loads one with `skill_load(name)`; the text comes back as a normal tool result.
+- **Forced:** an agent's `skills:` list is rendered into its system prompt at start. An unknown forced skill is a startup error.

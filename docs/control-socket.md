@@ -21,8 +21,7 @@ removed on exit; a stale socket left by a crash is detected and replaced
 automatically.
 
 Commands use one short-lived connection and receive one response line. The
-event stream on the agent's stdout and the workspace database are the durable
-output.
+event stream on stdout and `.genji/sessions/<id>.jsonl` are the durable output.
 
 ## Interact via netcat
 
@@ -40,10 +39,6 @@ output.
    # inject an instruction (any line not starting with "/")
    printf 'focus on the parser first\n' | nc -U "$SOCK"
    # -> queued (1 pending)
-   # select a plan for the agent to follow/refine (any mode; `off` clears)
-   printf '/setplan rate-limiting\n' | nc -U "$SOCK"
-   # existing plan -> plan set to rate-limiting (1 pending, existing plan queued)
-   # missing/empty  -> plan set to rate-limiting (empty; awaiting plan content)
    # graceful stop
    printf '/stop\n'   | nc -U "$SOCK"        # -> stopping
  ```
@@ -60,23 +55,4 @@ broadcast to the event stream.
 genji instruct <id> /context    # full context snapshot (JSON) on stdout
 ```
 
-## Selecting a plan
-
-`/setplan <slug>` points a running agent at a plan. The selection is injected
-into the system prompt, so it survives context compaction, and it works in any
-mode: `plan` updates the plan (creating `<slug>.md` when it does not exist),
-`build` follows an existing plan. A plan that does not exist is a no-op outside
-`plan` mode. `/setplan off` clears the selection.
-
-If `plans_dir/<slug>.md` (default `.genji/plans/<slug>.md`) already exists and
-is non-empty, an instruction is queued telling the agent to read it, update it
-if the approach changes, and continue until it is satisfied. If the file is
-missing or empty, nothing is queued: in `plan` mode the system prompt tells the
-agent to create the plan with `plan_write` at that path; other modes ignore it.
-
-The same command is available from the CLI, which sends `/setplan` for you:
-
-```bash
-genji setplan <id> rate-limiting     # plan mode updates, build mode follows .genji/plans/rate-limiting.md
-genji setplan <id> off               # clear
-```
+With `--follow`, the socket stays open across handoffs and always talks to the agent running now.

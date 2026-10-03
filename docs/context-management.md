@@ -2,70 +2,54 @@
 
 ## Composition and budget
 
-The prompt sent to the model has three parts: the **system prompt** (shared +
-mode + Formal + extended guidance, plus any active plan), the **system tools** (the
-tool definitions for the mode), and the **turn messages** (the conversation).
-`ContextComposer` owns all three and the operations that shape them: pushing
-messages and tool results, switching mode, compaction, and stats.
+The prompt sent to the model has three parts: the **system prompt** (the agent's
+prompt, environment, project instructions, skill list, forced skills, agent list,
+and for subagents a reporting section), the **tools** of the agent, and the
+**turn messages**. `ContextComposer` owns all three and the operations that
+shape them: push, prune and compaction.
 
-Inspect the current context:
+`genji instruct <id> /context` prints the live prompt the model will receive
+next. Context is pull-only: it is never written to the event stream.
 
-- **Live snapshot:** `genji instruct <id> /context` sends `/context` over the
-  control socket and prints the live prompt the model will receive next — the
-  system prompt, tool definitions, conversation turns, and window size — read
-  directly from the composer. Context is pull-only: it is never written to the
-  event stream.
+## Pruning and compaction
 
-## Auto compaction
-
-Before each model call, if the last reported prompt size exceeds
-`compact_threshold × context_window`, the middle of the conversation is
-summarized by the model and replaced with a single summary message; the system
-prompt and the most recent `compact_keep_recent` messages are preserved.
-Tool-call/result pairs are never split. Each compaction is logged in the
-`compactions` table (before/after token estimates, removed count, summary).
+Before each model call, if the prompt size reaches `compact_threshold ×
+context_window`, tool results older than the last `compact_keep_recent` messages
+are elided (a `prune` event). If still over, the older conversation is summarized
+by the model and replaced with one summary message (a `compaction` event); the
+system prompt and the most recent messages stay. Tool-call/result pairs are never
+split.
 
 ## Resume
 
-`genji --resume <id>` continues the recorded instance under the same id. Each
-pruning or compaction writes the full message list to `context_checkpoints`, so
-the resumed conversation is the exact list the model last saw, followed by any
-messages recorded after the checkpoint; the provider's prompt cache keeps
-matching. The system prompt and tools are rebuilt from the current files, with
-the skills the run had loaded. Nothing is appended unless a task is given or the
-transcript ends on a finished answer.
+`genji <agent> --resume <id>` (the agent is optional) replays the session file
+through the same operations the run applied: `system`, `user`, `assistant`,
+`tool_result`, `prune`, `compaction`. The resumed run uses the **recorded** system
+prompt, tools and model, and the recorded raw tool-call argument strings, so its
+first request is a byte-identical prefix of the last one and the provider's
+prompt cache keeps matching (as long as its TTL has not expired).
+`GENJI_DUMP_REQUESTS=<dir>` writes each request body to `<dir>` to check this.
 
-### Interrupted tool calls
+A truncated last line (crash mid-write) is dropped. Then:
 
-Every tool call is journaled in `tool_calls` as `started` before it runs. Its
-result row (`done`) and its tool message are written in one transaction, so a
-call either has both or neither. On resume, each call of the last assistant turn
-that has no result is settled before anything else:
-
-| journal state | action |
+| session ends at | action |
 | --- | --- |
-| no row (never started) | run it |
-| `started`, safe tool (`read`, `ls`, `write`, `plan_write`, read-only ticket/requirement/query tools) | mark the row `interrupted` and run it again |
-| `started`, `spawn` | reattach the subagent (below) |
-| `started`, any other tool (`bash`, `edit`, …) | result `ERROR: interrupted … it may have partially run`; the model checks state itself |
+| `user` / `tool_result` | the request is re-sent unchanged |
+| `assistant` with unanswered calls | `spawn` and `finish` run again; other calls get `ERROR: interrupted … it may have partially run`, and the model checks state itself |
+| a crash during compaction | no `compaction` event was written; it compacts again |
+| a finished run | the given task, or "Continue from where you left off.", is appended |
 
-A `spawn` journals the child's instance id before launching it. To reattach,
-genji uses the child's recorded report if the child has finished. If the child
-is still running (an orphan of the stopped parent), genji waits for it up to
-`spawn_timeout_secs`. If it died, or the wait times out, genji kills its process
-group and resumes it with `--resume <child>`; the child settles its own
-interrupted calls the same way. If the child never started, the spawn runs
-again. The tool result carries `"reattached": true` when it comes from the
-child's record.
+An unfinished `spawn` is settled from the child's session file: a finished child's
+report is delivered; an unfinished child is stopped and resumed with
+`--resume <child>`; a child that never started runs normally.
 
-## Retries and hints
+## Retries and notes
 
 Transport errors, 408/409/429/5xx and unparseable responses are retried with
-backoff (`llm_max_retries`). A truncated response or a malformed tool call
-(invalid JSON, unknown tool, missing required field) is discarded and
-re-requested with a one-request `[note]` hint appended after the context; the
-hint is never stored. A failed tool or a repeated call adds a hint to the next
-request in the same way.
+backoff (`llm_max_retries`). A response cut off by the output limit is re-requested
+up to 3 times with a one-request `[note]` appended after the context. A model that
+answers in plain text without `finish` gets one `[note] End by calling finish.`
+Notes are never stored.
 
 ## How tool results are truncated
 

@@ -3,139 +3,69 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::storage::util::{resolve_path, write_file};
+use crate::storage::util::{split_frontmatter, valid_slug, write_file};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ModelsConfig {
-    pub plan: String,
-    pub build: String,
-    pub explore: String,
-    pub retro: String,
+/// Subcommand names an agent may not take.
+pub const RESERVED: [&str; 6] = ["list", "stop", "instruct", "inspect", "reset", "help"];
+
+const BUILTIN_AGENTS: [(&str, &str); 4] = [
+    ("plan", include_str!("agents/plan.md")),
+    ("build", include_str!("agents/build.md")),
+    ("explore", include_str!("agents/explore.md")),
+    ("retro", include_str!("agents/retro.md")),
+];
+const BUILTIN_SKILLS: [(&str, &str); 1] = [("formal", include_str!("skills/formal.md"))];
+
+/// `<workspace>/.genji/<name>`.
+pub fn dot(workspace: &Path, name: &str) -> PathBuf {
+    workspace.join(".genji").join(name)
 }
 
-impl ModelsConfig {
-    pub fn for_mode(&self, mode: crate::storage::modes::Mode) -> &str {
-        use crate::storage::modes::Mode::{Build, Explore, Plan, Retro};
-        match mode {
-            Plan => &self.plan,
-            Build => &self.build,
-            Explore => &self.explore,
-            Retro => &self.retro,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ModelLimits {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_limit: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<i64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct EffectiveLimits {
-    pub token_limit: i64,
-    pub context_window: i64,
-    pub max_output_tokens: i64,
-}
-
-/// Fully resolved provider, model, and limits for one agent mode.
-#[derive(Debug, Clone)]
-pub struct ModelRuntime {
-    pub provider: ProviderConfig,
-    pub model: String,
-    pub limits: EffectiveLimits,
-}
-
+/// One OpenAI-compatible endpoint plus its limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ProviderConfig {
-    /// "openai" (llama.cpp, `DeepSeek`, `OpenAI`, `OpenRouter`, …) or "azure".
-    pub kind: String,
+pub struct Provider {
     pub base_url: String,
-    /// Explicit key (highest priority). May be empty for local servers.
     pub api_key: String,
     /// Env var consulted when `api_key` is empty.
     pub api_key_env: String,
-    /// auth file fallback: { "<`auth_key>"`: { "key": "..." } }.
-    pub auth_file: String,
-    pub auth_key: String,
-    /// "bearer" (Authorization) or "api-key" (Azure). Empty = derive from kind.
+    /// "bearer" (Authorization) or "api-key" (Azure).
     pub auth: String,
-    /// Azure `api-version` query value.
-    pub api_version: String,
-    /// Single model/deployment used for every mode (optional override).
     pub model: String,
-    /// Per-mode model/deployment names.
-    pub models: ModelsConfig,
-    /// "`max_tokens`" (default) or "`max_completion_tokens`" (some Azure/OpenAI reasoning models).
+    /// "max_tokens" or "max_completion_tokens".
     pub max_tokens_field: String,
-    /// Provider-wide overrides of the top-level limits.
-    #[serde(flatten)]
-    pub limits: ModelLimits,
-    /// Per-model overrides, keyed by model/deployment name. Win over the
-    /// provider-level limits and the top-level values.
-    pub model_limits: BTreeMap<String, ModelLimits>,
-    /// Send `tool_choice: "auto"` (some endpoints reject it).
     pub send_tool_choice: bool,
-    pub extra_headers: BTreeMap<String, String>,
-    pub extra_query: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, String>,
+    pub context_window: i64,
+    pub max_output_tokens: i64,
+    /// Max tokens (prompt + completion) per run.
+    pub token_limit: i64,
 }
 
-impl Default for ProviderConfig {
+impl Default for Provider {
     fn default() -> Self {
         Self {
-            kind: "openai".into(),
-            base_url: String::new(),
+            base_url: "http://127.0.0.1:8080/v1".into(),
             api_key: String::new(),
             api_key_env: String::new(),
-            auth_file: String::new(),
-            auth_key: String::new(),
-            auth: String::new(),
-            api_version: String::new(),
-            model: String::new(),
-            models: ModelsConfig::default(),
+            auth: "bearer".into(),
+            model: "qwen3-coder-30b-a3b".into(),
             max_tokens_field: "max_tokens".into(),
-            limits: ModelLimits::default(),
-            model_limits: BTreeMap::new(),
             send_tool_choice: true,
-            extra_headers: BTreeMap::new(),
-            extra_query: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            context_window: 32_768,
+            max_output_tokens: 8_192,
+            token_limit: 4_000_000,
         }
     }
 }
 
-impl ProviderConfig {
-    pub fn is_azure(&self) -> bool {
-        self.kind.eq_ignore_ascii_case("azure")
-    }
-
-    pub fn resolve_api_key(&self) -> String {
+impl Provider {
+    pub fn api_key(&self) -> String {
         if !self.api_key.is_empty() {
             return self.api_key.clone();
         }
-        if !self.api_key_env.is_empty()
-            && let Ok(v) = std::env::var(&self.api_key_env)
-            && !v.is_empty()
-        {
-            return v;
-        }
-        let path = crate::storage::util::expand_home(&self.auth_file);
-        if let Ok(text) = std::fs::read_to_string(&path)
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
-            && let Some(key) = v
-                .get(&self.auth_key)
-                .and_then(|p| p.get("key"))
-                .and_then(|k| k.as_str())
-        {
-            return key.to_string();
-        }
-        String::new()
+        std::env::var(&self.api_key_env).unwrap_or_default()
     }
 }
 
@@ -143,224 +73,251 @@ impl ProviderConfig {
 #[serde(default)]
 pub struct Config {
     pub provider: String,
-    pub providers: BTreeMap<String, ProviderConfig>,
-    pub token_limit: i64,
+    pub providers: BTreeMap<String, Provider>,
     pub time_limit_secs: u64,
     pub compact_threshold: f64,
     pub compact_keep_recent: usize,
-    pub context_window: i64,
-    pub max_output_tokens: i64,
     pub tool_result_max_bytes: usize,
     pub max_tool_iterations: usize,
     pub llm_max_retries: u32,
     pub bash_timeout_secs: u64,
     pub spawn_timeout_secs: u64,
     pub max_subagent_depth: u32,
-    #[cfg(feature = "formal")]
-    pub max_cycles: usize,
-    pub db_path: String,
-    #[cfg(feature = "formal")]
-    pub requirements_dir: String,
-    pub plans_dir: String,
-    pub prompts_dir: String,
-    #[cfg(feature = "formal")]
-    pub tickets_dir: String,
-    pub skills_dir: String,
-    pub tmp_dir: String,
-    pub control_socket: String,
     pub control_enabled: bool,
-    #[cfg(feature = "formal")]
-    pub auto_ingest_requirements: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        let mut providers = BTreeMap::new();
-        let mut model_limits = BTreeMap::new();
-        model_limits.insert(
-            "qwen3-coder-30b-a3b".into(),
-            ModelLimits {
-                token_limit: Some(4_000_000),
-                context_window: Some(32_768),
-                max_output_tokens: Some(8_192),
-            },
-        );
-        providers.insert(
-            "local".into(),
-            ProviderConfig {
-                kind: "openai".into(),
-                base_url: "http://127.0.0.1:8080/v1".into(),
-                model: "qwen3-coder-30b-a3b".into(),
-                model_limits,
-                ..Default::default()
-            },
-        );
         Self {
             provider: "local".into(),
-            providers,
-            token_limit: 4_000_000,
+            providers: BTreeMap::from([("local".into(), Provider::default())]),
             time_limit_secs: 1800,
             compact_threshold: 0.70,
             compact_keep_recent: 6,
-            context_window: 32_768,
-            max_output_tokens: 8_192,
             tool_result_max_bytes: 24_000,
             max_tool_iterations: 80,
             llm_max_retries: 6,
             bash_timeout_secs: 120,
             spawn_timeout_secs: 900,
             max_subagent_depth: 2,
-            #[cfg(feature = "formal")]
-            max_cycles: 30,
-            db_path: ".genji/genji.db".into(),
-            #[cfg(feature = "formal")]
-            requirements_dir: ".genji/requirements".into(),
-            plans_dir: ".genji/plans".into(),
-            prompts_dir: ".genji/prompts".into(),
-            #[cfg(feature = "formal")]
-            tickets_dir: ".genji/tickets".into(),
-            skills_dir: ".genji/skills".into(),
-            tmp_dir: ".genji/tmp".into(),
-            control_socket: ".genji/control.sock".into(),
             control_enabled: true,
-            #[cfg(feature = "formal")]
-            auto_ingest_requirements: true,
         }
     }
 }
 
 impl Config {
-    pub fn path_in(workspace: &Path) -> PathBuf {
-        workspace.join(".genji/config.json")
-    }
-
+    /// Read `.genji/config.json`, writing the defaults first when it is missing.
     pub fn load_or_create(workspace: &Path) -> Result<Self> {
-        let path = Self::path_in(workspace);
+        let path = dot(workspace, "config.json");
         if !path.exists() {
             let cfg = Config::default();
-            let text = serde_json::to_string_pretty(&cfg)?;
-            write_file(&path, format!("{text}\n"))?;
+            write_file(&path, format!("{}\n", serde_json::to_string_pretty(&cfg)?))?;
             eprintln!("[config] created default config at {}", path.display());
             return Ok(cfg);
         }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let cfg: Config = serde_json::from_str(&text)
-            .with_context(|| format!("parsing config {}", path.display()))?;
-        Ok(cfg)
+        serde_json::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
     }
 
-    pub fn db_file(&self, workspace: &Path) -> PathBuf {
-        resolve_path(workspace, &self.db_path)
-    }
-
-    #[cfg(feature = "formal")]
-    pub fn requirements_path(&self, workspace: &Path) -> PathBuf {
-        resolve_path(workspace, &self.requirements_dir)
-    }
-    pub fn plans_path(&self, workspace: &Path) -> PathBuf {
-        resolve_path(workspace, &self.plans_dir)
-    }
-    #[cfg(feature = "formal")]
-    pub fn tickets_path(&self, workspace: &Path) -> PathBuf {
-        resolve_path(workspace, &self.tickets_dir)
-    }
-    pub fn prompts_path(&self, workspace: &Path) -> PathBuf {
-        resolve_path(workspace, &self.prompts_dir)
-    }
-    pub fn skills_path(&self, workspace: &Path) -> PathBuf {
-        resolve_path(workspace, &self.skills_dir)
-    }
-    pub fn tmp_path(&self, workspace: &Path) -> PathBuf {
-        resolve_path(workspace, &self.tmp_dir)
-    }
-    pub fn control_path(&self, workspace: &Path) -> PathBuf {
-        resolve_path(workspace, &self.control_socket)
-    }
-
-    /// Directories created at startup; formal mode adds requirements and tickets.
-    pub fn layout_dirs(&self, workspace: &Path, formal: bool) -> Vec<PathBuf> {
-        let mut dirs = vec![
-            self.plans_path(workspace),
-            self.skills_path(workspace),
-            self.prompts_path(workspace),
-        ];
-        dirs.extend(
-            self.formal_dirs(workspace, formal)
-                .into_iter()
-                .map(|(_, d)| d),
-        );
-        dirs
-    }
-
-    /// Formal-mode content directories with display labels (empty unless formal).
-    pub fn formal_dirs(&self, workspace: &Path, formal: bool) -> Vec<(&'static str, PathBuf)> {
-        #[cfg(feature = "formal")]
-        if formal {
-            return vec![
-                ("requirement(s)", self.requirements_path(workspace)),
-                ("ticket(s)", self.tickets_path(workspace)),
-            ];
-        }
-        let _ = (workspace, formal);
-        Vec::new()
-    }
-
-    /// `<plans_dir>/<slug>.md`.
-    pub fn plan_file(&self, workspace: &Path, slug: &str) -> PathBuf {
-        self.plans_path(workspace).join(format!("{slug}.md"))
-    }
-
-    pub fn resolve_active_provider(&self) -> Result<ProviderConfig> {
-        let mut provider = self.providers.get(&self.provider).cloned().ok_or_else(|| {
+    pub fn provider(&self) -> Result<Provider> {
+        self.providers.get(&self.provider).cloned().ok_or_else(|| {
             anyhow::anyhow!("configured provider `{}` does not exist", self.provider)
-        })?;
-        if provider.auth_key.is_empty() {
-            provider.auth_key = self.provider.clone();
-        }
-        if provider.auth.is_empty() {
-            provider.auth = if provider.is_azure() {
-                "api-key"
-            } else {
-                "bearer"
-            }
-            .into();
-        }
-        Ok(provider)
-    }
-
-    pub fn runtime_for_mode(&self, mode: crate::storage::modes::Mode) -> Result<ModelRuntime> {
-        let provider = self.resolve_active_provider()?;
-        let model = if provider.model.trim().is_empty() {
-            let model = provider.models.for_mode(mode);
-            if model.trim().is_empty() {
-                anyhow::bail!(
-                    "provider `{}` has no model configured for {}",
-                    self.provider,
-                    mode.as_str()
-                );
-            }
-            model.to_string()
-        } else {
-            provider.model.clone()
-        };
-        let limits = self.limits_for(&provider, &model);
-        Ok(ModelRuntime {
-            provider,
-            model,
-            limits,
         })
     }
+}
 
-    fn limits_for(&self, p: &ProviderConfig, model: &str) -> EffectiveLimits {
-        let m = p.model_limits.get(model);
-        let pick = |f: fn(&ModelLimits) -> Option<i64>, top: i64| {
-            m.and_then(f).or(f(&p.limits)).unwrap_or(top)
-        };
-        EffectiveLimits {
-            token_limit: pick(|l| l.token_limit, self.token_limit),
-            context_window: pick(|l| l.context_window, self.context_window),
-            max_output_tokens: pick(|l| l.max_output_tokens, self.max_output_tokens),
+/// An agent: a system prompt, the tools it may call, and what it may declare when it finishes.
+#[derive(Debug, Clone)]
+pub struct AgentDef {
+    pub name: String,
+    pub description: String,
+    pub prompt: String,
+    pub tools: Vec<String>,
+    /// Skills rendered into the system prompt at start.
+    pub skills: Vec<String>,
+    /// Statuses `finish` may use: done | handoff | blocked.
+    pub finish: Vec<String>,
+    pub model: Option<String>,
+}
+
+fn list(meta: &BTreeMap<String, String>, key: &str) -> Option<Vec<String>> {
+    meta.get(key).map(|v| {
+        v.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+}
+
+fn parse_agent(name: &str, text: &str) -> AgentDef {
+    let (meta, prompt) = split_frontmatter(text);
+    AgentDef {
+        name: name.to_string(),
+        description: meta.get("description").cloned().unwrap_or_default(),
+        prompt,
+        tools: list(&meta, "tools").unwrap_or_default(),
+        skills: list(&meta, "skills").unwrap_or_default(),
+        finish: list(&meta, "finish")
+            .unwrap_or_else(|| ["done", "handoff", "blocked"].map(String::from).into()),
+        model: meta.get("model").filter(|m| !m.is_empty()).cloned(),
+    }
+}
+
+/// The built-in agents, overridden or extended by `.genji/agents/<name>.md`.
+/// Reserved or malformed definitions are skipped with a warning.
+pub fn load_agents(workspace: &Path) -> BTreeMap<String, AgentDef> {
+    let mut agents: BTreeMap<String, AgentDef> = BUILTIN_AGENTS
+        .iter()
+        .map(|(n, t)| ((*n).to_string(), parse_agent(n, t)))
+        .collect();
+    let files = std::fs::read_dir(dot(workspace, "agents"))
+        .into_iter()
+        .flatten()
+        .flatten();
+    for path in files
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
+    {
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if RESERVED.contains(&name.as_str()) || !valid_slug(&name) {
+            eprintln!(
+                "[agents] ignoring {}: `{name}` is not a usable agent name",
+                path.display()
+            );
+            continue;
         }
+        let def = parse_agent(&name, &std::fs::read_to_string(&path).unwrap_or_default());
+        match crate::tools::check(&def) {
+            Ok(()) => agents.insert(name, def),
+            Err(e) => {
+                eprintln!("[agents] ignoring {}: {e}", path.display());
+                continue;
+            }
+        };
+    }
+    agents
+}
+
+/// Skill names with their descriptions: workspace files first, then built-ins.
+pub fn skill_list(workspace: &Path) -> BTreeMap<String, String> {
+    let mut skills: BTreeMap<String, String> = BUILTIN_SKILLS
+        .iter()
+        .map(|(n, t)| {
+            (
+                (*n).to_string(),
+                split_frontmatter(t)
+                    .0
+                    .remove("description")
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    let files = std::fs::read_dir(dot(workspace, "skills"))
+        .into_iter()
+        .flatten()
+        .flatten();
+    for path in files
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
+    {
+        if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let description = split_frontmatter(&text)
+                .0
+                .remove("description")
+                .unwrap_or_default();
+            skills.insert(name.to_string(), description);
+        }
+    }
+    skills
+}
+
+/// The skill's text as it appears in a prompt or tool result.
+pub fn render_skill(workspace: &Path, name: &str) -> Result<String> {
+    let text = valid_slug(name)
+        .then(|| std::fs::read_to_string(dot(workspace, "skills").join(format!("{name}.md"))).ok())
+        .flatten()
+        .or_else(|| {
+            BUILTIN_SKILLS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, t)| (*t).to_string())
+        });
+    let Some(text) = text else {
+        let names: Vec<_> = skill_list(workspace).into_keys().collect();
+        anyhow::bail!("skill `{name}` not found. available: {}", names.join(", "));
+    };
+    let (meta, body) = split_frontmatter(&text);
+    let description = meta.get("description").map_or("", String::as_str);
+    Ok(format!("# Skill: {name}\n{description}\n\n{body}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::util::temp_dir;
+
+    #[test]
+    fn defaults_ship_the_four_agents_and_the_formal_skill() {
+        let ws = temp_dir("agents-default");
+        let agents = load_agents(&ws);
+        assert_eq!(
+            agents.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["build", "explore", "plan", "retro"]
+        );
+        assert_eq!(agents["plan"].finish, ["done", "handoff", "blocked"]);
+        assert_eq!(agents["build"].finish, ["handoff", "blocked"]);
+        assert!(skill_list(&ws).contains_key("formal"));
+        assert!(
+            render_skill(&ws, "formal")
+                .unwrap()
+                .starts_with("# Skill: formal")
+        );
+    }
+
+    #[test]
+    fn workspace_agents_override_and_reserved_names_are_skipped() {
+        let ws = temp_dir("agents-override");
+        let dir = dot(&ws, "agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("build.md"),
+            "---\ntools: read, ls\nskills: formal\n---\ncustom",
+        )
+        .unwrap();
+        std::fs::write(dir.join("list.md"), "---\ntools: read\n---\nx").unwrap();
+        std::fs::write(dir.join("bad.md"), "---\ntools: nope\n---\nx").unwrap();
+        std::fs::write(
+            dir.join("review.md"),
+            "---\ndescription: reviews\ntools: read\n---\ny",
+        )
+        .unwrap();
+        let agents = load_agents(&ws);
+        assert_eq!(agents["build"].prompt, "custom");
+        assert_eq!(agents["build"].tools, ["read", "ls"]);
+        assert_eq!(agents["build"].skills, ["formal"]);
+        assert_eq!(agents["review"].description, "reviews");
+        assert!(!agents.contains_key("list") && !agents.contains_key("bad"));
+    }
+
+    #[test]
+    fn workspace_skill_shadows_builtin() {
+        let ws = temp_dir("skills");
+        let dir = dot(&ws, "skills");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("formal.md"), "---\ndescription: mine\n---\nbody\n").unwrap();
+        assert_eq!(skill_list(&ws)["formal"], "mine");
+        assert!(render_skill(&ws, "formal").unwrap().contains("body"));
+        assert!(
+            render_skill(&ws, "../x")
+                .unwrap_err()
+                .to_string()
+                .contains("available")
+        );
     }
 }

@@ -50,7 +50,7 @@ _PROVIDER_LIMITS = {
 
 
 class GenjiOptions(InstalledAgentOptions):
-    mode: Literal["build", "plan", "explore", "retro", "cycle"] = "build"
+    mode: Literal["build", "plan", "explore", "retro"] = "build"
 
 
 class Genji(BaseInstalledAgent):
@@ -119,14 +119,12 @@ class Genji(BaseInstalledAgent):
             "provider": "harbor",
             "providers": {
                 "harbor": {
-                    "kind": "openai",
                     "base_url": base_url,
                     "api_key_env": _API_KEY_ENV,
                     "model": model_id,
-                    "model_limits": {model_id: dict(limits)},
+                    **limits,
                 }
             },
-            "default_model": model_id,
         }
 
     async def _workdir(self, environment: BaseEnvironment) -> str:
@@ -136,10 +134,8 @@ class Genji(BaseInstalledAgent):
         return (result.stdout or "/").strip().splitlines()[-1] or "/"
 
     def _command(self, instruction: str) -> str:
-        # genji sets `args_conflicts_with_subcommands`, so the task follows the
-        # subcommand; `cycle` is the bare auto-cycling form.
         task = shlex.quote(instruction)
-        core = f"genji {task}" if self.options.mode == "cycle" else f"genji {self.options.mode} {task}"
+        core = f"genji {self.options.mode} {task}"
         return f"{core} > /logs/agent/{_OUTPUT} 2> /logs/agent/{_STDERR}"
 
     @override
