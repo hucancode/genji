@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -19,7 +19,8 @@ crate::storage::string_enum! {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
@@ -69,6 +70,27 @@ impl Serialize for ToolCall {
             },
         }
         .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolCall {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Function {
+            name: String,
+            arguments: String,
+        }
+        #[derive(Deserialize)]
+        struct Wire {
+            id: String,
+            function: Function,
+        }
+        let w = Wire::deserialize(d)?;
+        Ok(ToolCall {
+            id: w.id,
+            name: w.function.name,
+            arguments: w.function.arguments,
+        })
     }
 }
 
@@ -135,6 +157,7 @@ impl ChatMessage {
             ..Default::default()
         }
     }
+    #[cfg(test)]
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
@@ -186,11 +209,21 @@ pub fn estimate_messages(messages: &[ChatMessage]) -> i64 {
     messages.iter().map(ChatMessage::est_tokens).sum::<i64>() + 8
 }
 
+/// The live context plus an optional one-request hint, serialized as one array
+/// without copying the context. The hint is never stored.
+struct Messages<'a>(&'a [ChatMessage], Option<ChatMessage>);
+
+impl Serialize for Messages<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().chain(self.1.iter()))
+    }
+}
+
 /// Chat-completions request body, serialized straight from the live context.
 #[derive(Serialize)]
 struct Request<'a> {
     model: &'a str,
-    messages: &'a [ChatMessage],
+    messages: Messages<'a>,
     stream: bool,
     #[serde(skip_serializing_if = "<[Value]>::is_empty")]
     tools: &'a [Value],
@@ -205,6 +238,7 @@ pub struct LlmClient {
     max_tokens_field: String,
     max_tokens: i64,
     send_tool_choice: bool,
+    max_retries: u32,
     url: String,
     headers: Vec<(String, String)>,
     agent: ureq::Agent,
@@ -230,40 +264,53 @@ impl LlmClient {
             headers,
             max_tokens_field: runtime.provider.max_tokens_field,
             send_tool_choice: runtime.provider.send_tool_choice,
+            max_retries: cfg.llm_max_retries,
             model: runtime.model,
             max_tokens: runtime.limits.max_output_tokens,
             agent,
         }
     }
 
-    pub fn chat(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<LlmResponse> {
+    /// `hint` is sent as a trailing user message for this request only.
+    pub fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        hint: Option<&str>,
+    ) -> Result<LlmResponse> {
         let body = serde_json::to_vec(&Request {
             model: &self.model,
-            messages,
+            messages: Messages(messages, hint.map(|h| ChatMessage::user(format!("[note] {h}")))),
             stream: false,
             tools,
             tool_choice: (self.send_tool_choice && !tools.is_empty()).then_some("auto"),
             max_tokens: BTreeMap::from([(self.max_tokens_field.as_str(), self.max_tokens)]),
         })?;
-        for attempt in 0..4u32 {
+        let mut attempt = 0u32;
+        loop {
             match self.post_once(&body) {
                 Ok(resp) => return Ok(resp),
-                Err((e, true)) if attempt < 3 => {
-                    let backoff = Duration::from_millis(800 * (1u64 << attempt));
+                Err(f) if f.retry && attempt < self.max_retries => {
+                    let wait = f.retry_after.unwrap_or_else(|| backoff(attempt));
+                    attempt += 1;
                     eprintln!(
-                        "[llm] retry {}/3 after error ({e:#}), sleeping {backoff:?}",
-                        attempt + 1
+                        "[llm] retry {attempt}/{} after error ({:#}), sleeping {wait:?}",
+                        self.max_retries, f.error
                     );
-                    std::thread::sleep(backoff);
+                    std::thread::sleep(wait);
                 }
-                Err((e, _)) => return Err(e),
+                Err(f) => return Err(f.error),
             }
         }
-        unreachable!("the final attempt always returns")
     }
 
-    /// One request; the error carries whether it is worth retrying.
-    fn post_once(&self, body: &[u8]) -> Result<LlmResponse, (anyhow::Error, bool)> {
+    /// One request; the failure says whether it is worth retrying.
+    fn post_once(&self, body: &[u8]) -> Result<LlmResponse, Failure> {
+        let fail = |error, retry| Failure {
+            error,
+            retry,
+            retry_after: None,
+        };
         let mut req = self
             .agent
             .post(&self.url)
@@ -275,19 +322,39 @@ impl LlmClient {
             Ok(r) => {
                 let text = r
                     .into_string()
-                    .map_err(|e| (anyhow!("reading llm response: {e}"), true))?;
-                parse_response(&text).map_err(|e| (e, false))
+                    .map_err(|e| fail(anyhow!("reading llm response: {e}"), true))?;
+                // A garbled 200 (truncated JSON, a proxy's HTML page) is transient.
+                parse_response(&text).map_err(|e| fail(e, true))
             }
             Err(ureq::Error::Status(code, r)) => {
+                let retry_after = r
+                    .header("retry-after")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(|s| Duration::from_secs(s.min(60)));
                 let txt = r.into_string().unwrap_or_default();
-                Err((
-                    anyhow!("HTTP {code}: {}", txt.chars().take(600).collect::<String>()),
-                    code == 429 || code >= 500,
-                ))
+                Err(Failure {
+                    error: anyhow!("HTTP {code}: {}", txt.chars().take(600).collect::<String>()),
+                    retry: matches!(code, 408 | 409 | 429) || code >= 500,
+                    retry_after,
+                })
             }
-            Err(e) => Err((anyhow!("transport error: {e}"), true)),
+            Err(e) => Err(fail(anyhow!("transport error: {e}"), true)),
         }
     }
+}
+
+struct Failure {
+    error: anyhow::Error,
+    retry: bool,
+    retry_after: Option<Duration>,
+}
+
+/// Exponential backoff capped at 30s, with up to 25% jitter.
+fn backoff(attempt: u32) -> Duration {
+    let base = 1000u64 << attempt.min(5);
+    let base = base.min(30_000);
+    let jitter = crate::storage::util::unix_millis() % (base / 4 + 1);
+    Duration::from_millis(base + jitter)
 }
 
 /// Endpoint URL for the provider kind.
@@ -439,12 +506,52 @@ mod tests {
     }
 
     #[test]
+    fn hint_is_one_trailing_user_message() {
+        let msgs = [ChatMessage::user("hi")];
+        let out = serde_json::to_value(super::Messages(
+            &msgs,
+            Some(ChatMessage::user("[note] x")),
+        ))
+        .unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 2);
+        assert_eq!(out[0]["content"], "hi");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"], "[note] x");
+    }
+
+    #[test]
+    fn messages_round_trip_through_json() {
+        let mut m = ChatMessage::assistant("a");
+        m.tool_calls.push(super::ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        });
+        let back: ChatMessage =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.role, m.role);
+        assert_eq!(back.tool_calls[0].id, "c1");
+        assert_eq!(back.tool_calls[0].arguments, "{}");
+        let t: ChatMessage = serde_json::from_str(
+            &serde_json::to_string(&ChatMessage::tool_result("c1", "ok")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(t.tool_call_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn backoff_is_capped() {
+        assert!(super::backoff(0).as_millis() >= 1000);
+        assert!(super::backoff(20).as_millis() <= 37_500);
+    }
+
+    #[test]
     fn request_body_wire_format() {
         let msgs = [ChatMessage::user("hi")];
         let body = |tools: &[serde_json::Value], choice| {
             serde_json::to_value(Request {
                 model: "m",
-                messages: &msgs,
+                messages: super::Messages(&msgs, None),
                 stream: false,
                 tools,
                 tool_choice: choice,

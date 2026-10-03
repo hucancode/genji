@@ -6,19 +6,23 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::config::{Config, ModelRuntime};
-use crate::llm::{self, ChatMessage, LlmClient, Role};
+use crate::llm::{self, ChatMessage, LlmClient, Role, ToolCall};
 use crate::socket::{Control, ControlPoll};
 use crate::storage::context::ContextComposer;
-use crate::storage::db::Db;
+use crate::storage::db::{CallRow, Db, ResumeState};
 use crate::storage::events::EventEmitter;
 use crate::storage::modes::{Mode, SHARED_PREAMBLE};
-use crate::tools;
+use crate::tools::{self, Recovery};
 
 const MAX_LLM_RETRIES: u32 = 3;
 /// Process exit code: 0 done, 1 LLM failure, 2 stopped by a limit or the user.
 pub static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 const MAX_REPEATED_CALLS: usize = 3;
+const TOOL_FAILED_HINT: &str =
+    "A tool call failed; read its error and fix the cause instead of repeating it.";
 const STOPPED_BY_USER: &str = "(stopped by user via control socket)";
+const INTERRUPTED: &str = "ERROR: interrupted — genji stopped while this tool was running; it may \
+     have partially run. Verify the current state before retrying.";
 
 pub struct Agent {
     pub cfg: Config,
@@ -38,6 +42,10 @@ pub struct Agent {
     pub control: Option<Arc<Control>>,
     pub events: EventEmitter,
     pub failed: bool,
+    /// Journal row of the tool call being dispatched.
+    pub running_call: Option<i64>,
+    /// Skills loaded into the system prompt, in load order.
+    skills: Vec<String>,
     last_call: Option<(String, String)>,
     repeats: usize,
 }
@@ -51,6 +59,8 @@ pub struct AgentParams {
     pub mode: Mode,
     pub depth: u32,
     pub task: String,
+    /// Continue this recorded instance instead of starting a new one.
+    pub resume: Option<ResumeState>,
     pub formal: bool,
     pub control: Option<Arc<Control>>,
     pub context: Arc<RwLock<ContextComposer>>,
@@ -88,6 +98,7 @@ impl Agent {
             mode,
             depth,
             task,
+            resume,
             formal,
             control,
             context,
@@ -97,14 +108,17 @@ impl Agent {
         let limits = runtime.limits;
         let llm = LlmClient::from_runtime(&cfg, runtime);
         let events = EventEmitter::new(instance_id.clone());
-        db.instance_start(
-            &instance_id,
-            mode.as_str(),
-            parent_instance.as_deref(),
-            &task,
-            &model,
-            depth,
-        )?;
+        match &resume {
+            Some(_) => db.instance_resume(&instance_id)?,
+            None => db.instance_start(
+                &instance_id,
+                mode.as_str(),
+                parent_instance.as_deref(),
+                &task,
+                &model,
+                depth,
+            )?,
+        }
         events.instance_start(
             &workspace.display().to_string(),
             mode.as_str(),
@@ -112,8 +126,12 @@ impl Agent {
             parent_instance.as_deref(),
             depth,
             &task,
+            resume.is_some(),
         );
-        Ok(Agent {
+        let (seq, tokens_used) = resume
+            .as_ref()
+            .map_or((0, 0), |r| (r.next_seq, r.tokens_used));
+        let mut agent = Agent {
             cfg,
             workspace,
             db,
@@ -121,19 +139,36 @@ impl Agent {
             mode,
             llm,
             context,
-            tokens_used: 0,
+            tokens_used,
             token_limit: limits.token_limit,
             started: Instant::now(),
             depth,
-            seq: 0,
+            seq,
             formal,
             active_plan: None,
             control,
             events,
             failed: false,
+            running_call: None,
+            skills: Vec::new(),
             last_call: None,
             repeats: 0,
-        })
+        };
+        if let Some(r) = resume {
+            {
+                let mut ctx = agent.context.write().unwrap();
+                for m in r.messages {
+                    ctx.push(m);
+                }
+            }
+            if !r.skills.is_empty() {
+                agent.skills = r.skills;
+                let system = agent.compose_system();
+                agent.context.write().unwrap().set_system(system);
+            }
+            agent.settle(r.unanswered, r.call_seq)?;
+        }
+        Ok(agent)
     }
 
     pub fn resolve_path(&self, path: &str) -> PathBuf {
@@ -144,14 +179,28 @@ impl Agent {
         crate::storage::util::relative_path(&self.workspace, path)
     }
 
-    /// The system prompt plus the active-plan section. Plan mode updates the
-    /// plan (creating it when missing); other modes follow an existing plan and
-    /// ignore a missing one.
+    /// The system prompt plus the active-plan and loaded-skills sections.
     fn compose_system(&self) -> String {
         let mut system = build_system(&self.cfg, &self.workspace, self.mode, self.formal);
-        let Some(slug) = &self.active_plan else {
-            return system;
-        };
+        if let Some(plan) = self.plan_section() {
+            system.push_str(&plan);
+        }
+        let skills: Vec<String> = self
+            .skills
+            .iter()
+            .filter_map(|name| tools::skills::render(&self.cfg, &self.workspace, name).ok())
+            .collect();
+        if !skills.is_empty() {
+            system.push_str("\n\n## Loaded skills\n\n");
+            system.push_str(&skills.join("\n\n"));
+        }
+        system
+    }
+
+    /// Plan mode updates the plan (creating it when missing); other modes
+    /// follow an existing plan and ignore a missing one.
+    fn plan_section(&self) -> Option<String> {
+        let slug = self.active_plan.as_ref()?;
         let file = self.cfg.plan_file(&self.workspace, slug);
         let path = self.display_path(&file);
         let exists = std::fs::read_to_string(&file).is_ok_and(|c| !c.trim().is_empty());
@@ -167,12 +216,11 @@ impl Agent {
                 "No plan file exists yet; create it with `plan_write` (path `{path}`) before \
                  acting, then keep it up to date."
             ),
-            (false, false) => return system,
+            (false, false) => return None,
         };
-        system.push_str(&format!(
+        Some(format!(
             "\n\n## Active plan\n\nThe user selected plan `{slug}` at `{path}`. {guidance}"
-        ));
-        system
+        ))
     }
 
     #[cfg(feature = "formal")]
@@ -206,6 +254,13 @@ impl Agent {
             }
             Role::System | Role::Tool => {}
         }
+        self.store(msg)?;
+        self.seq += 1;
+        Ok(())
+    }
+
+    /// Insert `msg` at the current seq; the caller advances `seq` once committed.
+    fn store(&self, msg: &ChatMessage) -> Result<()> {
         let tool_calls_json = if msg.tool_calls.is_empty() {
             None
         } else {
@@ -224,9 +279,7 @@ impl Agent {
             tool_calls_json.as_deref(),
             msg.tool_call_id.as_deref(),
             msg.reasoning_content.as_deref(),
-        )?;
-        self.seq += 1;
-        Ok(())
+        )
     }
 
     pub fn log(&mut self, msg: ChatMessage) -> Result<()> {
@@ -257,8 +310,10 @@ impl Agent {
 
     pub fn run_loop(&mut self) -> Result<String> {
         let mut iterations = 0usize;
-        let mut llm_retries = 0u32;
+        let mut rejects = 0u32;
         let mut overflow_retried = false;
+        // One-request nudge appended after the context; never stored.
+        let mut hint: Option<String> = None;
         loop {
             if let Some(reason) = self.budget_exceeded() {
                 eprintln!("[budget] {reason}");
@@ -290,7 +345,7 @@ impl Agent {
             self.maybe_compact(self.cfg.compact_threshold)?;
             let result = {
                 let ctx = self.context.read().unwrap();
-                self.llm.chat(ctx.messages(), ctx.tools())
+                self.llm.chat(ctx.messages(), ctx.tools(), hint.as_deref())
             };
             let resp = match result {
                 Ok(r) => r,
@@ -314,27 +369,54 @@ impl Agent {
                 resp.cached_tokens,
             );
             if resp.is_truncated() {
-                if llm_retries >= MAX_LLM_RETRIES {
+                if rejects >= MAX_LLM_RETRIES {
                     return Ok(self.fail(format!(
                         "LLM request failed: response truncated {MAX_LLM_RETRIES} times"
                     )));
                 }
-                llm_retries += 1;
+                rejects += 1;
                 let msg = format!(
-                    "LLM response truncated (finish_reason=length); retry {llm_retries}/{MAX_LLM_RETRIES}"
+                    "LLM response truncated (finish_reason=length); retry {rejects}/{MAX_LLM_RETRIES}"
                 );
                 eprintln!("[llm] {msg}");
                 self.events.error(&msg);
-                self.log(ChatMessage::assistant(resp.message.content))?;
-                self.add_user(
+                hint = Some(
                     "Your last response was cut off by the output limit. Continue with smaller \
-                     steps: split large writes into several edits.",
-                )?;
+                     steps: split large writes into several edits."
+                        .into(),
+                );
                 continue;
             }
-            llm_retries = 0;
+            if rejects < MAX_LLM_RETRIES
+                && let Some(problems) = self.malformed_calls(&resp.message.tool_calls)
+            {
+                rejects += 1;
+                let msg = format!(
+                    "malformed tool call; retry {rejects}/{MAX_LLM_RETRIES}: {problems}"
+                );
+                eprintln!("[llm] {msg}");
+                self.events.error(&msg);
+                hint = Some(format!(
+                    "Your last response was discarded because of invalid tool calls: {problems}. \
+                     Issue corrected calls."
+                ));
+                continue;
+            }
+            rejects = 0;
+            hint = None;
 
-            let assistant = resp.message;
+            let mut assistant = resp.message;
+            let (skill_calls, calls): (Vec<_>, Vec<_>) = std::mem::take(&mut assistant.tool_calls)
+                .into_iter()
+                .partition(|c| c.name == "skill_load");
+            assistant.tool_calls = calls;
+            let skill_hint = self.load_skills(&skill_calls)?;
+            if !skill_calls.is_empty() && assistant.tool_calls.is_empty() {
+                // A turn that only loads skills leaves nothing in the conversation.
+                hint = skill_hint;
+                iterations += 1;
+                continue;
+            }
             if assistant.tool_calls.is_empty() {
                 let text = if assistant.content.trim().is_empty() {
                     "(no output)".to_string()
@@ -356,7 +438,7 @@ impl Agent {
             self.log(assistant)?;
             let msg_seq = self.seq - 1;
 
-            self.execute_tool_calls(&tool_calls, msg_seq)?;
+            hint = self.execute_tool_calls(&tool_calls, msg_seq)?.or(skill_hint);
 
             iterations += 1;
             if iterations >= self.cfg.max_tool_iterations {
@@ -372,33 +454,23 @@ impl Agent {
         }
     }
 
-    fn execute_tool_calls(&mut self, calls: &[llm::ToolCall], msg_seq: i64) -> Result<()> {
+    /// Problems that make the calls unrunnable, or `None` when they are all fine.
+    fn malformed_calls(&self, calls: &[llm::ToolCall]) -> Option<String> {
+        let problems: Vec<String> = calls
+            .iter()
+            .filter_map(|c| {
+                tools::validate(self.mode, self.formal, &c.name, &c.arguments).err()
+            })
+            .collect();
+        (!problems.is_empty()).then(|| problems.join("; "))
+    }
+
+    /// Runs the calls, storing their results. Returns a hint for the next
+    /// request when something went wrong or the model is looping.
+    fn execute_tool_calls(&mut self, calls: &[ToolCall], msg_seq: i64) -> Result<Option<String>> {
+        let mut hint = None;
         for tc in calls {
-            let start = Instant::now();
-            let (result, is_error) = match serde_json::from_str::<Value>(&tc.arguments) {
-                Ok(args) => tools::dispatch(self, &tc.name, &args),
-                Err(e) => (format!("ERROR: invalid JSON tool arguments: {e}"), true),
-            };
-            let duration = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
-            self.db.tool_call_add(
-                &self.instance_id,
-                msg_seq,
-                &tc.name,
-                &tc.arguments,
-                &result,
-                is_error,
-                duration,
-            )?;
-            self.events
-                .tool_result(&tc.id, &tc.name, is_error, duration, &result);
-            if is_error {
-                eprintln!(
-                    "[tool] {}({}) -> ERROR ({}ms)",
-                    tc.name,
-                    llm::truncate(&tc.arguments, 120),
-                    duration
-                );
-            }
+            let is_error = self.run_call(tc, msg_seq)?;
             let key = (tc.name.clone(), tc.arguments.clone());
             self.repeats = if self.last_call.as_ref() == Some(&key) {
                 self.repeats + 1
@@ -406,23 +478,150 @@ impl Agent {
                 1
             };
             self.last_call = Some(key);
-            let result = if self.repeats >= MAX_REPEATED_CALLS {
-                format!(
-                    "{result}\n[the same call has now run {} times in a row; change approach]",
+            if is_error {
+                hint = Some(TOOL_FAILED_HINT.to_string());
+            }
+            if self.repeats >= MAX_REPEATED_CALLS {
+                hint = Some(format!(
+                    "The same call has now run {} times in a row; change approach.",
                     self.repeats
-                )
-            } else {
-                result
+                ));
+            }
+        }
+        Ok(hint)
+    }
+
+    /// Journal the call as started, run it, and store its result. Returns whether it failed.
+    fn run_call(&mut self, tc: &ToolCall, msg_seq: i64) -> Result<bool> {
+        let row = self
+            .db
+            .tool_call_start(&self.instance_id, msg_seq, &tc.id, &tc.name, &tc.arguments)?;
+        self.running_call = Some(row);
+        let start = Instant::now();
+        let (result, is_error) = match serde_json::from_str::<Value>(&tc.arguments) {
+            Ok(args) => tools::dispatch(self, &tc.name, &args),
+            Err(e) => (format!("ERROR: invalid JSON tool arguments: {e}"), true),
+        };
+        self.running_call = None;
+        self.finish_call(row, tc, result, is_error, start)?;
+        Ok(is_error)
+    }
+
+    /// Store the result row and its tool message in one transaction, then add it to the context.
+    fn finish_call(
+        &mut self,
+        row: i64,
+        tc: &ToolCall,
+        result: String,
+        is_error: bool,
+        start: Instant,
+    ) -> Result<()> {
+        let duration = i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let msg = ChatMessage::tool_result(&tc.id, result);
+        let tx = self.db.conn.unchecked_transaction()?;
+        self.db
+            .tool_call_finish(row, "done", &msg.content, is_error, duration)?;
+        self.store(&msg)?;
+        tx.commit()?;
+        self.seq += 1;
+        self.events
+            .tool_result(&tc.id, &tc.name, is_error, duration, &msg.content);
+        if is_error {
+            eprintln!(
+                "[tool] {}({}) -> ERROR ({}ms)",
+                tc.name,
+                llm::truncate(&tc.arguments, 120),
+                duration
+            );
+        }
+        self.context.write().unwrap().push(msg);
+        Ok(())
+    }
+
+    /// Answer the calls a stopped run left without results: run the ones that
+    /// never started, and recover the ones that were running per their tool.
+    fn settle(&mut self, unanswered: Vec<(ToolCall, Option<CallRow>)>, msg_seq: i64) -> Result<()> {
+        for (tc, row) in unanswered {
+            let Some(row) = row.filter(|r| r.status == "started") else {
+                self.run_call(&tc, msg_seq)?;
+                continue;
             };
-            self.log(ChatMessage::tool_result(&tc.id, result))?;
+            eprintln!("[resume] {} was running when genji stopped", tc.name);
+            match tools::recovery(&tc.name) {
+                Recovery::Rerun => {
+                    self.db
+                        .tool_call_finish(row.id, "interrupted", "", true, 0)?;
+                    self.run_call(&tc, msg_seq)?;
+                }
+                Recovery::Report => {
+                    self.finish_call(row.id, &tc, INTERRUPTED.to_string(), true, Instant::now())?;
+                }
+                Recovery::Reattach => {
+                    let start = Instant::now();
+                    self.running_call = Some(row.id);
+                    let (result, is_error) = match tools::spawn::reattach(self, &row) {
+                        Ok(s) => (s, false),
+                        Err(e) => (format!("ERROR: {e:#}"), true),
+                    };
+                    self.running_call = None;
+                    self.finish_call(row.id, &tc, result, is_error, start)?;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Load the requested skills into the system prompt. The calls are
+    /// journaled and emitted as events but never enter the conversation.
+    /// Returns a hint for the next request when a load failed.
+    fn load_skills(&mut self, calls: &[ToolCall]) -> Result<Option<String>> {
+        let mut errors = Vec::new();
+        let before = self.skills.len();
+        for tc in calls {
+            let loaded = serde_json::from_str::<Value>(&tc.arguments)
+                .map_err(anyhow::Error::from)
+                .and_then(|args| tools::skills::requested(&args))
+                .and_then(|name| {
+                    tools::skills::render(&self.cfg, &self.workspace, &name)?;
+                    Ok(name)
+                });
+            let (result, is_error) = match loaded {
+                Ok(name) if self.skills.contains(&name) => {
+                    (format!("skill `{name}` is already loaded"), false)
+                }
+                Ok(name) => {
+                    let text = format!("skill `{name}` loaded into the system prompt");
+                    self.skills.push(name);
+                    (text, false)
+                }
+                Err(e) => {
+                    let text = format!("ERROR: {e:#}");
+                    errors.push(text.clone());
+                    (text, true)
+                }
+            };
+            self.db.tool_call_record(
+                &self.instance_id,
+                self.seq,
+                &tc.id,
+                &tc.name,
+                &tc.arguments,
+                &result,
+                is_error,
+            )?;
+            self.events.tool_call(&tc.id, &tc.name, &tc.arguments);
+            self.events.tool_result(&tc.id, &tc.name, is_error, 0, &result);
+        }
+        if self.skills.len() > before {
+            let system = self.compose_system();
+            self.context.write().unwrap().set_system(system);
+        }
+        Ok((!errors.is_empty()).then(|| format!("skill_load failed: {}", errors.join("; "))))
     }
 
     fn fail(&mut self, msg: String) -> String {
         eprintln!("[llm] {msg}");
         self.events.error(&msg);
-        let _ = self.log(ChatMessage::assistant(&msg));
         self.failed = true;
         EXIT_CODE.store(1, Ordering::Relaxed);
         msg
@@ -473,19 +672,45 @@ impl Agent {
             threshold,
             self.cfg.compact_keep_recent,
             &self.llm,
-        )?;
+        );
+        let compacted = match compacted {
+            Ok(c) => c,
+            Err(e) if threshold > 0.0 => {
+                // Compaction is an optimisation here; keep going without it.
+                let msg = format!("compaction failed: {e:#}");
+                eprintln!("[compact] {msg}");
+                self.events.error(&msg);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let tx = self.db.conn.unchecked_transaction()?;
+        self.checkpoint()?;
+        if let Some(c) = &compacted {
+            self.db
+                .compaction_add(&self.instance_id, c.removed, c.before, c.after, &c.summary)?;
+        }
+        tx.commit()?;
         let Some(c) = compacted else {
             return Ok(());
         };
         self.record_usage(c.prompt_tokens, c.completion_tokens);
-        self.db
-            .compaction_add(&self.instance_id, c.removed, c.before, c.after, &c.summary)?;
         eprintln!(
             "[compact] removed {} messages ({} -> {} est tokens)",
             c.removed, c.before, c.after
         );
         self.events
             .compaction(c.removed, c.before, c.after, &c.summary);
+        Ok(())
+    }
+
+    /// Persist the context if pruning or compaction rewrote earlier messages.
+    fn checkpoint(&self) -> Result<()> {
+        let mut ctx = self.context.write().unwrap();
+        if ctx.take_rewritten() {
+            self.db
+                .checkpoint_add(&self.instance_id, self.seq, &ctx.messages()[1..])?;
+        }
         Ok(())
     }
 

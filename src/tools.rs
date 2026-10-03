@@ -952,14 +952,14 @@ pub mod skills {
     use anyhow::{Result, bail};
     use serde::Deserialize;
     use serde_json::Value;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::parse_args;
     use crate::agent::Agent;
     use crate::config::Config;
     use crate::storage::util::{split_frontmatter, valid_slug};
 
-    fn skill_files(cfg: &Config, workspace: &std::path::Path) -> impl Iterator<Item = PathBuf> {
+    fn skill_files(cfg: &Config, workspace: &Path) -> impl Iterator<Item = PathBuf> {
         std::fs::read_dir(cfg.skills_path(workspace))
             .into_iter()
             .flatten()
@@ -968,7 +968,7 @@ pub mod skills {
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
     }
 
-    fn names(cfg: &Config, workspace: &std::path::Path) -> Vec<String> {
+    fn names(cfg: &Config, workspace: &Path) -> Vec<String> {
         let mut names: Vec<String> = skill_files(cfg, workspace)
             .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_owned))
             .collect();
@@ -976,7 +976,7 @@ pub mod skills {
         names
     }
 
-    pub fn any(cfg: &Config, workspace: &std::path::Path) -> bool {
+    pub fn any(cfg: &Config, workspace: &Path) -> bool {
         skill_files(cfg, workspace).next().is_some()
     }
 
@@ -985,17 +985,20 @@ pub mod skills {
         name: String,
     }
 
-    pub fn load(agent: &mut Agent, args: &Value) -> Result<String> {
+    /// The skill name a `skill_load` call asks for.
+    pub fn requested(args: &Value) -> Result<String> {
         let LoadArgs { name } = parse_args(args)?;
-        let path = agent
-            .cfg
-            .skills_path(&agent.workspace)
-            .join(format!("{name}.md"));
-        let text = match valid_slug(&name).then(|| std::fs::read_to_string(&path)) {
+        Ok(name)
+    }
+
+    /// The skill's text as it appears in the system prompt.
+    pub fn render(cfg: &Config, workspace: &Path, name: &str) -> Result<String> {
+        let path = cfg.skills_path(workspace).join(format!("{name}.md"));
+        let text = match valid_slug(name).then(|| std::fs::read_to_string(&path)) {
             Some(Ok(text)) => text,
             _ => bail!(
                 "skill `{name}` not found. available: {}",
-                names(&agent.cfg, &agent.workspace).join(", ")
+                names(cfg, workspace).join(", ")
             ),
         };
         let (meta, body) = split_frontmatter(&text);
@@ -1003,9 +1006,29 @@ pub mod skills {
         Ok(format!("# Skill: {name}\n{description}\n\n{body}"))
     }
 
+    pub fn load(agent: &mut Agent, args: &Value) -> Result<String> {
+        render(&agent.cfg, &agent.workspace, &requested(args)?)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn render_formats_frontmatter_and_body() {
+            let ws = crate::storage::util::temp_dir("skills-render");
+            let cfg = Config::default();
+            let dir = cfg.skills_path(&ws);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("git.md"), "---\ndescription: use git\n---\nCommit often.\n")
+                .unwrap();
+            let text = render(&cfg, &ws, "git").unwrap();
+            assert!(text.starts_with("# Skill: git\nuse git\n\n"), "{text}");
+            assert!(text.contains("Commit often."));
+            let err = render(&cfg, &ws, "nope").unwrap_err().to_string();
+            assert!(err.contains("available: git"), "{err}");
+            let _ = std::fs::remove_dir_all(&ws);
+        }
 
         #[test]
         fn lists_markdown_files_only() {
@@ -1026,19 +1049,27 @@ pub mod spawn {
     use anyhow::{Result, bail};
     use serde::Deserialize;
     use serde_json::{Value, json};
-    use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::parse_args;
     use crate::agent::Agent;
-    use crate::storage::proc;
+    use crate::storage::db::CallRow;
     use crate::storage::util::{TempPath, tmp_file, write_file};
+    use crate::storage::{proc, registry};
 
     #[derive(Deserialize)]
     struct SpawnArgs {
         mode: String,
         instructions: String,
         task: Option<String>,
+    }
+
+    impl SpawnArgs {
+        fn label(&self) -> String {
+            self.task
+                .clone()
+                .unwrap_or_else(|| format!("subagent:{}", self.mode))
+        }
     }
 
     pub fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
@@ -1053,19 +1084,80 @@ pub mod spawn {
                 agent.cfg.max_subagent_depth
             );
         }
-        let task = a.task.unwrap_or_else(|| format!("subagent:{}", a.mode));
+        // The child's id is journaled before it starts so a resumed parent can find it.
+        let child = loop {
+            let id = registry::new_id();
+            if !agent.db.instance_exists(&id)? {
+                break id;
+            }
+        };
+        if let Some(row) = agent.running_call {
+            agent.db.tool_call_set_child(row, &child)?;
+        }
         let tmp = agent.cfg.tmp_path(&agent.workspace);
-        let exe = std::env::current_exe().unwrap_or_else(|_| "genji".into());
         let instruction_file = TempPath(tmp_file(&tmp, "subagent", "md"));
         write_file(&instruction_file.0, &a.instructions)?;
-        let cmd_args = build_subagent_args(
+        let file = instruction_file.0.to_string_lossy().into_owned();
+        run_child(
+            agent,
+            &a,
+            &["--instance-id", &child, "--instructions-file", &file],
+        )
+    }
+
+    /// The result for a spawn that was running when this agent stopped: the
+    /// child's recorded report if it finished, otherwise the child resumed.
+    pub fn reattach(agent: &mut Agent, row: &CallRow) -> Result<String> {
+        let a: SpawnArgs = parse_args(&serde_json::from_str::<Value>(&row.args)?)?;
+        let child = match row.child_instance.clone() {
+            Some(c) if agent.db.instance_exists(&c)? => c,
+            // The child never started.
+            _ => return spawn(agent, &serde_json::from_str(&row.args)?),
+        };
+        // An orphaned child may still be working; give it the usual time to finish.
+        let start = Instant::now();
+        let timeout = Duration::from_secs(agent.cfg.spawn_timeout_secs);
+        loop {
+            let Some(b) = agent.db.instance_brief(&child)? else {
+                bail!("subagent {child} disappeared from the database");
+            };
+            if b.status != "running" {
+                return Ok(result(
+                    agent,
+                    Some(&child),
+                    &a.mode,
+                    &b.status,
+                    None,
+                    false,
+                    0,
+                    &b.report.unwrap_or_default(),
+                    true,
+                ));
+            }
+            let alive = b.pid.is_some_and(proc::alive);
+            if !alive || start.elapsed() >= timeout {
+                if let Some(pid) = b.pid.filter(|_| alive) {
+                    proc::kill_group(pid);
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        run_child(agent, &a, &["--resume", &child])
+    }
+
+    /// Run a child genji to completion and turn its event stream into the tool result.
+    fn run_child(agent: &mut Agent, a: &SpawnArgs, extra: &[&str]) -> Result<String> {
+        let mut cmd_args = build_subagent_args(
             &a.mode,
             &agent.instance_id,
-            &instruction_file.0,
-            &task,
+            &a.label(),
             agent.depth,
             agent.formal,
         );
+        cmd_args.extend(extra.iter().map(|s| (*s).to_string()));
+        let tmp = agent.cfg.tmp_path(&agent.workspace);
+        let exe = std::env::current_exe().unwrap_or_else(|_| "genji".into());
         // The child's stdout is a JSONL event stream whose last line carries the
         // report, so it must be read whole; only the parsed report is bounded.
         let res = proc::run_capture(
@@ -1109,22 +1201,49 @@ pub mod spawn {
         if res.timed_out {
             status = "timed_out";
         }
-        Ok(json!({
-            "subagent_instance": sub_instance,
-            "mode": a.mode,
+        Ok(result(
+            agent,
+            sub_instance.as_deref(),
+            &a.mode,
+            status,
+            res.code,
+            res.timed_out,
+            res.duration_ms,
+            &report,
+            false,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn result(
+        agent: &Agent,
+        child: Option<&str>,
+        mode: &str,
+        status: &str,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        duration_ms: u64,
+        report: &str,
+        reattached: bool,
+    ) -> String {
+        let mut out = json!({
+            "subagent_instance": child,
+            "mode": mode,
             "status": status,
-            "exit_code": res.code,
-            "timed_out": res.timed_out,
-            "duration_ms": res.duration_ms,
-            "report": crate::llm::truncate(&report, agent.cfg.tool_result_max_bytes.saturating_sub(1024).max(4096)),
-        })
-        .to_string())
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "duration_ms": duration_ms,
+            "report": crate::llm::truncate(report, agent.cfg.tool_result_max_bytes.saturating_sub(1024).max(4096)),
+        });
+        if reattached {
+            out["reattached"] = json!(true);
+        }
+        out.to_string()
     }
 
     fn build_subagent_args(
         mode: &str,
         parent_instance: &str,
-        instructions: &Path,
         task: &str,
         depth: u32,
         formal: bool,
@@ -1134,8 +1253,6 @@ pub mod spawn {
             "--subagent",
             "--parent-instance",
             parent_instance,
-            "--instructions-file",
-            &instructions.to_string_lossy(),
             "--label",
             task,
             "--depth",
@@ -1350,18 +1467,35 @@ enum Gate {
     Skills,
 }
 
+/// What a resumed run does with a call that was running when genji stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recovery {
+    /// Safe to run again: reads, or writes that leave the same state.
+    Rerun,
+    /// Tell the model it was interrupted and may have partially run.
+    Report,
+    /// Collect or resume the subagent it started.
+    Reattach,
+}
+
 struct Tool {
     name: &'static str,
     description: &'static str,
     parameters: Value,
     modes: &'static [Mode],
     gate: Gate,
+    recovery: Recovery,
     handler: fn(&mut Agent, &Value) -> Result<String>,
 }
 
 impl Tool {
     fn gate(mut self, gate: Gate) -> Self {
         self.gate = gate;
+        self
+    }
+
+    fn recovery(mut self, recovery: Recovery) -> Self {
+        self.recovery = recovery;
         self
     }
 
@@ -1406,6 +1540,7 @@ fn tool(
         parameters,
         modes,
         gate: Gate::None,
+        recovery: Recovery::Report,
         handler,
     }
 }
@@ -1422,12 +1557,12 @@ fn registry() -> &'static [Tool] {
                     "limit":{"type":"integer","description":"Max lines to read (default 2000)"}
                 },
                 "required":["path"]
-            }), basic::read),
+            }), basic::read).recovery(Recovery::Rerun),
             tool("write", ALL_MODES, "Create or overwrite a file, creating parent directories.", json!({
                 "type":"object",
                 "properties":{"path":{"type":"string"},"content":{"type":"string"}},
                 "required":["path","content"]
-            }), basic::write),
+            }), basic::write).recovery(Recovery::Rerun),
             tool("edit", ALL_MODES, "Apply precise text replacements to a file. Each oldText must match uniquely.", json!({
                 "type":"object",
                 "properties":{
@@ -1448,7 +1583,7 @@ fn registry() -> &'static [Tool] {
                     "max_depth":{"type":"integer","description":"Recursion depth; Default = 0 = lists only immediate children"},
                     "show_hidden":{"type":"boolean","description":"default false"}
                 }
-            }), basic::ls),
+            }), basic::ls).recovery(Recovery::Rerun),
             tool("bash", ALL_MODES, "Run a shell command via bash -c in the workspace. Returns exit code, stdout, stderr.", json!({
                 "type":"object",
                 "properties":{
@@ -1466,7 +1601,7 @@ fn registry() -> &'static [Tool] {
                     "path":{"type":"string","description":"Optional explicit path (default: plans_dir/<title-slug>.md)"}
                 },
                 "required":["title","content"]
-            }), plans::write),
+            }), plans::write).recovery(Recovery::Rerun),
             #[cfg(feature = "formal")]
             tool("ticket_create", PLAN, "Create a work ticket.", json!({
                 "type":"object",
@@ -1487,7 +1622,7 @@ fn registry() -> &'static [Tool] {
                     "status":{"type":"string","enum":["open","in_progress","resolved","closed"]},
                     "requirement_id":{"type":"integer"}
                 }
-            }), tickets::read).gate(Gate::Formal),
+            }), tickets::read).gate(Gate::Formal).recovery(Recovery::Rerun),
             #[cfg(feature = "formal")]
             tool("ticket_claim", PLAN_BUILD, "Claim the next open ticket (highest priority) or a specific ticket, marking it in_progress.", json!({
                 "type":"object",
@@ -1536,14 +1671,14 @@ fn registry() -> &'static [Tool] {
                     "level":{"type":"string","enum":["stakeholder","system"]},
                     "status":{"type":"string","enum":["active","met"]}
                 }
-            }), requirements::read).gate(Gate::Formal),
+            }), requirements::read).gate(Gate::Formal).recovery(Recovery::Rerun),
             #[cfg(feature = "formal")]
             tool("requirement_tree", PLAN_BUILD, "Show the requirement hierarchy with ticket coverage per requirement.", json!({
                 "type":"object",
                 "properties":{
                     "status":{"type":"string","enum":["active","met"],"description":"Only show requirements with this status"}
                 }
-            }), requirements::tree).gate(Gate::Formal),
+            }), requirements::tree).gate(Gate::Formal).recovery(Recovery::Rerun),
             #[cfg(feature = "formal")]
             tool("requirement_update", PLAN, "Update a requirement's title/body/status/level/parent.", json!({
                 "type":"object",
@@ -1576,7 +1711,7 @@ fn registry() -> &'static [Tool] {
                 "type":"object",
                 "properties":{"name":{"type":"string"}},
                 "required":["name"]
-            }), skills::load).gate(Gate::Skills),
+            }), skills::load).gate(Gate::Skills).recovery(Recovery::Rerun),
             tool("spawn", PLAN_BUILD_EXPLORE, "Spawn a subagent in a given mode that only reports back.", json!({
                 "type":"object",
                 "properties":{
@@ -1585,14 +1720,14 @@ fn registry() -> &'static [Tool] {
                     "task":{"type":"string","description":"Optional task label"}
                 },
                 "required":["mode","instructions"]
-            }), spawn::spawn),
+            }), spawn::spawn).recovery(Recovery::Reattach),
             tool("query_instances", RETRO, "List past agent instances.", json!({
                 "type":"object",
                 "properties":{
                     "mode":{"type":"string"},
                     "limit":{"type":"integer","description":"Default 20"}
                 }
-            }), retro::instances),
+            }), retro::instances).recovery(Recovery::Rerun),
             tool("query_messages", RETRO, "Read recorded messages (latest N, oldest first). Filter by instance_id to read one conversation; add role/search to narrow.", json!({
                 "type":"object",
                 "properties":{
@@ -1601,7 +1736,7 @@ fn registry() -> &'static [Tool] {
                     "search":{"type":"string"},
                     "limit":{"type":"integer","description":"Default 50, max 2000"}
                 }
-            }), retro::messages),
+            }), retro::messages).recovery(Recovery::Rerun),
             tool("query_tool_calls", RETRO, "Query recorded tool calls (filter by name/errors/instance).", json!({
                 "type":"object",
                 "properties":{
@@ -1610,10 +1745,10 @@ fn registry() -> &'static [Tool] {
                     "errors_only":{"type":"boolean"},
                     "limit":{"type":"integer","description":"Default 50"}
                 }
-            }), retro::tool_calls),
+            }), retro::tool_calls).recovery(Recovery::Rerun),
             tool("query_stats", RETRO, "Aggregate stats: tool usage, error rates, skill loads, token usage.", json!({
                 "type":"object","properties":{}
-            }), retro::stats),
+            }), retro::stats).recovery(Recovery::Rerun),
         ]
     })
 }
@@ -1626,16 +1761,54 @@ pub fn specs_for(mode: Mode, formal: bool, has_skills: bool) -> Vec<Value> {
         .collect()
 }
 
-fn run_tool(agent: &mut Agent, name: &str, args: &Value) -> Result<String> {
+/// How to recover an interrupted call to `name`; unknown tools are reported.
+pub fn recovery(name: &str) -> Recovery {
+    registry()
+        .iter()
+        .find(|t| t.name == name)
+        .map_or(Recovery::Report, |t| t.recovery)
+}
+
+fn lookup(name: &str, mode: Mode, formal: bool) -> Result<&'static Tool> {
     let t = registry()
         .iter()
         .find(|t| t.name == name)
         .ok_or_else(|| anyhow!("unknown tool `{name}`"))?;
     // `skill_load` reports missing skills itself, so skills are not re-scanned here.
-    if !t.available(agent.mode, agent.formal, true) {
+    if !t.available(mode, formal, true) {
         bail!("tool `{name}` is unavailable in the current mode");
     }
-    (t.handler)(agent, args)
+    Ok(t)
+}
+
+fn run_tool(agent: &mut Agent, name: &str, args: &Value) -> Result<String> {
+    (lookup(name, agent.mode, agent.formal)?.handler)(agent, args)
+}
+
+/// Checks a model-issued call without running it: the tool exists in this mode,
+/// the arguments are a JSON object, and every required field is present.
+pub fn validate(mode: Mode, formal: bool, name: &str, arguments: &str) -> Result<(), String> {
+    let t = lookup(name, mode, formal).map_err(|e| format!("{e:#}"))?;
+    let args: Value = serde_json::from_str(arguments)
+        .map_err(|e| format!("call `{name}`: arguments are not valid JSON ({e})"))?;
+    let Some(obj) = args.as_object() else {
+        return Err(format!("call `{name}`: arguments must be a JSON object"));
+    };
+    let missing: Vec<&str> = t.parameters["required"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|k| !obj.contains_key(*k))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "call `{name}`: missing required field(s) {}",
+            missing.join(", ")
+        ))
+    }
 }
 
 pub fn dispatch(agent: &mut Agent, name: &str, args: &Value) -> (String, bool) {
@@ -1682,10 +1855,20 @@ pub fn parse_args<'a, T: Deserialize<'a>>(args: &'a Value) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_result, specs_for};
+    use super::{bounded_result, specs_for, validate};
     use crate::config::Config;
     use crate::storage::modes::Mode;
     use crate::storage::util::temp_dir as temp_workspace;
+
+    #[test]
+    fn validate_rejects_malformed_calls() {
+        let v = |name, args| validate(Mode::Build, false, name, args);
+        assert!(v("read", r#"{"path":"a"}"#).is_ok());
+        assert!(v("read", "{oops").unwrap_err().contains("not valid JSON"));
+        assert!(v("read", "[]").unwrap_err().contains("JSON object"));
+        assert!(v("read", "{}").unwrap_err().contains("path"));
+        assert!(v("nope", "{}").unwrap_err().contains("unknown tool"));
+    }
 
     #[test]
     fn small_results_are_returned_verbatim() {
@@ -1753,6 +1936,18 @@ mod tests {
         assert!(!formal.available(Mode::Plan, false, true));
         assert!(formal.available(Mode::Plan, true, false));
         assert!(!formal.available(Mode::Build, true, true));
+    }
+
+    #[test]
+    fn only_safe_tools_rerun_after_interruption() {
+        use super::{Recovery, recovery};
+        for name in ["read", "ls", "write", "plan_write", "query_stats"] {
+            assert_eq!(recovery(name), Recovery::Rerun, "{name}");
+        }
+        for name in ["bash", "edit", "nope"] {
+            assert_eq!(recovery(name), Recovery::Report, "{name}");
+        }
+        assert_eq!(recovery("spawn"), Recovery::Reattach);
     }
 
     fn is_ticket_or_requirement(name: &str) -> bool {

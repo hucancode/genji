@@ -37,6 +37,9 @@ struct Cli {
     /// Continue from the recorded conversation of an earlier instance (id or prefix).
     #[arg(long, global = true)]
     resume: Option<String>,
+    /// Id for a new run (set by a parent spawning a subagent).
+    #[arg(long, hide = true, global = true)]
+    instance_id: Option<String>,
     #[arg(long, default_value = "", global = true)]
     label: String,
     #[arg(long, default_value_t = 0, hide = true, global = true)]
@@ -252,7 +255,9 @@ fn run_single(params: AgentParams, quiet: bool) -> Result<String> {
             llm::truncate(&task, 120)
         );
     }
-    agent.add_user(&task)?;
+    if !task.is_empty() {
+        agent.add_user(&task)?;
+    }
     let report = agent.run_loop()?;
     agent.finish(agent.status(), &report)?;
     Ok(report)
@@ -272,7 +277,9 @@ fn run_cycle(params: AgentParams, quiet: bool) -> Result<String> {
             agent.instance_id
         );
     }
-    agent.add_user(&task)?;
+    if !task.is_empty() {
+        agent.add_user(&task)?;
+    }
 
     let mut last_report = String::new();
     for cycle in 0..max_cycles {
@@ -708,13 +715,30 @@ fn main() -> Result<()> {
         .as_ref()
         .and_then(Command::mode)
         .unwrap_or((Mode::Build, cli.task.as_deref()));
-    let explicit_task = read_task(cli.instructions_file.as_deref(), task_arg)?.or_else(|| {
-        cli.resume
-            .as_ref()
-            .map(|_| "Continue from where you left off.".to_string())
-    });
+    let explicit_task = read_task(cli.instructions_file.as_deref(), task_arg)?;
     let quiet = cli.quiet_startup || cli.subagent;
-    let instance_id = registry::new_id();
+    let resume = cli
+        .resume
+        .as_deref()
+        .map(|prefix| db.resume_state(prefix))
+        .transpose()?;
+    if let Some(r) = &resume
+        && registry::find(&r.id).is_ok()
+    {
+        bail!("instance {} is still running; stop it before resuming", r.id);
+    }
+    // Resuming keeps the recorded mode unless a subcommand picked one.
+    let start_mode = match &resume {
+        Some(r) if cli.command.as_ref().and_then(Command::mode).is_none() => {
+            r.mode.parse().unwrap_or(start_mode)
+        }
+        _ => start_mode,
+    };
+    let instance_id = match (&resume, &cli.instance_id) {
+        (Some(r), _) => r.id.clone(),
+        (None, Some(id)) => id.clone(),
+        (None, None) => registry::new_id(),
+    };
     let runtime = cfg.runtime_for_mode(start_mode)?;
     if !quiet {
         eprintln!(
@@ -729,13 +753,6 @@ fn main() -> Result<()> {
         formal,
         runtime.limits.context_window,
     );
-
-    if let Some(prev) = &cli.resume {
-        let mut ctx = context.write().unwrap();
-        for msg in db.history(prev)? {
-            ctx.push(msg);
-        }
-    }
 
     // Top-level runs open a control socket so instructions can be injected
     // mid-run; subagents never do. Controllable runs also register themselves so
@@ -756,6 +773,18 @@ fn main() -> Result<()> {
 
     let task = if let Some(t) = explicit_task {
         t
+    } else if let Some(r) = &resume {
+        // Pick up exactly where the transcript ends; only a finished assistant
+        // turn needs a nudge, otherwise the stored prefix is sent as is.
+        let ends_with_answer = r.unanswered.is_empty()
+            && r.messages
+                .last()
+                .is_some_and(|m| m.role == llm::Role::Assistant && m.tool_calls.is_empty());
+        if ends_with_answer {
+            "Continue from where you left off.".to_string()
+        } else {
+            String::new()
+        }
     } else {
         if has_active_requirements(&cfg, &workspace, formal)? {
             DEFAULT_TASK.to_string()
@@ -784,6 +813,7 @@ fn main() -> Result<()> {
         mode: start_mode,
         depth: cli.depth,
         task,
+        resume,
         formal,
         control,
         context,

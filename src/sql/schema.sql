@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS instances (
   tokens_used INTEGER NOT NULL DEFAULT 0,
   started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   ended_at TEXT,
-  report TEXT
+  report TEXT,
+  pid INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -41,11 +42,15 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   instance_id TEXT NOT NULL,
   message_seq INTEGER NOT NULL DEFAULT 0,
+  call_id TEXT,
   name TEXT NOT NULL,
   args TEXT NOT NULL DEFAULT '',
   result TEXT NOT NULL DEFAULT '',
   is_error INTEGER NOT NULL DEFAULT 0,
   duration_ms INTEGER NOT NULL DEFAULT 0,
+  -- started | done | interrupted
+  status TEXT NOT NULL DEFAULT 'done',
+  child_instance TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_toolcalls_instance ON tool_calls(instance_id);
@@ -60,3 +65,12 @@ CREATE TABLE IF NOT EXISTS compactions (
   summary TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+CREATE TABLE IF NOT EXISTS context_checkpoints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  instance_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  messages TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_instance ON context_checkpoints(instance_id, id);

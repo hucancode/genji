@@ -16,6 +16,7 @@
 | `bash_timeout_secs` | `120` | Default `bash` timeout |
 | `spawn_timeout_secs` | `900` | Subagent timeout |
 | `max_tool_iterations` | `80` | Max tool rounds per mode run |
+| `llm_max_retries` | `6` | Retries per model request on transport errors, 408/409/429/5xx and unparseable responses (exponential backoff, honors `Retry-After`) |
 | `max_cycles` | `30` | Max plan/build cycles |
 | `max_subagent_depth` | `2` | Subagent nesting limit |
 | `db_path` | `.genji/genji.db` | SQLite database |

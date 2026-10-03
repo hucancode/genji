@@ -36,7 +36,7 @@ Event types:
 
 | `type` | fields | emitted when |
 | --- | --- | --- |
-| `instance_start` | `mode`, `model`, `parent`, `depth`, `task` | a run begins |
+| `instance_start` | `mode`, `model`, `parent`, `depth`, `task`, `resumed` | a run begins |
 | `user` | `content` | task or injected instruction is queued |
 | `cycle` | `cycle`, `max`, `mode`, `active_requirements` | each auto-cycle iteration |
 | `mode` | `mode`, `model` | the active mode/model changes |
@@ -49,7 +49,9 @@ Event types:
 | `error` | `message` | recoverable/terminal problems (budget, LLM, loop limit) |
 | `instance_end` | `status`, `tokens_used`, `report` | the run ends |
 
-`tool_call.id` lets a UI pair a request with its `tool_result`.
+`tool_call.id` lets a UI pair a request with its `tool_result`. `skill_load`
+calls produce both events, but they have no `assistant` message and are not part
+of the conversation (see [Skills](skills.md)).
 
 ## Agent-to-agent communication
 
@@ -57,7 +59,8 @@ Subagents speak the machine form. The `spawn` tool runs a child genji and
 reads its JSONL event stream, keeping only its identity (`instance_start`) and
 its final `instance_end`. The tool result is a JSON object with
 `subagent_instance`, `mode`, `status`, `exit_code`, `timed_out`, `duration_ms`
-and the subagent's `report`.
+and the subagent's `report`. A resumed parent that collects a finished child's
+recorded report adds `"reattached": true` (with `exit_code: null`).
 
 Subagent events are **not** relayed into the parent's stdout stream, so the
 parent's stream stays a faithful record of that one agent. Every run records its

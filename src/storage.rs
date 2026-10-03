@@ -71,6 +71,8 @@ pub mod context {
         last_prompt_tokens: i64,
         /// Message count when `last_prompt_tokens` was measured.
         prompt_len: usize,
+        /// Set when pruning or compaction rewrote earlier messages.
+        rewritten: bool,
     }
 
     impl ContextComposer {
@@ -81,7 +83,13 @@ pub mod context {
                 context_window,
                 last_prompt_tokens: 0,
                 prompt_len: 0,
+                rewritten: false,
             }
+        }
+
+        /// Whether earlier messages were rewritten since the last call; clears the flag.
+        pub fn take_rewritten(&mut self) -> bool {
+            std::mem::take(&mut self.rewritten)
         }
 
         pub fn messages(&self) -> &[ChatMessage] {
@@ -141,6 +149,7 @@ pub mod context {
                 return Ok(None);
             }
             if self.prune_old_results(keep) {
+                self.rewritten = true;
                 self.last_prompt_tokens = 0;
                 self.prompt_len = 0;
                 if llm::estimate_messages(&self.messages) < threshold {
@@ -188,7 +197,7 @@ pub mod context {
                     "Summarize this conversation segment:\n\n{rendered}"
                 )),
             ];
-            let resp = llm.chat(&summary_req, &[])?;
+            let resp = llm.chat(&summary_req, &[], None)?;
             let summary = resp.message.content.trim().to_string();
 
             let recent = self.messages.split_off(split);
@@ -197,6 +206,7 @@ pub mod context {
                 "[compacted summary of earlier conversation]\n{summary}"
             )));
             self.messages.extend(recent);
+            self.rewritten = true;
             self.last_prompt_tokens = 0;
             self.prompt_len = 0;
             Ok(Some(Compaction {
@@ -290,11 +300,71 @@ pub mod context {
 }
 pub mod db {
     use anyhow::{Context, Result};
-    use rusqlite::{Connection, params};
+    use rusqlite::{Connection, OptionalExtension, params};
     use serde_json::{Value, json};
     use std::path::Path;
 
     use crate::llm::{ChatMessage, Role, ToolCall};
+
+    pub struct ResumeState {
+        pub id: String,
+        pub mode: String,
+        pub tokens_used: i64,
+        /// Seq for the next stored message.
+        pub next_seq: i64,
+        pub messages: Vec<ChatMessage>,
+        /// Seq of the last assistant message that called tools.
+        pub call_seq: i64,
+        /// That message's calls with no result, each with its journal row if it started.
+        pub unanswered: Vec<(ToolCall, Option<CallRow>)>,
+        /// Skills loaded so far, in load order.
+        pub skills: Vec<String>,
+    }
+
+    /// A `tool_calls` journal row.
+    #[derive(Debug, Clone)]
+    pub struct CallRow {
+        pub id: i64,
+        pub status: String,
+        pub args: String,
+        pub child_instance: Option<String>,
+    }
+
+    /// What a resuming parent needs to know about a subagent.
+    pub struct InstanceBrief {
+        pub status: String,
+        pub report: Option<String>,
+        pub pid: Option<u32>,
+    }
+
+    /// The last assistant turn's tool calls that have no result.
+    fn unanswered_calls(messages: &[ChatMessage]) -> Vec<ToolCall> {
+        let Some(last) = messages.iter().rposition(|m| !m.tool_calls.is_empty()) else {
+            return Vec::new();
+        };
+        let answered: Vec<&str> = messages[last + 1..]
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        messages[last]
+            .tool_calls
+            .iter()
+            .filter(|c| !answered.contains(&c.id.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Add `col` to `table` when an older database lacks it.
+    fn add_column(conn: &Connection, table: &str, col: &str, decl: &str) -> Result<()> {
+        let exists = conn
+            .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name=?"))?
+            .exists(params![col])?;
+        if !exists {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"))?;
+        }
+        Ok(())
+    }
 
     const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 
@@ -314,6 +384,13 @@ pub mod db {
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
             )?;
             conn.execute_batch(include_str!("sql/schema.sql"))?;
+            add_column(&conn, "instances", "pid", "INTEGER")?;
+            add_column(&conn, "tool_calls", "call_id", "TEXT")?;
+            add_column(&conn, "tool_calls", "status", "TEXT NOT NULL DEFAULT 'done'")?;
+            add_column(&conn, "tool_calls", "child_instance", "TEXT")?;
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_toolcalls_call ON tool_calls(instance_id, message_seq, call_id);",
+            )?;
             Ok(Db { conn })
         }
 
@@ -327,8 +404,8 @@ pub mod db {
             depth: u32,
         ) -> Result<()> {
             self.conn.execute(
-                "INSERT INTO instances(id,mode,parent_instance,task,model,depth,status) VALUES(?,?,?,?,?,?,'running')",
-                params![id, mode, parent, task, model, i64::from(depth)],
+                "INSERT INTO instances(id,mode,parent_instance,task,model,depth,status,pid) VALUES(?,?,?,?,?,?,'running',?)",
+                params![id, mode, parent, task, model, i64::from(depth), std::process::id()],
             )?;
             Ok(())
         }
@@ -364,27 +441,44 @@ pub mod db {
             Ok(())
         }
 
-        /// Summary of the single instance whose id starts with `prefix`.
-        /// The recorded conversation of the instance matching `prefix`, minus the
-        /// system prompt. A tail whose tool calls never got results is dropped,
-        /// since the API rejects it.
-        pub fn history(&self, prefix: &str) -> Result<Vec<ChatMessage>> {
-            let id = self.instance_summary(prefix)?["id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
+        /// Everything needed to continue the instance matching `prefix`: the
+        /// exact message list it last sent (latest checkpoint plus the rows
+        /// recorded after it, system prompt excluded). Tool calls that never got
+        /// a result get an error result, since the API rejects an unanswered call.
+        pub fn resume_state(&self, prefix: &str) -> Result<ResumeState> {
+            let summary = self.instance_summary(prefix)?;
+            let id = summary["id"].as_str().unwrap_or_default().to_string();
+            let checkpoint: Option<(i64, String)> = self
+                .conn
+                .query_row(
+                    "SELECT seq,messages FROM context_checkpoints WHERE instance_id=? ORDER BY id DESC LIMIT 1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let (from_seq, mut messages) = match checkpoint {
+                Some((seq, json)) => (
+                    seq,
+                    serde_json::from_str::<Vec<ChatMessage>>(&json)
+                        .context("parsing context checkpoint")?,
+                ),
+                None => (0, Vec::new()),
+            };
             let mut stmt = self.conn.prepare(
-                "SELECT role,content,tool_calls,tool_call_id,reasoning FROM messages
-                 WHERE instance_id=? AND role!='system' ORDER BY seq",
+                "SELECT role,content,tool_calls,tool_call_id,reasoning,seq FROM messages
+                 WHERE instance_id=? AND role!='system' AND seq>=? ORDER BY seq",
             )?;
-            let mut out: Vec<ChatMessage> = stmt
-                .query_map(params![id], |r| {
-                    let calls: Vec<Value> = r
-                        .get::<_, Option<String>>(2)?
-                        .and_then(|j| serde_json::from_str(&j).ok())
-                        .unwrap_or_default();
-                    let text = |v: &Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
-                    Ok(ChatMessage {
+            let mut next_seq = from_seq;
+            let mut call_seq = from_seq - 1;
+            let rows = stmt.query_map(params![id, from_seq], |r| {
+                let calls: Vec<Value> = r
+                    .get::<_, Option<String>>(2)?
+                    .and_then(|j| serde_json::from_str(&j).ok())
+                    .unwrap_or_default();
+                let text = |v: &Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
+                Ok((
+                    r.get::<_, i64>(5)?,
+                    ChatMessage {
                         role: r.get::<_, String>(0)?.parse().unwrap_or_default(),
                         content: r.get(1)?,
                         tool_calls: calls
@@ -397,18 +491,68 @@ pub mod db {
                             .collect(),
                         tool_call_id: r.get(3)?,
                         reasoning_content: r.get(4)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            let dangling = (0..out.len()).find(|&i| {
-                let n = out[i].tool_calls.len();
-                n > 0
-                    && !out
-                        .get(i + 1..i + 1 + n)
-                        .is_some_and(|r| r.len() == n && r.iter().all(|m| m.role == Role::Tool))
-            });
-            out.truncate(dangling.unwrap_or(out.len()));
-            Ok(out)
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (seq, msg) = row?;
+                next_seq = next_seq.max(seq + 1);
+                if !msg.tool_calls.is_empty() {
+                    call_seq = seq;
+                }
+                messages.push(msg);
+            }
+            // Seq counts every stored row, including the system message at 0.
+            let next_seq = next_seq.max(
+                self.conn.query_row(
+                    "SELECT COALESCE(MAX(seq)+1,0) FROM messages WHERE instance_id=?",
+                    params![id],
+                    |r| r.get(0),
+                )?,
+            );
+            let mut unanswered = Vec::new();
+            for call in unanswered_calls(&messages) {
+                let row = self.call_row(&id, call_seq, &call.id)?;
+                unanswered.push((call, row));
+            }
+            let skills = self
+                .conn
+                .prepare(
+                    "SELECT json_extract(args,'$.name') AS skill FROM tool_calls
+                     WHERE instance_id=? AND name='skill_load' AND is_error=0
+                     GROUP BY skill ORDER BY MIN(id)",
+                )?
+                .query_map(params![id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(ResumeState {
+                id,
+                mode: summary["mode"].as_str().unwrap_or_default().to_string(),
+                tokens_used: summary["tokens_used"].as_i64().unwrap_or(0),
+                next_seq,
+                messages,
+                call_seq,
+                unanswered,
+                skills,
+            })
+        }
+
+        /// Record the full rewritten message list (system prompt excluded) so a
+        /// resume restores exactly what the model last saw.
+        pub fn checkpoint_add(&self, instance_id: &str, seq: i64, messages: &[ChatMessage]) -> Result<()> {
+            self.conn.execute(
+                "INSERT INTO context_checkpoints(instance_id,seq,messages) VALUES(?,?,?)",
+                params![instance_id, seq, serde_json::to_string(messages)?],
+            )?;
+            Ok(())
+        }
+
+        /// Mark a previously ended instance as running again.
+        pub fn instance_resume(&self, id: &str) -> Result<()> {
+            self.conn.execute(
+                "UPDATE instances SET status='running', ended_at=NULL, report=NULL, pid=? WHERE id=?",
+                params![std::process::id(), id],
+            )?;
+            Ok(())
         }
 
         pub fn instance_summary(&self, prefix: &str) -> Result<Value> {
@@ -462,23 +606,109 @@ pub mod db {
             Ok(())
         }
 
-        #[allow(clippy::too_many_arguments)]
-        pub fn tool_call_add(
+        /// Journal a tool call before it runs; returns the row id.
+        pub fn tool_call_start(
             &self,
             instance_id: &str,
             message_seq: i64,
+            call_id: &str,
             name: &str,
             args: &str,
+        ) -> Result<i64> {
+            self.conn
+                .prepare_cached(
+                    "INSERT INTO tool_calls(instance_id,message_seq,call_id,name,args,status) VALUES(?,?,?,?,?,'started')",
+                )?
+                .execute(params![instance_id, message_seq, call_id, name, args])?;
+            Ok(self.conn.last_insert_rowid())
+        }
+
+        pub fn tool_call_finish(
+            &self,
+            row: i64,
+            status: &str,
             result: &str,
             is_error: bool,
             duration_ms: i64,
         ) -> Result<()> {
             self.conn
                 .prepare_cached(
-                    "INSERT INTO tool_calls(instance_id,message_seq,name,args,result,is_error,duration_ms) VALUES(?,?,?,?,?,?,?)",
+                    "UPDATE tool_calls SET status=?,result=?,is_error=?,duration_ms=? WHERE id=?",
                 )?
-                .execute(params![instance_id, message_seq, name, args, result, i64::from(is_error), duration_ms])?;
+                .execute(params![status, result, i64::from(is_error), duration_ms, row])?;
             Ok(())
+        }
+
+        /// Journal a call that completes immediately (no conversation counterpart).
+        #[allow(clippy::too_many_arguments)]
+        pub fn tool_call_record(
+            &self,
+            instance_id: &str,
+            message_seq: i64,
+            call_id: &str,
+            name: &str,
+            args: &str,
+            result: &str,
+            is_error: bool,
+        ) -> Result<()> {
+            self.conn
+                .prepare_cached(
+                    "INSERT INTO tool_calls(instance_id,message_seq,call_id,name,args,result,is_error,status) VALUES(?,?,?,?,?,?,?,'done')",
+                )?
+                .execute(params![instance_id, message_seq, call_id, name, args, result, i64::from(is_error)])?;
+            Ok(())
+        }
+
+        pub fn tool_call_set_child(&self, row: i64, child: &str) -> Result<()> {
+            self.conn.execute(
+                "UPDATE tool_calls SET child_instance=? WHERE id=?",
+                params![child, row],
+            )?;
+            Ok(())
+        }
+
+        fn call_row(&self, instance_id: &str, message_seq: i64, call_id: &str) -> Result<Option<CallRow>> {
+            Ok(self
+                .conn
+                .query_row(
+                    "SELECT id,status,args,child_instance FROM tool_calls
+                     WHERE instance_id=? AND message_seq=? AND call_id=? ORDER BY id DESC LIMIT 1",
+                    params![instance_id, message_seq, call_id],
+                    |r| {
+                        Ok(CallRow {
+                            id: r.get(0)?,
+                            status: r.get(1)?,
+                            args: r.get(2)?,
+                            child_instance: r.get(3)?,
+                        })
+                    },
+                )
+                .optional()?)
+        }
+
+        pub fn instance_exists(&self, id: &str) -> Result<bool> {
+            Ok(self
+                .conn
+                .query_row("SELECT 1 FROM instances WHERE id=?", params![id], |_| Ok(()))
+                .optional()?
+                .is_some())
+        }
+
+        pub fn instance_brief(&self, id: &str) -> Result<Option<InstanceBrief>> {
+            Ok(self
+                .conn
+                .query_row(
+                    "SELECT status,report,pid FROM instances WHERE id=?",
+                    params![id],
+                    |r| {
+                        Ok(InstanceBrief {
+                            status: r.get(0)?,
+                            report: r.get(1)?,
+                            pid: r.get(2)?,
+                        })
+                    },
+                )
+                .optional()?)
         }
 
         #[cfg(feature = "formal")]
@@ -550,6 +780,7 @@ pub mod events {
                 let _ = out.flush();
             }
         }
+        #[allow(clippy::too_many_arguments)]
         pub fn instance_start(
             &self,
             workspace: &str,
@@ -558,9 +789,11 @@ pub mod events {
             parent: Option<&str>,
             depth: u32,
             task: &str,
+            resumed: bool,
         ) {
             self.emit(json!({
                 "type": "instance_start",
+                "resumed": resumed,
                 "workspace": workspace,
                 "mode": mode,
                 "model": model,
@@ -805,6 +1038,23 @@ pub mod proc {
         out
     }
 
+    /// Whether a process with this pid exists.
+    pub fn alive(pid: u32) -> bool {
+        Command::new("bash")
+            .args(["-c", &format!("kill -0 {pid}")])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// SIGKILL the process group led by `pid`.
+    pub fn kill_group(pid: u32) {
+        let _ = Command::new("bash")
+            .args(["-c", &format!("kill -KILL -- -{pid}")])
+            .stderr(Stdio::null())
+            .status();
+    }
+
     /// Run `program`, capturing at most `max_read_bytes` of each output stream.
     pub fn run_capture(
         program: &str,
@@ -838,9 +1088,7 @@ pub mod proc {
             }
             if start.elapsed() >= timeout {
                 // Kill the whole group so grandchildren do not outlive the timeout.
-                let _ = Command::new("bash")
-                    .args(["-c", &format!("kill -KILL -- -{}", child.id())])
-                    .status();
+                kill_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 timed_out = true;
@@ -864,12 +1112,12 @@ mod history_tests {
     use crate::llm::Role;
 
     #[test]
-    fn history_round_trips_and_drops_dangling_tool_calls() {
+    fn resume_rebuilds_checkpoint_and_reports_unanswered_calls() {
         let ws = super::util::temp_dir("history");
         let db = Db::open(&ws.join("t.db")).unwrap();
         db.instance_start("abc123", "build", None, "task", "m", 0)
             .unwrap();
-        let calls = r#"[{"id":"c1","name":"read","arguments":"{}"}]"#;
+        let calls = r#"[{"id":"c1","name":"read","arguments":"{}"},{"id":"c2","name":"read","arguments":"{}"}]"#;
         let add = |seq, role, content, calls, id| {
             db.message_add("abc123", seq, role, content, calls, id, None)
                 .unwrap();
@@ -878,13 +1126,117 @@ mod history_tests {
         add(1, "user", "hi", None, None);
         add(2, "assistant", "", Some(calls), None);
         add(3, "tool", "ok", None, Some("c1"));
-        add(4, "assistant", "", Some(calls), None);
-        let h = db.history("abc").unwrap();
-        let roles: Vec<Role> = h.iter().map(|m| m.role).collect();
+        let r = db.resume_state("abc").unwrap();
+        let roles: Vec<Role> = r.messages.iter().map(|m| m.role).collect();
         assert_eq!(roles, [Role::User, Role::Assistant, Role::Tool]);
-        assert_eq!(h[1].tool_calls[0].name, "read");
-        assert_eq!(h[2].tool_call_id.as_deref(), Some("c1"));
-        assert!(db.history("zzz").is_err());
+        assert_eq!(r.next_seq, 4);
+        assert_eq!(r.call_seq, 2);
+        assert_eq!(r.unanswered.len(), 1);
+        assert_eq!(r.unanswered[0].0.id, "c2");
+        assert!(r.unanswered[0].1.is_none(), "c2 never started");
+
+        // A checkpoint replaces everything before its seq; later rows are appended.
+        let summary = [crate::llm::ChatMessage::user("[compacted summary]")];
+        db.checkpoint_add("abc123", 4, &summary).unwrap();
+        add(4, "tool", "ok2", None, Some("c2"));
+        let r = db.resume_state("abc").unwrap();
+        assert_eq!(r.messages.len(), 2);
+        assert_eq!(r.messages[0].content, "[compacted summary]");
+        assert_eq!(r.messages[1].content, "ok2");
+        assert!(r.unanswered.is_empty());
+        assert_eq!(r.next_seq, 5);
+        assert!(db.resume_state("zzz").is_err());
+    }
+
+    #[test]
+    fn unanswered_calls_carry_their_journal_row_for_that_turn_only() {
+        let ws = super::util::temp_dir("journal");
+        let db = Db::open(&ws.join("t.db")).unwrap();
+        db.instance_start("j1", "build", None, "task", "m", 0).unwrap();
+        let calls = |id: &str| format!(r#"[{{"id":"{id}","name":"bash","arguments":"{{}}"}}]"#);
+        // Turn 1 reuses the id `call_1` and finished.
+        db.message_add("j1", 1, "assistant", "", Some(&calls("call_1")), None, None)
+            .unwrap();
+        let old = db.tool_call_start("j1", 1, "call_1", "bash", "{}").unwrap();
+        db.tool_call_finish(old, "done", "ok", false, 1).unwrap();
+        db.message_add("j1", 2, "tool", "ok", None, Some("call_1"), None)
+            .unwrap();
+        // Turn 2 has `call_1` again and never started it.
+        db.message_add("j1", 3, "assistant", "", Some(&calls("call_1")), None, None)
+            .unwrap();
+        let r = db.resume_state("j1").unwrap();
+        assert_eq!(r.call_seq, 3);
+        assert!(r.unanswered[0].1.is_none());
+        // Once started, the row is found.
+        let row = db.tool_call_start("j1", 3, "call_1", "bash", "{}").unwrap();
+        db.tool_call_set_child(row, "kid").unwrap();
+        let r = db.resume_state("j1").unwrap();
+        let found = r.unanswered[0].1.as_ref().unwrap();
+        assert_eq!((found.id, found.status.as_str()), (row, "started"));
+        assert_eq!(found.child_instance.as_deref(), Some("kid"));
+    }
+
+    #[test]
+    fn resume_lists_loaded_skills_once_in_load_order() {
+        let ws = super::util::temp_dir("skills-resume");
+        let db = Db::open(&ws.join("t.db")).unwrap();
+        db.instance_start("s1", "build", None, "task", "m", 0).unwrap();
+        for (name, err) in [("b", false), ("a", false), ("b", false), ("x", true)] {
+            let args = format!(r#"{{"name":"{name}"}}"#);
+            db.tool_call_record("s1", 0, "c", "skill_load", &args, "", err)
+                .unwrap();
+        }
+        assert_eq!(db.resume_state("s1").unwrap().skills, ["b", "a"]);
+    }
+
+    #[test]
+    fn open_adds_columns_to_older_databases() {
+        let ws = super::util::temp_dir("migrate");
+        let path = ws.join("t.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE instances (id TEXT PRIMARY KEY, mode TEXT NOT NULL);
+                 CREATE TABLE tool_calls (id INTEGER PRIMARY KEY, instance_id TEXT NOT NULL,
+                   message_seq INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL);",
+            )
+            .unwrap();
+        let db = Db::open(&path).unwrap();
+        let cols = |t: &str| -> Vec<String> {
+            db.conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{t}')"))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert!(cols("instances").contains(&"pid".to_string()));
+        for c in ["call_id", "status", "child_instance"] {
+            assert!(cols("tool_calls").contains(&c.to_string()), "{c}");
+        }
+    }
+
+    #[test]
+    fn rolled_back_result_leaves_call_started_and_no_message() {
+        let ws = super::util::temp_dir("txn");
+        let db = Db::open(&ws.join("t.db")).unwrap();
+        let row = db.tool_call_start("t1", 1, "c", "bash", "{}").unwrap();
+        {
+            let _tx = db.conn.unchecked_transaction().unwrap();
+            db.tool_call_finish(row, "done", "ok", false, 1).unwrap();
+            db.message_add("t1", 2, "tool", "ok", None, Some("c"), None)
+                .unwrap();
+        }
+        let status: String = db
+            .conn
+            .query_row("SELECT status FROM tool_calls WHERE id=?", [row], |r| r.get(0))
+            .unwrap();
+        let messages: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((status.as_str(), messages), ("started", 0));
     }
 }
 
