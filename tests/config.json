@@ -1,0 +1,28 @@
+{
+  "provider": "local",
+  "providers": {
+    "local": {
+      "base_url": "http://127.0.0.1:8080/v1",
+      "api_key": "",
+      "api_key_env": "",
+      "auth": "bearer",
+      "model": "qwen3-coder-30b-a3b",
+      "max_tokens_field": "max_tokens",
+      "send_tool_choice": true,
+      "headers": {},
+      "context_window": 32768,
+      "max_output_tokens": 8192,
+      "token_limit": 4000000
+    }
+  },
+  "time_limit_secs": 1800,
+  "compact_threshold": 0.7,
+  "compact_keep_recent": 6,
+  "tool_result_max_bytes": 24000,
+  "max_tool_iterations": 80,
+  "llm_max_retries": 6,
+  "bash_timeout_secs": 120,
+  "spawn_timeout_secs": 900,
+  "max_subagent_depth": 2,
+  "control_enabled": true
+}
