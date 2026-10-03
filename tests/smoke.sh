@@ -10,10 +10,11 @@ SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/genji-e2e.XXXXXX")
 
 cleanup() {
   local status=$?
+  echo "scratch directory: $SCRATCH" >&2
   if (( status == 0 )); then
     rm -rf "$SCRATCH"
   else
-    echo "smoke test failed; scratch directory kept at $SCRATCH" >&2
+    echo "smoke test failed"
   fi
 }
 trap cleanup EXIT
@@ -41,32 +42,7 @@ run_smoke() {
     return 1
   fi
 
-  python3 - "$stdout" "$workspace" <<'PY'
-import json
-import pathlib
-import sys
-
-output = pathlib.Path(sys.argv[1])
-workspace = pathlib.Path(sys.argv[2])
-end = None
-for line in reversed(output.read_text().splitlines()):
-    try:
-        event = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-    if event.get("type") == "instance_end":
-        end = event
-        break
-
-if end is None:
-    raise SystemExit(f"no instance_end event; workspace kept at {workspace}")
-if end.get("status") != "done":
-    raise SystemExit(f"instance status is {end.get('status')!r}; workspace kept at {workspace}")
-if end.get("result", {}).get("status") != "done":
-    raise SystemExit(f"result status is not done; workspace kept at {workspace}")
-if not any(path.name != ".genji" for path in workspace.iterdir()):
-    raise SystemExit(f"no files generated; workspace kept at {workspace}")
-PY
+  "$SCRIPT_DIR/judge.py" "$stdout" "$workspace"
 }
 
 run_smoke \
