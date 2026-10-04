@@ -1,5 +1,6 @@
 pub mod context {
     use serde_json::{Value, json};
+    use std::collections::HashMap;
     use std::fmt::Write as _;
 
     use crate::llm::{self, ChatMessage, Role};
@@ -70,25 +71,88 @@ pub mod context {
             })
         }
 
-        /// Elide bulky tool results older than the last `keep` messages.
+        /// Drops what the model no longer needs, deterministically from the messages alone
+        /// (replay applies the same call):
+        /// - `read` results for a file that was written or edited later, or read again later;
+        /// - bulky tool results older than the last `keep` messages;
+        /// - old `write`/`edit` payloads and reasoning, since the file on disk is the truth.
         pub fn prune(&mut self, keep: usize) -> bool {
             const MAX: usize = 1000;
+            const STUB: &str = "[superseded: the file changed or was read again later; read it again if needed]";
             let old = self.messages.len().saturating_sub(keep.max(2));
+            // call id -> (call message index, tool, path, read signature)
+            let mut calls: HashMap<String, (usize, String, String, String)> = HashMap::new();
+            let mut last_change: HashMap<String, usize> = HashMap::new();
+            let mut last_read: HashMap<String, usize> = HashMap::new();
+            for (i, m) in self.messages.iter().enumerate() {
+                for c in &m.tool_calls {
+                    let args: Value = serde_json::from_str(c.args()).unwrap_or(Value::Null);
+                    let path = args["path"].as_str().unwrap_or_default().to_string();
+                    let sig = format!("{path}:{}:{}", args["offset"], args["limit"]);
+                    match c.name() {
+                        "write" | "edit" if !path.is_empty() => {
+                            last_change.insert(path.clone(), i);
+                        }
+                        "read" if !path.is_empty() => {
+                            last_read.insert(sig.clone(), i);
+                        }
+                        _ => {}
+                    }
+                    calls.insert(c.id.clone(), (i, c.name().to_string(), path, sig));
+                }
+            }
             let mut changed = false;
-            for m in &mut self.messages[..old] {
-                if m.role == Role::Tool && m.content.len() > MAX {
-                    m.content = format!(
-                        "{}\n[older output elided: {} bytes; re-run the tool if needed]",
-                        llm::truncate(&m.content, MAX / 2),
-                        m.content.len()
-                    );
-                    changed = true;
+            for (i, m) in self.messages.iter_mut().enumerate() {
+                if m.role == Role::Tool {
+                    let stale = m
+                        .tool_call_id
+                        .as_ref()
+                        .and_then(|id| calls.get(id))
+                        .is_some_and(|(at, name, path, sig)| {
+                            name == "read"
+                                && (last_change.get(path).is_some_and(|l| l > at)
+                                    || last_read.get(sig).is_some_and(|l| l > at))
+                        });
+                    if stale && m.content.len() > STUB.len() {
+                        m.content = STUB.to_string();
+                        changed = true;
+                    } else if i < old && m.content.len() > MAX {
+                        m.content = format!(
+                            "{}\n[older output elided: {} bytes; re-run the tool if needed]",
+                            llm::truncate(&m.content, MAX / 2),
+                            m.content.len()
+                        );
+                        changed = true;
+                    }
+                } else if i < old && m.role == Role::Assistant {
+                    if m.reasoning_content.as_deref().is_some_and(|r| !r.is_empty()) {
+                        m.reasoning_content = None;
+                        changed = true;
+                    }
+                    for c in &mut m.tool_calls {
+                        if matches!(c.function.name.as_str(), "write" | "edit")
+                            && c.function.arguments.len() > 500
+                        {
+                            let args: Value =
+                                serde_json::from_str(&c.function.arguments).unwrap_or(Value::Null);
+                            c.function.arguments = json!({
+                                "path": args["path"],
+                                "elided_bytes": c.function.arguments.len(),
+                            })
+                            .to_string();
+                            changed = true;
+                        }
+                    }
                 }
             }
             if changed {
                 self.last_prompt_tokens = 0;
             }
             changed
+        }
+
+        pub fn len(&self) -> usize {
+            self.messages.len()
         }
 
         /// The text to summarize and how many trailing messages stay verbatim
@@ -137,7 +201,8 @@ pub mod context {
     #[cfg(test)]
     mod tests {
         use super::ContextComposer;
-        use crate::llm::ChatMessage;
+        use crate::llm::{self, ChatMessage};
+        use serde_json::{Value, json};
 
         #[test]
         fn estimate_counts_messages_after_last_prompt() {
@@ -157,6 +222,49 @@ pub mod context {
             assert!(c.prune(2));
             assert!(c.messages()[1].content.len() < 1000);
             assert_eq!(c.messages()[3].content.len(), 5000);
+            assert!(!c.prune(2));
+        }
+
+        fn call(id: &str, name: &str, args: Value) -> ChatMessage {
+            let mut m = ChatMessage::default();
+            m.tool_calls.push(llm::ToolCall::new(id, name, args.to_string()));
+            m
+        }
+
+        #[test]
+        fn prune_drops_reads_superseded_by_edits_or_rereads() {
+            let mut c = ContextComposer::new("sys".into(), vec![], 100);
+            let big = "x".repeat(400);
+            c.push(call("r1", "read", json!({"path": "a.rs"})));
+            c.push(ChatMessage::tool_result("r1", big.clone()));
+            c.push(call("r2", "read", json!({"path": "b.rs"})));
+            c.push(ChatMessage::tool_result("r2", big.clone()));
+            c.push(call("e1", "edit", json!({"path": "a.rs", "oldText": "a", "newText": "b"})));
+            c.push(ChatMessage::tool_result("e1", "ok"));
+            c.push(call("r3", "read", json!({"path": "b.rs"})));
+            c.push(ChatMessage::tool_result("r3", big.clone()));
+            assert!(c.prune(100));
+            let m = c.messages();
+            assert!(m[2].content.starts_with("[superseded"), "edited later");
+            assert!(m[4].content.starts_with("[superseded"), "re-read later");
+            assert_eq!(m[8].content, big, "latest read stays");
+            assert_eq!(m[6].content, "ok");
+            assert!(!c.prune(100));
+        }
+
+        #[test]
+        fn prune_slims_old_write_payloads_and_reasoning() {
+            let mut c = ContextComposer::new("sys".into(), vec![], 100);
+            let mut m = call("w1", "write", json!({"path": "a.rs", "content": "y".repeat(2000)}));
+            m.reasoning_content = Some("thinking".into());
+            c.push(m);
+            c.push(ChatMessage::tool_result("w1", "ok"));
+            c.push(ChatMessage::user("u"));
+            c.push(ChatMessage::user("v"));
+            assert!(c.prune(2));
+            let a = &c.messages()[1];
+            assert!(a.reasoning_content.is_none());
+            assert!(a.tool_calls[0].args().len() < 100 && a.tool_calls[0].args().contains("a.rs"));
             assert!(!c.prune(2));
         }
 

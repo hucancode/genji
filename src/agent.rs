@@ -19,6 +19,7 @@ const STOPPED_BY_USER: &str = "(stopped by user via control socket)";
 /// Sent for the last few tool-call turns so the run ends with a handoff or report, not a cut-off.
 const WRAP_UP: &str = "[note] You are about to run out of tool calls and will be cut off. Wrap up now: stop starting new work, then call hand_off or finish with a standalone report of what is done, what remains, and where the state lives.";
 const WRAP_UP_TURNS: usize = 5;
+const PRUNE_EVERY: usize = 16;
 const NUDGE: &str = "[note] End by calling finish.";
 const CONTINUE: &str = "Continue from where you left off.";
 const TRUNCATED_HINT: &str = "[note] Your last response was cut off by the output limit. Continue with smaller steps: split large writes into several edits.";
@@ -392,6 +393,7 @@ impl Agent {
         let mut truncations = 0u32;
         let mut overflow_retried = false;
         let mut nudged = false;
+        let mut pruned_at = self.context.read().unwrap().len();
         // One-request note after the context; never stored.
         let mut hint: Option<&str> = None;
         loop {
@@ -405,6 +407,7 @@ impl Agent {
             }
             self.set_status();
             self.maybe_compact(self.cfg.compact_threshold, true)?;
+            self.maybe_prune(&mut pruned_at);
             if hint.is_none() && iterations + WRAP_UP_TURNS >= self.cfg.max_tool_iterations {
                 hint = Some(WRAP_UP);
             }
@@ -520,6 +523,23 @@ impl Agent {
         (ctrl.stop_requested(), !queued.is_empty())
     }
 
+    /// Every `PRUNE_EVERY` new messages, drop what the model no longer needs. Batched so the
+    /// provider's prompt cache is rewritten rarely, not on every call.
+    fn maybe_prune(&mut self, pruned_at: &mut usize) {
+        let len = self.context.read().unwrap().len();
+        if len < *pruned_at {
+            *pruned_at = len;
+        }
+        if len - *pruned_at < PRUNE_EVERY {
+            return;
+        }
+        *pruned_at = len;
+        let keep = self.cfg.prune_keep_recent;
+        if self.context.write().unwrap().prune(keep) {
+            self.events.prune(keep);
+        }
+    }
+
     /// Prune old tool results, then summarize older turns, once the context nears the window.
     /// Both are logged so a resume rebuilds the same context.
     fn maybe_compact(&mut self, threshold: f64, optional: bool) -> Result<()> {
@@ -538,7 +558,7 @@ impl Agent {
         };
         let req = [
             ChatMessage::system(
-                "You compress agent running history. Preserve decisions, key clues, open problems. Be dense and factual.",
+                "You compress an agent's running history so it can continue the work. Be dense and factual. Use these sections: Goal; Decisions and why; Files created or changed (paths); Commands run and their outcome (passing/failing tests, errors); Open problems; Next step. Keep exact identifiers, paths, ids and error messages. Drop pleasantries, file contents that are on disk, and anything recoverable by reading the workspace.",
             ),
             ChatMessage::user(format!(
                 "Summarize this conversation segment:\n\n{}",

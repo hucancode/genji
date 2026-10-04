@@ -9,6 +9,7 @@
 | `time_limit_secs` | `1800` | Max wall-clock time per run |
 | `compact_threshold` | `0.70` | Fraction of `context_window` that triggers compaction |
 | `compact_keep_recent` | `6` | Messages kept verbatim during compaction |
+| `prune_keep_recent` | `24` | Messages kept verbatim by the periodic prune (every 16 new messages) that drops superseded reads and elides old bulky tool output, `write`/`edit` payloads and reasoning |
 | `tool_result_max_bytes` | `24000` | Inline limit for tool results; larger ones are clipped and the full text goes to `.genji/tmp` |
 | `bash_timeout_secs` | `120` | Default `bash` timeout |
 | `spawn_timeout_secs` | `900` | Subagent timeout |

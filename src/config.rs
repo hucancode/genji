@@ -84,6 +84,8 @@ pub struct Config {
     pub time_limit_secs: u64,
     pub compact_threshold: f64,
     pub compact_keep_recent: usize,
+    /// Messages kept verbatim by the periodic prune of old tool output and payloads.
+    pub prune_keep_recent: usize,
     pub tool_result_max_bytes: usize,
     pub max_tool_iterations: usize,
     pub llm_max_retries: u32,
@@ -108,6 +110,7 @@ impl Default for Config {
             time_limit_secs: 1800,
             compact_threshold: 0.70,
             compact_keep_recent: 6,
+            prune_keep_recent: 24,
             tool_result_max_bytes: 24_000,
             max_tool_iterations: 200,
             llm_max_retries: 6,

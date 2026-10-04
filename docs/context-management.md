@@ -13,12 +13,26 @@ next. Context is pull-only: it is never written to the event stream.
 
 ## Pruning and compaction
 
-Before each model call, if the prompt size reaches `compact_threshold ×
-context_window`, tool results older than the last `compact_keep_recent` messages
-are elided (a `prune` event). If still over, the older conversation is summarized
-by the model and replaced with one summary message (a `compaction` event); the
-system prompt and the most recent messages stay. Tool-call/result pairs are never
-split.
+A `prune` event drops what the model no longer needs. It runs every 16 new
+messages, and again when the prompt reaches `compact_threshold × context_window`.
+Replay applies the same operation, so the rebuilt context is identical:
+
+- a `read` result is replaced by a stub when the file was written or edited later,
+  or the same range was read again later;
+- tool results larger than 1000 bytes older than the last `prune_keep_recent`
+  messages (`compact_keep_recent` at the threshold) are elided to a short head;
+- older `write`/`edit` payloads shrink to the path and size, and older assistant
+  reasoning is dropped, since the file on disk is the source of truth.
+
+If the prompt is still over the threshold, the older conversation is summarized by
+the model into sections (goal, decisions, files, commands and outcomes, open
+problems, next step) and replaced with one summary message (a `compaction` event);
+the system prompt and the most recent messages stay. Tool-call/result pairs are
+never split.
+
+Tool output is bounded at `tool_result_max_bytes` and the full text is spilled to
+`.genji/tmp`. `bash` output keeps its head and its tail, because failures and test
+summaries come last. `read` returns at most 500 lines unless `limit` is given.
 
 ## Resume
 

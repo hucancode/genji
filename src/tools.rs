@@ -30,6 +30,9 @@ struct ReadArgs {
     limit: Option<usize>,
 }
 
+/// Whole-file reads are capped; larger files are paged with offset/limit.
+const DEFAULT_READ_LINES: usize = 500;
+
 fn read(agent: &mut Agent, args: &Value) -> Result<String> {
     let a: ReadArgs = parse_args(args)?;
     let path = agent.resolve_path(&a.path);
@@ -39,13 +42,13 @@ fn read(agent: &mut Agent, args: &Value) -> Result<String> {
         return Ok(format!("{} is empty (0 lines)", path.display()));
     }
     let start = (a.offset.unwrap_or(1).max(1) - 1).min(total);
-    let end = (start + a.limit.unwrap_or(2000).max(1)).min(total);
+    let end = (start + a.limit.unwrap_or(DEFAULT_READ_LINES).max(1)).min(total);
     let mut out = String::new();
     for (i, line) in content.lines().enumerate().take(end).skip(start) {
         writeln!(out, "{:>6}\t{line}", i + 1)?;
     }
     if end < total {
-        writeln!(out, "\n[showing lines {}-{end} of {total}]", start + 1)?;
+        writeln!(out, "\n[showing lines {}-{end} of {total}; pass offset/limit for the rest]", start + 1)?;
     }
     Ok(out)
 }
@@ -684,7 +687,7 @@ fn registry() -> &'static [Tool] {
                 "properties":{
                     "path":{"type":"string","description":"File path"},
                     "offset":{"type":"integer","description":"First line (1-indexed)"},
-                    "limit":{"type":"integer","description":"Max lines to read (default 2000)"}
+                    "limit":{"type":"integer","description":"Max lines to read (default 500)"}
                 },
                 "required":["path"]
             }), read),
@@ -836,12 +839,30 @@ pub fn dispatch(agent: &mut Agent, name: &str, args: &Value) -> (String, bool) {
     )
 }
 
+/// The first two thirds and the last third of `max` bytes, cut on char boundaries.
+fn head_and_tail(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    let (mut head, mut tail) = (max * 2 / 3, max / 3);
+    while head > 0 && !s.is_char_boundary(head) {
+        head -= 1;
+    }
+    tail = s.len().saturating_sub(tail);
+    while tail < s.len() && !s.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}\n[... {} bytes omitted ...]\n{}", &s[..head], tail - head, &s[tail..]).into()
+}
+
 /// Results over `max` bytes are clipped; the full text is spilled to a tmp file.
 fn bounded_result(workspace: &Path, max: usize, name: &str, text: String) -> String {
     if text.len() <= max {
         return text;
     }
-    let clipped = crate::llm::truncate(&text, max);
+    // Failures and summaries come last in command output, so keep the tail as well.
+    let clipped = if name == "bash" {
+        head_and_tail(&text, max)
+    } else {
+        crate::llm::truncate(&text, max)
+    };
     let safe: String = name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
@@ -859,6 +880,14 @@ fn bounded_result(workspace: &Path, max: usize, name: &str, text: String) -> Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn head_and_tail_keeps_both_ends() {
+        let s = format!("{}MID{}", "a".repeat(100), "z".repeat(100));
+        let out = super::head_and_tail(&s, 30);
+        assert!(out.starts_with("aaaa") && out.ends_with("zzzz") && out.contains("omitted"));
+        assert!(!out.contains("MID") && out.len() < 100);
+    }
+
     #[test]
     fn handoff_without_summary_is_accepted() {
         let def = crate::config::AgentDef {
