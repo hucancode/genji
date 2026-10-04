@@ -1,16 +1,8 @@
 # Orchestration
 
-Agents cooperate through `finish` handoffs. genji either follows them
-(`--follow`) or leaves it to the caller.
-
-## `--follow`
-
-```bash
-genji plan "ship the feature" --follow=20
-```
-
-Runs the first agent, then each `next.agent` it hands off to, until an agent finishes `done`
-or `blocked`, or 20 handoffs have been followed. See [Agents](agents.md#following-handoffs).
+Agents cooperate through `finish` handoffs. genji does not follow them; the
+caller does. The one exception is `hand_off`, which continues in a fresh
+instance of the named agent, e.g. `build` ⇄ `review` (see [Agents](agents.md#hand_off)).
 
 ## External loop
 

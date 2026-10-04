@@ -9,11 +9,12 @@ use crate::storage::util::{split_frontmatter, tmp_file, valid_slug, write_file};
 pub const RESERVED: [&str; 7] = ["init", "list", "stop", "instruct", "inspect", "reset", "help"];
 
 /// The agent definitions `genji init` writes; they are not read at run time.
-const DEFAULT_AGENTS: [(&str, &str); 4] = [
+const DEFAULT_AGENTS: [(&str, &str); 5] = [
     ("plan", include_str!("agents/plan.md")),
     ("build", include_str!("agents/build.md")),
     ("explore", include_str!("agents/explore.md")),
     ("retro", include_str!("agents/retro.md")),
+    ("review", include_str!("agents/review.md")),
 ];
 
 /// `<workspace>/.genji/<name>`.
@@ -170,6 +171,8 @@ pub struct AgentDef {
     /// Statuses `finish` may use: done | handoff | blocked.
     pub finish: Vec<String>,
     pub model: Option<String>,
+    /// Reached only through `hand_off`/`spawn`; front ends do not offer it for a new session.
+    pub internal: bool,
 }
 
 fn list(meta: &BTreeMap<String, String>, key: &str) -> Option<Vec<String>> {
@@ -192,6 +195,7 @@ fn parse_agent(name: &str, text: &str) -> AgentDef {
         finish: list(&meta, "finish")
             .unwrap_or_else(|| ["done", "handoff", "blocked"].map(String::from).into()),
         model: meta.get("model").filter(|m| !m.is_empty()).cloned(),
+        internal: meta.get("internal").is_some_and(|v| v == "true"),
     }
 }
 
@@ -413,15 +417,15 @@ pub(crate) mod tests {
         let ws = temp_dir("agents-default");
         assert!(load_agents(&ws).is_empty());
         let r = init_agents(&ws, false, &[]).unwrap();
-        assert_eq!(r.written, ["plan", "build", "explore", "retro"]);
+        assert_eq!(r.written, ["plan", "build", "explore", "retro", "review"]);
         assert!(r.skipped.is_empty());
         let agents = load_agents(&ws);
         assert_eq!(
             agents.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["build", "explore", "plan", "retro"]
+            ["build", "explore", "plan", "retro", "review"]
         );
         assert_eq!(agents["plan"].finish, ["done", "blocked"]);
-        assert_eq!(agents["build"].finish, ["done", "handoff", "blocked"]);
+        assert_eq!(agents["build"].finish, ["done", "blocked"]);
         assert!(load_skills(&ws).is_empty());
         assert!(!skills_dir(&ws).exists());
     }
@@ -435,7 +439,7 @@ pub(crate) mod tests {
         std::fs::remove_file(dir.join("retro.md")).unwrap();
         let r = init_agents(&ws, false, &[]).unwrap();
         assert_eq!(r.written, ["retro"]);
-        assert_eq!(r.skipped, ["plan", "build", "explore"]);
+        assert_eq!(r.skipped, ["plan", "build", "explore", "review"]);
         assert_eq!(load_agents(&ws)["build"].prompt, "mine");
         let r = init_agents(&ws, true, &["build".to_string()]).unwrap();
         assert_eq!(r.written, ["build"]);
@@ -461,7 +465,7 @@ pub(crate) mod tests {
     fn ensure_agents_initialises_a_fresh_workspace() {
         let ws = temp_dir("agents-ensure");
         ensure_agents(&ws).unwrap();
-        assert_eq!(load_agents(&ws).len(), 4);
+        assert_eq!(load_agents(&ws).len(), 5);
     }
 
     #[test]
@@ -508,11 +512,12 @@ pub(crate) mod tests {
                 ("build", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
                 ("explore", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
                 ("retro", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
+                ("review", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
                 ("alpha", "---\ntools: read, finish\nfinish: handoff, done\n---\na"),
             ],
         );
         let agents = load_agents(&ws);
-        for n in ["plan", "build", "explore", "retro"] {
+        for n in ["plan", "build", "explore", "retro", "review"] {
             assert_eq!(agents[n].prompt, "replaced");
             assert_eq!(agents[n].finish, ["blocked"]);
         }

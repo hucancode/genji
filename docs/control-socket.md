@@ -58,4 +58,4 @@ broadcast to the event stream.
 genji instruct <id> /context    # full context snapshot (JSON) on stdout
 ```
 
-With `--follow`, the socket stays open across handoffs and always talks to the agent running now.
+The socket stays open across `hand_off`s and always talks to the agent running now.

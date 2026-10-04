@@ -35,7 +35,7 @@ run_smoke() {
 
   echo "==> $tag"
   if ! GENJI_REGISTRY_DIR="$registry" "$GENJI" \
-    plan "$prompt" --follow=6 --no-control --quiet-startup \
+    build "$prompt" --no-control --quiet-startup \
     --workspace "$workspace" >"$stdout" 2>"$stderr"
   then
     cat "$stderr" >&2

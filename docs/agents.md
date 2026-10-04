@@ -5,10 +5,11 @@ An agent is a markdown file: frontmatter plus the system prompt.
 ```markdown
 ---
 description: Reviews a diff and reports problems     # shown in `genji --help` and in other agents' prompts
-tools: read, ls, bash, finish                        # read write edit ls bash plan_write spawn ask finish
+tools: read, ls, bash, finish                        # read write edit ls bash plan_write spawn ask hand_off finish
 skills: formal                                         # optional: skills inlined into the system prompt at start
 finish: handoff, blocked                             # optional: statuses `finish` accepts (default: done, handoff, blocked)
 model: some-model                                    # optional: overrides the provider's model
+internal: true                                       # optional: reached only through `hand_off`/`spawn`; front ends do not offer it for a new session
 ---
 You review changes. ...
 ```
@@ -18,14 +19,14 @@ exactly the `<name>.md` files found there and assumes nothing about their names 
 contents. A deleted file stays deleted.
 
 `genji init [agent...] [--force] [--workspace DIR]` writes the default agents
-(`plan`, `build`, `explore`, `retro`) into that directory and prints
+(`plan`, `build`, `explore`, `retro`, `review`) into that directory and prints
 `{"written":[...],"skipped":[...]}`. Existing files are kept unless `--force`;
 naming agents limits what is written (and, with `--force`, what is reset). Running an agent
 in a workspace without `.genji/agents/` runs `init` first. With the directory present,
 nothing is added to it, and an empty directory means no agents.
 Every agent is a subcommand: `genji <name> "task"`.
 `genji help agent --json` prints the agents in `.genji/agents/` as
-`[{name, description, tools, skills, finish, model}]`; `genji help tool --json`
+`[{name, description, tools, skills, finish, model, internal}]`; `genji help tool --json`
 prints the tools as `[{name, description, parameters}]`.
 
 Names that collide with a command (`init list stop instruct inspect help`) and
@@ -36,8 +37,9 @@ The files `genji init` writes:
 | agent | tools | `finish` | role |
 |---|---|---|---|
 | `plan` | read write edit ls bash plan_write spawn ask finish | done, blocked | refines the goal with the human through `ask`, writes the plan to `docs/notes/`; never builds or hands off |
-| `build` | read write edit ls bash spawn finish | done, handoff, blocked | implements and verifies; hands off to a fresh `build` when a batch is done, `done` when the whole task is delivered |
-| `explore` | read ls bash spawn finish | handoff, blocked | investigates, hands findings back to `plan` |
+| `build` | read write edit ls bash spawn hand_off finish | done, blocked | implements and verifies; `hand_off` to `review` when delivered, to a fresh `build` when a batch is done |
+| `explore` | read ls bash spawn finish | handoff, blocked | internal; investigates, hands findings back to `plan` |
+| `review` | read ls bash hand_off finish | done, blocked | internal; verifies the work independently; `done` when satisfied, `hand_off` back to `build` with instructions otherwise |
 | `retro` | read write edit ls bash finish | done, blocked | improves agents and skills from recorded sessions |
 
 ## The `ask` tool
@@ -75,17 +77,20 @@ model stops without calling `finish`.
 The exit code reports how the run went, not the verdict: 0 finished, 1 LLM
 failure, 2 stopped (limit or `stop`).
 
-## Following handoffs
+## `hand_off`
 
-`genji plan "goal" --follow[=N]` (N defaults to 10) follows handoffs inside the
-same process. Each handoff starts a new instance (new id, `parent` = the previous
-one, its own session file, fresh context, the next agent's prompt and tools),
-behind the same control socket. `genji list` shows the instance that is running
-now. The chain stops on `done`, `blocked`, a missing verdict, a failed or stopped
-run, or after N handoffs (an `error` event records the cap). `stop` ends the chain.
+`hand_off {agent, task}` ends the run and continues in the same process with a
+fresh instance of `agent` (it may be the caller) working on `task`: new id,
+`parent` = the previous one, its own session file, empty context, the next
+agent's prompt and tools, behind the same control socket. `genji list` shows the
+instance that is running now. `task` must stand alone. Chains are not capped;
+`stop` ends one. Subagents cannot `hand_off`.
 
-Without `--follow`, genji runs one agent and exits; the handoff is data in
-`instance_end`. See [Orchestration](orchestration.md).
+`genji build` uses it to loop `build` → `review` → `build` → … until `review`
+finishes `done`.
+
+A `finish` handoff is not followed; it is data in `instance_end`. See
+[Orchestration](orchestration.md).
 
 ## Subagents
 
@@ -97,7 +102,7 @@ tool result:
 ```
 
 A subagent reports through the same `finish`: it hands off to its parent's agent
-with the report in `next.task`, whether or not `--follow` is set. If it crashes,
+with the report in `next.task`. If it crashes,
 times out or never calls `finish`, genji returns `status: blocked` with its last
 output. The child id is `<parent id>-<tool call id>`, so a resumed parent finds
 the child's session: a finished child's report is delivered, an unfinished child

@@ -35,8 +35,8 @@ pub struct Agent {
     /// The id of the tool call being dispatched, as logged in the session.
     pub call_id: String,
     pub verdict: Option<Verdict>,
-    /// Set when a handoff will not be followed because the `--follow` cap is reached.
-    pub follow_capped: bool,
+    /// Set by `hand_off`: genji continues with `verdict.next` instead of exiting.
+    pub handed_off: bool,
     /// How the run ended: done | failed | stopped.
     pub status: &'static str,
     /// Why a stopped run stopped: token_limit | time_limit | max_iterations | user.
@@ -221,7 +221,7 @@ impl Agent {
             call_tag: String::new(),
             call_id: String::new(),
             verdict: None,
-            follow_capped: false,
+            handed_off: false,
             status: "done",
             reason: None,
             llm,
@@ -232,9 +232,9 @@ impl Agent {
             token_limit,
             started: Instant::now(),
         };
-        // `spawn` and `finish` are safe to run again; any other call may have partly run.
+        // `spawn`, `finish` and `hand_off` are safe to run again; any other call may have partly run.
         for tc in pending {
-            if matches!(tc.name(), "spawn" | "finish") {
+            if matches!(tc.name(), "spawn" | "finish" | "hand_off") {
                 agent.run_call(&tc);
             } else {
                 eprintln!("[resume] {} was running when genji stopped", tc.name());
@@ -334,14 +334,6 @@ impl Agent {
             .run_loop()
             .unwrap_or_else(|e| self.fail(format!("{e:#}")));
         let result = self.verdict.as_ref().map(|v| json!(v));
-        if let (true, Some(Verdict { next: Some(n), .. })) = (self.follow_capped, &self.verdict) {
-            let msg = format!(
-                "handoff limit reached; not following the handoff to `{}`",
-                n.agent
-            );
-            eprintln!("[follow] {msg}");
-            self.events.error(&msg);
-        }
         self.events.instance_end(
             self.status,
             self.reason,
@@ -472,8 +464,8 @@ impl Agent {
             nudged = false;
             let mut calls = assistant.tool_calls.clone();
             self.log(assistant);
-            // `finish` runs after the other calls of its turn.
-            calls.sort_by_key(|c| c.name() == "finish");
+            // `finish` and `hand_off` run after the other calls of its turn.
+            calls.sort_by_key(|c| matches!(c.name(), "finish" | "hand_off"));
             for tc in &calls {
                 self.run_call(tc);
             }

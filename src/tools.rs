@@ -465,6 +465,43 @@ fn finish(agent: &mut Agent, args: &Value) -> Result<String> {
     Ok("ok".into())
 }
 
+#[derive(Deserialize)]
+struct HandOffArgs {
+    agent: String,
+    task: String,
+}
+
+/// Ends this run; genji continues with a fresh instance of `agent` working on `task`.
+fn hand_off(agent: &mut Agent, args: &Value) -> Result<String> {
+    let a: HandOffArgs = parse_args(args)?;
+    if agent.parent_agent.is_some() {
+        bail!("a subagent reports with `finish`, not `hand_off`");
+    }
+    if !agent.agents.contains_key(&a.agent) {
+        bail!(
+            "unknown agent `{}`; available: {}",
+            a.agent,
+            agent.agents.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    if a.task.trim().is_empty() {
+        bail!("task must not be empty");
+    }
+    if agent.verdict.is_some() {
+        bail!("finish or hand_off was already called");
+    }
+    agent.verdict = Some(Verdict {
+        status: "handoff".into(),
+        summary: format!("handed off to {}", a.agent),
+        next: Some(Next {
+            agent: a.agent,
+            task: a.task,
+        }),
+    });
+    agent.handed_off = true;
+    Ok("ok".into())
+}
+
 // --- spawn ----------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -704,6 +741,11 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["agent","instructions"]
             }), spawn),
+            tool("hand_off", "Your context is getting heavy or a batch is done and work remains: end this run and continue in a fresh instance of `agent` (it may be yourself) with an empty context. `task` must stand alone: the goal, what is done, what is left, where the state lives (branch, files, failing test), and the assumptions so far.", json!({
+                "type":"object",
+                "properties":{"agent":{"type":"string"},"task":{"type":"string"}},
+                "required":["agent","task"]
+            }), hand_off),
             tool("finish", "End your run. done: the goal is achieved and verified. handoff: your part is done and `next.agent` continues with `next.task` (self-contained: goal, what is done, what is left, where the state lives). blocked: a human must step in.", json!({
                 "type":"object",
                 "properties":{

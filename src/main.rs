@@ -17,10 +17,9 @@ use storage::context::ContextComposer;
 use storage::{events, registry};
 
 const COMMANDS: [&str; 5] = ["init", "list", "stop", "instruct", "inspect"];
-const DEFAULT_FOLLOW: u32 = 10;
 
 const USAGE: &str = "usage:
-  genji <agent> [task] [--follow[=N]] [--resume ID] [--parent ID] [--workspace DIR] [--provider P] [--label L]
+  genji <agent> [task] [--resume ID] [--parent ID] [--workspace DIR] [--provider P] [--label L]
                 [--socket PATH] [--sessions-dir DIR] [--token-limit N]
   genji init [agent...] [--force] [--workspace DIR]
   genji list | stop <id...|all> | instruct <id> <text...> | inspect <id>
@@ -32,7 +31,6 @@ struct Opts {
     workspace: Option<String>,
     provider: Option<String>,
     label: String,
-    follow: Option<u32>,
     resume: Option<String>,
     parent: Option<String>,
     parent_agent: Option<String>,
@@ -81,12 +79,6 @@ fn parse(args: Vec<String>) -> Result<Opts> {
                 o.token_limit = Some(value()?.parse().context("--token-limit needs a number")?)
             }
             "--depth" => o.depth = value()?.parse().context("--depth needs a number")?,
-            "--follow" => {
-                o.follow = Some(match &inline {
-                    Some(n) => n.parse().context("--follow=N needs a number")?,
-                    None => DEFAULT_FOLLOW,
-                })
-            }
             "--subagent" => o.subagent = true,
             "--no-control" => o.no_control = true,
             "--quiet-startup" => o.quiet = true,
@@ -138,7 +130,7 @@ fn cmd_help(o: &Opts, topic: Option<&str>) -> Result<i32> {
                 .values()
                 .map(|a| {
                     json!({ "name": a.name, "description": a.description, "tools": a.tools,
-                            "skills": a.skills, "finish": a.finish, "model": a.model })
+                            "skills": a.skills, "finish": a.finish, "model": a.model, "internal": a.internal })
                 })
                 .collect();
             println!("{}", serde_json::to_string(&arr)?);
@@ -167,7 +159,7 @@ fn print_usage(agents: &BTreeMap<String, AgentDef>) {
     if agents.is_empty() {
         eprintln!("  (none; `genji init` writes the default agents to .genji/agents)");
     }
-    for a in agents.values() {
+    for a in agents.values().filter(|a| !a.internal) {
         eprintln!("  {:<10} {}", a.name, a.description);
     }
 }
@@ -341,9 +333,7 @@ fn run_agent(o: Opts) -> Result<i32> {
     let mut id = first_id;
     let mut parent = o.parent.clone();
     let mut resuming = resume.is_some();
-    let mut hops = 0u32;
     loop {
-        let follow = if o.subagent { None } else { o.follow };
         let mut a = Agent::start(AgentParams {
             cfg: cfg.clone(),
             workspace: ws.clone(),
@@ -359,19 +349,33 @@ fn run_agent(o: Opts) -> Result<i32> {
             control: guard.as_ref().map(|g| g.control.clone()),
             context: context.clone(),
         })?;
-        a.follow_capped = follow.is_some_and(|n| hops >= n);
         let report = a.run(task.as_deref())?;
         eprintln!("[report] {report}");
+        // A `hand_off` continues in this process as a new instance of `next.agent`:
+        // new id, new session file, fresh context.
         let next = a
             .verdict
             .as_ref()
-            .filter(|_| a.status == "done")
+            .filter(|_| a.handed_off && a.status == "done")
             .and_then(|v| v.next.clone());
-        let Some(next) = next.filter(|_| follow.is_some_and(|n| hops < n)) else {
+        // An agent that can hand off and ran out of tool iterations continues as a fresh
+        // instance of itself; the shared run limits (time, tokens) still bound the chain.
+        let next = next.or_else(|| {
+            (a.status == "stopped"
+                && a.reason == Some("max_iterations")
+                && a.def.tools.iter().any(|t| t == "hand_off"))
+            .then(|| tools::Next {
+                agent: a.def.name.clone(),
+                task: {
+                    const NOTE: &str = "\n\nA previous instance used up its tool iterations on this task. Inspect the workspace and the task's tracking files for what is already done, then continue with what remains.";
+                    let t = task.as_deref().unwrap_or_default();
+                    if t.ends_with(NOTE) { t.to_string() } else { format!("{t}{NOTE}") }
+                },
+            })
+        });
+        let Some(next) = next else {
             return Ok(exit_code(a.status));
         };
-        // The handoff continues in this process as a new instance: new id, new session file, fresh context.
-        hops += 1;
         parent = Some(id.clone());
         id = registry::new_id();
         def = agents[&next.agent].clone();
@@ -382,7 +386,7 @@ fn run_agent(o: Opts) -> Result<i32> {
         }
         if !quiet {
             eprintln!(
-                "[follow] handoff {hops}: {} -> {} (instance {id})",
+                "[hand_off] {} -> {} (instance {id})",
                 a.def.name, def.name
             );
         }
@@ -586,7 +590,6 @@ mod tests {
             "build",
             "fix",
             "the bug",
-            "--follow=3",
             "--workspace",
             "/w",
             "--resume=ab",
@@ -594,11 +597,9 @@ mod tests {
         ]);
         assert_eq!(o.positional, ["build", "fix", "the bug"]);
         assert_eq!(
-            (o.follow, o.workspace.as_deref(), o.resume.as_deref(), o.yes),
-            (Some(3), Some("/w"), Some("ab"), true)
+            (o.workspace.as_deref(), o.resume.as_deref(), o.yes),
+            (Some("/w"), Some("ab"), true)
         );
-        assert_eq!(p(&["plan", "--follow"]).follow, Some(DEFAULT_FOLLOW));
-        assert_eq!(p(&["plan"]).follow, None);
         let o = p(&[
             "build",
             "--socket=/s.sock",
@@ -616,15 +617,6 @@ mod tests {
             ),
             (Some("/s.sock"), Some("/sess"), Some(500), true)
         );
-    }
-
-    #[test]
-    fn rejects_bad_flags() {
-        let args = |a: &[&str]| parse(a.iter().map(|s| s.to_string()).collect());
-        assert!(args(&["build", "--nope"]).is_err());
-        assert!(args(&["build", "--workspace"]).is_err());
-        assert!(args(&["build", "--follow=x"]).is_err());
-        assert!(args(&["build", "--token-limit=x"]).is_err());
     }
 
     #[test]

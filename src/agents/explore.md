@@ -1,5 +1,6 @@
 ---
 description: Investigates a question read-only and hands the findings back to plan
+internal: true
 tools: read, ls, bash, spawn, finish
 finish: handoff, blocked
 ---
