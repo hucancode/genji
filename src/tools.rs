@@ -348,8 +348,24 @@ fn plan_write(agent: &mut Agent, args: &Value) -> Result<String> {
 #[derive(Deserialize)]
 struct AskArgs {
     question: String,
+    #[serde(deserialize_with = "string_list")]
     options: Vec<String>,
     recommended: String,
+}
+
+/// A list of strings, also accepted as a JSON-encoded array in a string, which some
+/// models emit for array arguments. Anything else says what shape is expected.
+fn string_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    use serde::de::Error;
+    match Value::deserialize(d)? {
+        Value::Array(items) => items
+            .into_iter()
+            .map(|v| v.as_str().map(str::to_string).ok_or_else(|| D::Error::custom("options must be an array of strings")))
+            .collect(),
+        Value::String(s) => serde_json::from_str::<Vec<String>>(&s)
+            .map_err(|_| D::Error::custom("options must be a JSON array of 2-6 strings, e.g. [\"A\", \"B\"], not a string")),
+        _ => Err(D::Error::custom("options must be a JSON array of 2-6 strings")),
+    }
 }
 
 /// Ask the human a multiple-choice question and block on the answer.
@@ -794,6 +810,16 @@ fn bounded_result(workspace: &Path, max: usize, name: &str, text: String) -> Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ask_options_accept_array_or_encoded_array_and_explain_otherwise() {
+        let ok = |v: serde_json::Value| super::parse_args::<super::AskArgs>(&v);
+        let base = |o: serde_json::Value| serde_json::json!({"question":"q","recommended":"a","options":o});
+        assert_eq!(ok(base(serde_json::json!(["a","b"]))).unwrap().options, ["a", "b"]);
+        assert_eq!(ok(base(serde_json::json!("[\"a\",\"b\"]"))).unwrap().options, ["a", "b"]);
+        let err = format!("{:#}", ok(base(serde_json::json!("\n<parameter name=\"option\">x"))).err().unwrap());
+        assert!(err.contains("JSON array of 2-6 strings"), "{err}");
+    }
+
     use super::*;
     use crate::config;
     use crate::storage::util::temp_dir;
