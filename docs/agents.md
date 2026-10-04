@@ -37,7 +37,7 @@ The files `genji init` writes:
 
 | agent | tools | `finish` | role |
 |---|---|---|---|
-| `plan` | read write edit ls bash plan_write spawn ask finish | done, blocked | refines the goal with the human through `ask`, writes the plan to `docs/notes/`; never builds or hands off |
+| `plan` | read write edit ls bash plan_write spawn ask finish | done, blocked | breaks the request into requirements (or follows a requirements skill), settles decisions through `ask`, delegates fact-finding to `explore`, and writes a self-contained plan to `docs/notes/` (or tickets, under a ticket skill): steps with acceptance criteria, the tests that prove them, seed data, and a test and verification strategy; never writes code or tests, never hands off |
 | `build` | read write edit ls bash spawn hand_off finish | done, blocked | implements and verifies; delegates exploration to `explore` via `spawn`; `hand_off` to `review` when delivered, to a fresh `build` when a batch is done |
 | `explore` | read ls bash spawn finish | handoff, blocked | internal; investigates read-only, hands terse `path:line` findings back to the agent that spawned it |
 | `review` | read ls bash hand_off finish | done, blocked | internal; verifies the work independently; `done` when satisfied, `hand_off` back to `build` with instructions otherwise |
@@ -67,7 +67,7 @@ An agent ends a run by calling `finish`:
 ```
 
 - `done`: the goal is achieved and verified.
-- `handoff`: this agent's part is done; `next.agent` continues with `next.task`. `next` is required for `handoff` and not allowed otherwise. `next.task` must stand alone: the next agent starts with a fresh context. Longer handoff notes go in `.genji/tmp/handoff-<short>.txt`, never under `docs/`.
+- `handoff`: this agent's part is done; `next.agent` continues with `next.task`. `next` is required for `handoff` and not allowed otherwise. `next.task` must stand alone: the next agent starts with a fresh context. Longer handoff notes go in `/tmp/handoff-<short>.txt`, never in the repository.
 - `blocked`: a human must step in.
 
 `finish` rejects statuses outside the agent's `finish:` list, unknown agents and

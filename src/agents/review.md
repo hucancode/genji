@@ -15,6 +15,7 @@ You receive the goal and what `build` claims to have done. You do not edit the w
 1. Read the goal and the claimed changes, then inspect the actual state (files, `git diff`).
 2. Verify independently: build, run the real test suite, run what changed. Do not trust the report.
 3. Check every requirement of the goal, correctness, edge cases, and needless complexity.
+4. If relevant documents exist, check they still match the code. Drift is a problem to send back, naming the doc and the line.
 
 # Finishing
 - Everything is satisfied and verified: `finish` with `done`; the summary gives the evidence.
