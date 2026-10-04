@@ -7,6 +7,7 @@ An agent is a markdown file: frontmatter plus the system prompt.
 description: Reviews a diff and reports problems     # shown in `genji --help` and in other agents' prompts
 tools: read, ls, bash, finish                        # read write edit ls bash plan_write spawn ask hand_off finish
 skills: formal                                         # optional: skills inlined into the system prompt at start
+context: docs/notes.md                                 # optional: files (or `dir/` listings) put in front of a fresh instance's task, after which come those of forced skills (`metadata.context`)
 finish: handoff, blocked                             # optional: statuses `finish` accepts (default: done, handoff, blocked)
 model: some-model                                    # optional: overrides the provider's model
 internal: true                                       # optional: reached only through `hand_off`/`spawn`; front ends do not offer it for a new session
@@ -37,8 +38,8 @@ The files `genji init` writes:
 | agent | tools | `finish` | role |
 |---|---|---|---|
 | `plan` | read write edit ls bash plan_write spawn ask finish | done, blocked | refines the goal with the human through `ask`, writes the plan to `docs/notes/`; never builds or hands off |
-| `build` | read write edit ls bash spawn hand_off finish | done, blocked | implements and verifies; `hand_off` to `review` when delivered, to a fresh `build` when a batch is done |
-| `explore` | read ls bash spawn finish | handoff, blocked | internal; investigates, hands findings back to `plan` |
+| `build` | read write edit ls bash spawn hand_off finish | done, blocked | implements and verifies; delegates exploration to `explore` via `spawn`; `hand_off` to `review` when delivered, to a fresh `build` when a batch is done |
+| `explore` | read ls bash spawn finish | handoff, blocked | internal; investigates read-only, hands terse `path:line` findings back to the agent that spawned it |
 | `review` | read ls bash hand_off finish | done, blocked | internal; verifies the work independently; `done` when satisfied, `hand_off` back to `build` with instructions otherwise |
 | `retro` | read write edit ls bash finish | done, blocked | improves agents and skills from recorded sessions |
 
@@ -66,7 +67,7 @@ An agent ends a run by calling `finish`:
 ```
 
 - `done`: the goal is achieved and verified.
-- `handoff`: this agent's part is done; `next.agent` continues with `next.task`. `next` is required for `handoff` and not allowed otherwise. `next.task` must stand alone: the next agent starts with a fresh context.
+- `handoff`: this agent's part is done; `next.agent` continues with `next.task`. `next` is required for `handoff` and not allowed otherwise. `next.task` must stand alone: the next agent starts with a fresh context. Longer handoff notes go in `.genji/tmp/handoff-<short>.txt`, never under `docs/`.
 - `blocked`: a human must step in.
 
 `finish` rejects statuses outside the agent's `finish:` list, unknown agents and

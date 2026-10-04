@@ -23,7 +23,8 @@ Read `references/formats.md` first. Run `scripts/extract.sh <file>`.
 | `name` | Lowercase letters, digits and single hyphens, at most 64 chars. Defaults to the directory name. |
 | `description` | Required. Shown to the model to decide when the skill applies. |
 | `disable-model-invocation` | `true` leaves the skill out of the prompt's skill list; it is then used only through an agent's `skills:`. |
-| `license`, `compatibility`, `metadata`, `allowed-tools` | Accepted and ignored. |
+| `metadata.context` | Comma-separated workspace files the skill maintains (a `dir/` entry lists the directory). For an agent that forces the skill through `skills:`, they are put in front of a fresh instance's task, and missing files are marked. |
+| `license`, `compatibility`, other `metadata`, `allowed-tools` | Accepted and ignored. |
 
 A skill without a description or with an invalid name is skipped with a warning.
 

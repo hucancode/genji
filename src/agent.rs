@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -19,7 +19,19 @@ const STOPPED_BY_USER: &str = "(stopped by user via control socket)";
 /// Sent for the last few tool-call turns so the run ends with a handoff or report, not a cut-off.
 const WRAP_UP: &str = "[note] You are about to run out of tool calls and will be cut off. Wrap up now: stop starting new work, then call hand_off or finish with a standalone report of what is done, what remains, and where the state lives.";
 const WRAP_UP_TURNS: usize = 5;
-const PRUNE_EVERY: usize = 16;
+/// Messages between prune checks, so one prune clears many turns.
+/// Tools whose repeated identical output is replaced by a pointer to the earlier result.
+const DEDUPED: [&str; 3] = ["read", "ls", "bash"];
+const PRUNE_MIN_GAP: usize = 8;
+/// A prune rewrites the cached prefix; it must free at least this many tokens...
+const PRUNE_MIN_FREE_TOKENS: i64 = 2000;
+/// ...or this fraction of the context, whichever is larger.
+const PRUNE_MIN_FREE_FRACTION: f64 = 0.15;
+/// Provider prompt caches expire after about this long idle, so the prefix is free to rewrite.
+const CACHE_TTL: Duration = Duration::from_secs(300);
+const CACHE_COLD_MIN_FREE_TOKENS: i64 = 500;
+/// Past this fraction of the window, any stale content goes (before compaction is needed).
+const PRUNE_PRESSURE: f64 = 0.5;
 const NUDGE: &str = "[note] End by calling finish.";
 const CONTINUE: &str = "Continue from where you left off.";
 const TRUNCATED_HINT: &str = "[note] Your last response was cut off by the output limit. Continue with smaller steps: split large writes into several edits.";
@@ -52,6 +64,8 @@ pub struct Agent {
     tokens_used: i64,
     token_limit: i64,
     started: Instant,
+    /// (tool, raw args) -> (call id, result hash) of the latest read-only call, for dedupe.
+    seen: HashMap<(String, String), (String, u64)>,
 }
 
 pub struct AgentParams {
@@ -137,6 +151,80 @@ fn build_system(
         ));
     }
     Ok(s)
+}
+
+/// The `context:` files of an agent definition, rendered for the first message: file contents
+/// (capped), a listing for entries ending in `/`, and a note for the ones that do not exist yet.
+fn project_docs(workspace: &Path, paths: &[String]) -> String {
+    const MAX: usize = 8 * 1024;
+    let mut out = String::from("# Project docs\n");
+    for p in paths {
+        let full = workspace.join(p);
+        if p.ends_with('/') {
+            let mut names: Vec<String> = std::fs::read_dir(&full)
+                .map(|d| {
+                    d.flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            if names.is_empty() {
+                out.push_str(&format!("\n## {p}\n(empty or missing)\n"));
+            } else {
+                out.push_str(&format!("\n## {p}\n{}\n", names.join("\n")));
+            }
+            continue;
+        }
+        match std::fs::read_to_string(&full) {
+            Ok(text) => {
+                let body = llm::truncate(&text, MAX);
+                out.push_str(&format!("\n## {p}\n{}\n", body.trim_end()));
+            }
+            Err(_) => out.push_str(&format!("\n## {p}\n({p} does not exist yet)\n")),
+        }
+    }
+    out
+}
+
+/// The same read-only call returning the same output as an earlier call whose result is still
+/// verbatim in context is answered with a pointer to it instead of a second copy.
+fn dedupe(
+    seen: &mut HashMap<(String, String), (String, u64)>,
+    ctx: &ContextComposer,
+    tc: &ToolCall,
+    result: String,
+) -> String {
+    let hash = hash_of(&result);
+    let key = (tc.name().to_string(), tc.args().to_string());
+    if let Some((id, h)) = seen.get(&key) {
+        let intact = ctx.tool_result(id).is_some_and(|c| hash_of(c) == *h);
+        if *h == hash && intact {
+            return format!("[unchanged since call {id}: identical output is above in context]");
+        }
+    }
+    seen.insert(key, (tc.id.clone(), hash));
+    result
+}
+
+fn hash_of(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Pruning trades tokens freed against rewriting the cached prefix: prune when the gain is large
+/// relative to the context, when the cache has expired anyway, or when the window is filling.
+fn should_prune(freed: i64, est_tokens: i64, window: i64, idle: Duration) -> bool {
+    if freed <= 0 {
+        return false;
+    }
+    let worth_rewrite =
+        freed >= PRUNE_MIN_FREE_TOKENS.max((est_tokens as f64 * PRUNE_MIN_FREE_FRACTION) as i64);
+    let cache_cold = idle >= CACHE_TTL && freed >= CACHE_COLD_MIN_FREE_TOKENS;
+    let pressure = est_tokens as f64 >= window as f64 * PRUNE_PRESSURE;
+    worth_rewrite || cache_cold || pressure
 }
 
 fn is_context_overflow(err: &str) -> bool {
@@ -235,6 +323,7 @@ impl Agent {
             tokens_used,
             token_limit,
             started: Instant::now(),
+            seen: HashMap::new(),
         };
         // `spawn`, `finish` and `hand_off` are safe to run again; any other call may have partly run.
         for tc in pending {
@@ -311,11 +400,28 @@ impl Agent {
         self.call_tag = sanitize(&tc.id);
         self.call_id = tc.id.clone();
         let start = Instant::now();
-        let (result, is_error) = match serde_json::from_str::<Value>(tc.args()) {
+        let (mut result, is_error) = match serde_json::from_str::<Value>(tc.args()) {
             Ok(args) => tools::dispatch(self, tc.name(), &args),
             Err(e) => (format!("ERROR: invalid JSON tool arguments: {e}"), true),
         };
+        if !is_error && DEDUPED.contains(&tc.name()) {
+            let ctx = self.context.read().unwrap();
+            result = dedupe(&mut self.seen, &ctx, tc, result);
+        }
         self.log_result(tc, result, is_error, start.elapsed());
+    }
+
+    /// The agent's `context:` files, then those of the skills it forces, without repeats.
+    fn context_paths(&self) -> Vec<String> {
+        let skills = config::load_skills(&self.workspace);
+        let mut out: Vec<String> = Vec::new();
+        let forced = self.def.skills.iter().filter_map(|n| skills.get(n));
+        for p in self.def.context.iter().chain(forced.flat_map(|k| &k.context)) {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+        out
     }
 
     /// Run until the agent finishes or stops, then record `instance_end`.
@@ -329,7 +435,16 @@ impl Agent {
             .messages()
             .last()
             .map(|m| m.role);
+        let paths = if self.context.read().unwrap().len() == 1 {
+            self.context_paths()
+        } else {
+            Vec::new()
+        };
         match (task, last) {
+            (Some(t), _) if !paths.is_empty() => {
+                let docs = project_docs(&self.workspace, &paths);
+                self.log(ChatMessage::user(format!("{docs}\n# Task\n{t}")));
+            }
             (Some(t), _) => self.log(ChatMessage::user(t)),
             (None, Some(Role::Assistant)) => self.log(ChatMessage::user(CONTINUE)),
             _ => {}
@@ -394,6 +509,7 @@ impl Agent {
         let mut overflow_retried = false;
         let mut nudged = false;
         let mut pruned_at = self.context.read().unwrap().len();
+        let mut last_call = Instant::now();
         // One-request note after the context; never stored.
         let mut hint: Option<&str> = None;
         loop {
@@ -407,7 +523,7 @@ impl Agent {
             }
             self.set_status();
             self.maybe_compact(self.cfg.compact_threshold, true)?;
-            self.maybe_prune(&mut pruned_at);
+            self.maybe_prune(&mut pruned_at, last_call);
             if hint.is_none() && iterations + WRAP_UP_TURNS >= self.cfg.max_tool_iterations {
                 hint = Some(WRAP_UP);
             }
@@ -415,6 +531,7 @@ impl Agent {
                 let ctx = self.context.read().unwrap();
                 self.llm.chat(ctx.messages(), ctx.tools(), hint.take())
             };
+            last_call = Instant::now();
             let resp = match result {
                 Ok(r) => r,
                 Err(e) if !overflow_retried && is_context_overflow(&format!("{e:#}")) => {
@@ -523,34 +640,48 @@ impl Agent {
         (ctrl.stop_requested(), !queued.is_empty())
     }
 
-    /// Every `PRUNE_EVERY` new messages, drop what the model no longer needs. Batched so the
-    /// provider's prompt cache is rewritten rarely, not on every call.
-    fn maybe_prune(&mut self, pruned_at: &mut usize) {
+    /// Drops what the model no longer needs, but only when it pays for rewriting the provider's
+    /// cached prefix (see `should_prune`); checked every `PRUNE_MIN_GAP` new messages.
+    fn maybe_prune(&mut self, pruned_at: &mut usize, last_call: Instant) {
         let len = self.context.read().unwrap().len();
         if len < *pruned_at {
             *pruned_at = len;
         }
-        if len - *pruned_at < PRUNE_EVERY {
+        if len - *pruned_at < PRUNE_MIN_GAP {
             return;
         }
         *pruned_at = len;
         let keep = self.cfg.prune_keep_recent;
-        if self.context.write().unwrap().prune(keep) {
-            self.events.prune(keep);
+        let ctx = self.context.read().unwrap();
+        // Old results stay verbatim (cache and facts intact) until the window fills.
+        let bulk = ctx.over(PRUNE_PRESSURE);
+        let gain = ctx.prune_gain(keep, bulk);
+        let go = should_prune(
+            gain,
+            ctx.est_tokens(),
+            ctx.context_window(),
+            last_call.elapsed(),
+        );
+        drop(ctx);
+        if go && self.context.write().unwrap().prune(keep, bulk) {
+            self.events.prune(keep, bulk);
         }
     }
 
-    /// Prune old tool results, then summarize older turns, once the context nears the window.
+    /// Prune old tool results (gently, then tightly), then summarize older turns, once the context nears the window.
     /// Both are logged so a resume rebuilds the same context.
     fn maybe_compact(&mut self, threshold: f64, optional: bool) -> Result<()> {
         let keep = self.cfg.compact_keep_recent;
         if !self.context.read().unwrap().over(threshold) {
             return Ok(());
         }
-        if self.context.write().unwrap().prune(keep) {
-            self.events.prune(keep);
-            if !self.context.read().unwrap().over(threshold) {
-                return Ok(());
+        // Gentle prune first; the tight one only if that was not enough.
+        for keep in [self.cfg.prune_keep_recent.max(keep), keep] {
+            if self.context.write().unwrap().prune(keep, true) {
+                self.events.prune(keep, true);
+                if !self.context.read().unwrap().over(threshold) {
+                    return Ok(());
+                }
             }
         }
         let Some((rendered, kept)) = self.context.read().unwrap().compaction_source(keep) else {
@@ -594,6 +725,58 @@ mod tests {
     use crate::storage::util::temp_dir;
 
     #[test]
+    fn project_docs_render_files_listings_and_missing() {
+        let ws = temp_dir("docs");
+        std::fs::create_dir_all(ws.join("docs/adr")).unwrap();
+        std::fs::write(ws.join("docs/architecture.md"), "- src/a.rs — a\n").unwrap();
+        std::fs::write(ws.join("docs/adr/orm.md"), "x").unwrap();
+        let out = project_docs(
+            &ws,
+            &["docs/architecture.md".into(), "docs/domain-model.md".into(), "docs/adr/".into()],
+        );
+        assert!(out.contains("## docs/architecture.md\n- src/a.rs — a\n"), "{out}");
+        assert!(out.contains("(docs/domain-model.md does not exist yet)"), "{out}");
+        assert!(out.contains("## docs/adr/\norm.md"), "{out}");
+    }
+
+    #[test]
+    fn repeated_output_still_in_context_is_deduped() {
+        let mut seen = HashMap::new();
+        let mut ctx = ContextComposer::new("sys".into(), vec![], 1000);
+        let call = |id: &str| ToolCall::new(id, "bash", r#"{"command":"cat a"}"#.to_string());
+        let mut run = |ctx: &mut ContextComposer, id: &str, out: &str| {
+            let r = dedupe(&mut seen, ctx, &call(id), out.to_string());
+            ctx.push(ChatMessage::tool_result(id, r.clone()));
+            r
+        };
+        assert_eq!(run(&mut ctx, "c1", "body"), "body");
+        assert!(run(&mut ctx, "c2", "body").contains("unchanged since call c1"));
+        assert_eq!(run(&mut ctx, "c3", "changed"), "changed");
+        assert!(run(&mut ctx, "c4", "changed").contains("call c3"));
+        // An earlier result that was elided no longer counts.
+        let big = "x".repeat(5000);
+        assert_eq!(run(&mut ctx, "c5", &big), big);
+        for i in 0..4 {
+            ctx.push(ChatMessage::user(format!("m{i}")));
+        }
+        assert!(ctx.prune(2, true));
+        assert_eq!(run(&mut ctx, "c6", &big), big);
+    }
+
+    #[test]
+    fn prune_gate_weighs_gain_against_cache_rewrite() {
+        let hot = Duration::from_secs(5);
+        let cold = CACHE_TTL;
+        assert!(!should_prune(0, 100_000, 350_000, cold));
+        assert!(!should_prune(1000, 100_000, 350_000, hot));
+        assert!(!should_prune(10_000, 100_000, 350_000, hot));
+        assert!(should_prune(15_000, 100_000, 350_000, hot));
+        assert!(should_prune(600, 100_000, 350_000, cold));
+        assert!(!should_prune(400, 100_000, 350_000, cold));
+        assert!(should_prune(10, 200_000, 350_000, hot));
+    }
+
+    #[test]
     fn detects_context_overflow_errors() {
         assert!(is_context_overflow(
             "HTTP 400: {\"code\":\"context_length_exceeded\"}"
@@ -607,13 +790,26 @@ mod tests {
         let ws = temp_dir("system");
         let skill_dir = ws.join(".agents/skills/formal");
         std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: formal\ndescription: tracks work\n---\nbody\n").unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: formal\ndescription: tracks work\n---\nbody\n",
+        )
+        .unwrap();
         config::tests::write_agents(
             &ws,
             &[
-                ("lead", "---\ndescription: leads\ntools: read, finish\n---\nl"),
-                ("worker", "---\ndescription: works\ntools: read, finish\n---\nw"),
-                ("scout", "---\ndescription: scouts\ntools: read, finish\n---\ns"),
+                (
+                    "lead",
+                    "---\ndescription: leads\ntools: read, finish\n---\nl",
+                ),
+                (
+                    "worker",
+                    "---\ndescription: works\ntools: read, finish\n---\nw",
+                ),
+                (
+                    "scout",
+                    "---\ndescription: scouts\ntools: read, finish\n---\ns",
+                ),
             ],
         );
         let agents = config::load_agents(&ws);

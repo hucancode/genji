@@ -682,7 +682,7 @@ fn registry() -> &'static [Tool] {
     static TOOLS: OnceLock<Vec<Tool>> = OnceLock::new();
     TOOLS.get_or_init(|| {
         vec![
-            tool("read", "Read a text file with line numbers. offset is 1-indexed.", json!({
+            tool("read", "Read a text file with line numbers; offset is 1-indexed. Prefer this over cat/sed/head/tail in bash for reading files: page large files with offset/limit, and a repeat of unchanged content returns a one-line pointer to the earlier result instead of a second copy.", json!({
                 "type":"object",
                 "properties":{
                     "path":{"type":"string","description":"File path"},
@@ -896,6 +896,7 @@ mod tests {
             prompt: String::new(),
             tools: vec![],
             skills: vec![],
+            context: vec![],
             finish: vec!["done".into(), "handoff".into()],
             model: None,
             internal: false,

@@ -72,83 +72,35 @@ pub mod context {
         }
 
         /// Drops what the model no longer needs, deterministically from the messages alone
-        /// (replay applies the same call):
-        /// - `read` results for a file that was written or edited later, or read again later;
-        /// - bulky tool results older than the last `keep` messages;
-        /// - old `write`/`edit` payloads and reasoning, since the file on disk is the truth.
-        pub fn prune(&mut self, keep: usize) -> bool {
-            const MAX: usize = 1000;
-            const STUB: &str = "[superseded: the file changed or was read again later; read it again if needed]";
-            let old = self.messages.len().saturating_sub(keep.max(2));
-            // call id -> (call message index, tool, path, read signature)
-            let mut calls: HashMap<String, (usize, String, String, String)> = HashMap::new();
-            let mut last_change: HashMap<String, usize> = HashMap::new();
-            let mut last_read: HashMap<String, usize> = HashMap::new();
-            for (i, m) in self.messages.iter().enumerate() {
-                for c in &m.tool_calls {
-                    let args: Value = serde_json::from_str(c.args()).unwrap_or(Value::Null);
-                    let path = args["path"].as_str().unwrap_or_default().to_string();
-                    let sig = format!("{path}:{}:{}", args["offset"], args["limit"]);
-                    match c.name() {
-                        "write" | "edit" if !path.is_empty() => {
-                            last_change.insert(path.clone(), i);
-                        }
-                        "read" if !path.is_empty() => {
-                            last_read.insert(sig.clone(), i);
-                        }
-                        _ => {}
-                    }
-                    calls.insert(c.id.clone(), (i, c.name().to_string(), path, sig));
-                }
-            }
-            let mut changed = false;
-            for (i, m) in self.messages.iter_mut().enumerate() {
-                if m.role == Role::Tool {
-                    let stale = m
-                        .tool_call_id
-                        .as_ref()
-                        .and_then(|id| calls.get(id))
-                        .is_some_and(|(at, name, path, sig)| {
-                            name == "read"
-                                && (last_change.get(path).is_some_and(|l| l > at)
-                                    || last_read.get(sig).is_some_and(|l| l > at))
-                        });
-                    if stale && m.content.len() > STUB.len() {
-                        m.content = STUB.to_string();
-                        changed = true;
-                    } else if i < old && m.content.len() > MAX {
-                        m.content = format!(
-                            "{}\n[older output elided: {} bytes; re-run the tool if needed]",
-                            llm::truncate(&m.content, MAX / 2),
-                            m.content.len()
-                        );
-                        changed = true;
-                    }
-                } else if i < old && m.role == Role::Assistant {
-                    if m.reasoning_content.as_deref().is_some_and(|r| !r.is_empty()) {
-                        m.reasoning_content = None;
-                        changed = true;
-                    }
-                    for c in &mut m.tool_calls {
-                        if matches!(c.function.name.as_str(), "write" | "edit")
-                            && c.function.arguments.len() > 500
-                        {
-                            let args: Value =
-                                serde_json::from_str(&c.function.arguments).unwrap_or(Value::Null);
-                            c.function.arguments = json!({
-                                "path": args["path"],
-                                "elided_bytes": c.function.arguments.len(),
-                            })
-                            .to_string();
-                            changed = true;
-                        }
-                    }
-                }
-            }
+        /// (replay applies the same call); see `prune_messages`.
+        pub fn prune(&mut self, keep: usize, bulk: bool) -> bool {
+            let changed = prune_messages(&mut self.messages, keep, bulk);
             if changed {
                 self.last_prompt_tokens = 0;
             }
             changed
+        }
+
+        /// Estimated tokens `prune(keep, bulk)` would free, without changing anything.
+        pub fn prune_gain(&self, keep: usize, bulk: bool) -> i64 {
+            let mut copy = self.messages.clone();
+            if !prune_messages(&mut copy, keep, bulk) {
+                return 0;
+            }
+            llm::estimate_messages(&self.messages) - llm::estimate_messages(&copy)
+        }
+
+        /// The content of the tool result answering call `id`, if it is still in context.
+        pub fn tool_result(&self, id: &str) -> Option<&str> {
+            self.messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(id))
+                .map(|m| m.content.as_str())
+        }
+
+        pub fn context_window(&self) -> i64 {
+            self.context_window
         }
 
         pub fn len(&self) -> usize {
@@ -179,6 +131,86 @@ pub mod context {
             self.messages.extend(recent);
             self.last_prompt_tokens = 0;
         }
+    }
+
+    /// - `read` results for a file that was written or edited later, or read again later;
+    /// - with `bulk`, tool results older than the last `keep` messages; without it, old results
+    ///   stay verbatim so the agent does not re-read what it already saw;
+    /// - old `write`/`edit` payloads and reasoning, since the file on disk is the truth.
+    fn prune_messages(messages: &mut [ChatMessage], keep: usize, bulk: bool) -> bool {
+        const MAX: usize = 1000;
+        const STUB: &str =
+            "[superseded: the file changed or was read again later; read it again if needed]";
+        let old = messages.len().saturating_sub(keep.max(2));
+        // call id -> (call message index, tool, path, read signature)
+        let mut calls: HashMap<String, (usize, String, String, String)> = HashMap::new();
+        let mut last_change: HashMap<String, usize> = HashMap::new();
+        let mut last_read: HashMap<String, usize> = HashMap::new();
+        for (i, m) in messages.iter().enumerate() {
+            for c in &m.tool_calls {
+                let args: Value = serde_json::from_str(c.args()).unwrap_or(Value::Null);
+                let path = args["path"].as_str().unwrap_or_default().to_string();
+                let sig = format!("{path}:{}:{}", args["offset"], args["limit"]);
+                match c.name() {
+                    "write" | "edit" if !path.is_empty() => {
+                        last_change.insert(path.clone(), i);
+                    }
+                    "read" if !path.is_empty() => {
+                        last_read.insert(sig.clone(), i);
+                    }
+                    _ => {}
+                }
+                calls.insert(c.id.clone(), (i, c.name().to_string(), path, sig));
+            }
+        }
+        let mut changed = false;
+        for (i, m) in messages.iter_mut().enumerate() {
+            if m.role == Role::Tool {
+                let stale = m
+                    .tool_call_id
+                    .as_ref()
+                    .and_then(|id| calls.get(id))
+                    .is_some_and(|(at, name, path, sig)| {
+                        name == "read"
+                            && (last_change.get(path).is_some_and(|l| l > at)
+                                || last_read.get(sig).is_some_and(|l| l > at))
+                    });
+                if stale && m.content.len() > STUB.len() {
+                    m.content = STUB.to_string();
+                    changed = true;
+                } else if bulk && i < old && m.content.len() > MAX {
+                    m.content = format!(
+                        "{}\n[older output elided: {} bytes; re-run the tool if needed]",
+                        llm::truncate(&m.content, MAX / 2),
+                        m.content.len()
+                    );
+                    changed = true;
+                }
+            } else if i < old && m.role == Role::Assistant {
+                if m.reasoning_content
+                    .as_deref()
+                    .is_some_and(|r| !r.is_empty())
+                {
+                    m.reasoning_content = None;
+                    changed = true;
+                }
+                for c in &mut m.tool_calls {
+                    if matches!(c.function.name.as_str(), "write" | "edit")
+                        && c.function.arguments.len() > 500
+                    {
+                        let args: Value =
+                            serde_json::from_str(&c.function.arguments).unwrap_or(Value::Null);
+                        c.function.arguments = json!({
+                            "path": args["path"],
+                            "elided_bytes": c.function.arguments.len(),
+                        })
+                        .to_string();
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
     }
 
     fn render(msgs: &[ChatMessage]) -> String {
@@ -219,15 +251,47 @@ pub mod context {
             c.push(ChatMessage::tool_result("1", "x".repeat(5000)));
             c.push(ChatMessage::user("mid"));
             c.push(ChatMessage::tool_result("2", "y".repeat(5000)));
-            assert!(c.prune(2));
+            assert!(c.prune(2, true));
             assert!(c.messages()[1].content.len() < 1000);
             assert_eq!(c.messages()[3].content.len(), 5000);
-            assert!(!c.prune(2));
+            assert!(!c.prune(2, true));
+        }
+
+        #[test]
+        fn prune_gain_previews_without_changing() {
+            let mut c = ContextComposer::new("sys".into(), vec![], 100);
+            c.push(ChatMessage::tool_result("1", "x".repeat(5000)));
+            c.push(ChatMessage::user("mid"));
+            c.push(ChatMessage::tool_result("2", "y".repeat(5000)));
+            let before = c.messages()[1].content.len();
+            let gain = c.prune_gain(2, true);
+            assert!(gain > 1000);
+            assert_eq!(c.messages()[1].content.len(), before);
+            assert!(c.prune(2, true));
+            assert_eq!(c.prune_gain(2, true), 0);
+        }
+
+        #[test]
+        fn prune_without_bulk_keeps_old_results_but_drops_superseded_reads() {
+            let mut c = ContextComposer::new("sys".into(), vec![], 100);
+            c.push(call("r1", "read", json!({"path": "a.rs"})));
+            c.push(ChatMessage::tool_result("r1", "x".repeat(5000)));
+            c.push(call("b1", "bash", json!({"command": "ls"})));
+            c.push(ChatMessage::tool_result("b1", "y".repeat(5000)));
+            c.push(call("e1", "edit", json!({"path": "a.rs"})));
+            c.push(ChatMessage::user("mid"));
+            c.push(ChatMessage::user("end"));
+            assert!(c.prune(2, false));
+            assert!(c.messages()[2].content.starts_with("[superseded"));
+            assert_eq!(c.messages()[4].content.len(), 5000);
+            assert!(c.prune(2, true));
+            assert!(c.messages()[4].content.len() < 1000);
         }
 
         fn call(id: &str, name: &str, args: Value) -> ChatMessage {
             let mut m = ChatMessage::default();
-            m.tool_calls.push(llm::ToolCall::new(id, name, args.to_string()));
+            m.tool_calls
+                .push(llm::ToolCall::new(id, name, args.to_string()));
             m
         }
 
@@ -239,33 +303,41 @@ pub mod context {
             c.push(ChatMessage::tool_result("r1", big.clone()));
             c.push(call("r2", "read", json!({"path": "b.rs"})));
             c.push(ChatMessage::tool_result("r2", big.clone()));
-            c.push(call("e1", "edit", json!({"path": "a.rs", "oldText": "a", "newText": "b"})));
+            c.push(call(
+                "e1",
+                "edit",
+                json!({"path": "a.rs", "oldText": "a", "newText": "b"}),
+            ));
             c.push(ChatMessage::tool_result("e1", "ok"));
             c.push(call("r3", "read", json!({"path": "b.rs"})));
             c.push(ChatMessage::tool_result("r3", big.clone()));
-            assert!(c.prune(100));
+            assert!(c.prune(100, true));
             let m = c.messages();
             assert!(m[2].content.starts_with("[superseded"), "edited later");
             assert!(m[4].content.starts_with("[superseded"), "re-read later");
             assert_eq!(m[8].content, big, "latest read stays");
             assert_eq!(m[6].content, "ok");
-            assert!(!c.prune(100));
+            assert!(!c.prune(100, true));
         }
 
         #[test]
         fn prune_slims_old_write_payloads_and_reasoning() {
             let mut c = ContextComposer::new("sys".into(), vec![], 100);
-            let mut m = call("w1", "write", json!({"path": "a.rs", "content": "y".repeat(2000)}));
+            let mut m = call(
+                "w1",
+                "write",
+                json!({"path": "a.rs", "content": "y".repeat(2000)}),
+            );
             m.reasoning_content = Some("thinking".into());
             c.push(m);
             c.push(ChatMessage::tool_result("w1", "ok"));
             c.push(ChatMessage::user("u"));
             c.push(ChatMessage::user("v"));
-            assert!(c.prune(2));
+            assert!(c.prune(2, true));
             let a = &c.messages()[1];
             assert!(a.reasoning_content.is_none());
             assert!(a.tool_calls[0].args().len() < 100 && a.tool_calls[0].args().contains("a.rs"));
-            assert!(!c.prune(2));
+            assert!(!c.prune(2, true));
         }
 
         #[test]
@@ -434,8 +506,8 @@ pub mod events {
             self.emit(json!({ "type": "tokens", "used": used, "prompt": prompt, "completion": completion, "cached": cached }));
         }
 
-        pub fn prune(&self, keep: usize) {
-            self.emit(json!({ "type": "prune", "keep": keep }));
+        pub fn prune(&self, keep: usize, bulk: bool) {
+            self.emit(json!({ "type": "prune", "keep": keep, "bulk": bulk }));
         }
 
         pub fn compaction(&self, summary: &str, kept: usize, removed: usize, used: i64) {
@@ -552,7 +624,10 @@ pub mod events {
                     text_of(&e, "result"),
                 )),
                 ("prune", Some(c)) => {
-                    c.prune(e["keep"].as_u64().unwrap_or(0) as usize);
+                    c.prune(
+                        e["keep"].as_u64().unwrap_or(0) as usize,
+                        e["bulk"].as_bool().unwrap_or(true),
+                    );
                 }
                 ("compaction", Some(c)) => {
                     c.apply_compaction(
@@ -724,8 +799,8 @@ pub mod events {
             }
             e.tokens(500, 400, 100, 0);
             live.set_last_prompt_tokens(400);
-            assert!(live.prune(2));
-            e.prune(2);
+            assert!(live.prune(2, true));
+            e.prune(2, true);
             let (_, kept) = live.compaction_source(2).unwrap();
             live.apply_compaction("SUMMARY", kept);
             e.compaction("SUMMARY", kept, 5, 700);

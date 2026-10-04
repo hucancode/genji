@@ -13,14 +13,23 @@ next. Context is pull-only: it is never written to the event stream.
 
 ## Pruning and compaction
 
-A `prune` event drops what the model no longer needs. It runs every 16 new
-messages, and again when the prompt reaches `compact_threshold × context_window`.
+A `prune` event drops what the model no longer needs. Rewriting old messages
+invalidates the provider's cached prompt prefix, so pruning is batched: every 8 new
+messages the agent previews how many tokens a prune would free and prunes only when
+the gain is at least 2000 tokens and 15% of the context, or the cache has been idle
+for 5 minutes (so it is cold anyway) and the gain is at least 500 tokens, or the
+prompt is past half the window. Between prunes the prefix stays byte-stable. Below
+half the window a prune never elides old tool results (`bulk: false`), so the agent
+keeps what it already read. When
+the prompt reaches `compact_threshold × context_window` it prunes with
+`prune_keep_recent`, then with `compact_keep_recent` if still over.
 Replay applies the same operation, so the rebuilt context is identical:
 
 - a `read` result is replaced by a stub when the file was written or edited later,
   or the same range was read again later;
-- tool results larger than 1000 bytes older than the last `prune_keep_recent`
-  messages (`compact_keep_recent` at the threshold) are elided to a short head;
+- with `bulk`, tool results larger than 1000 bytes older than the last
+  `prune_keep_recent` messages (`compact_keep_recent` at the threshold) are elided
+  to a short head;
 - older `write`/`edit` payloads shrink to the path and size, and older assistant
   reasoning is dropped, since the file on disk is the source of truth.
 
@@ -29,6 +38,11 @@ the model into sections (goal, decisions, files, commands and outcomes, open
 problems, next step) and replaced with one summary message (a `compaction` event);
 the system prompt and the most recent messages stay. Tool-call/result pairs are
 never split.
+
+A `read`, `ls` or `bash` call with the same arguments as an earlier one, whose
+output is identical and whose earlier result is still verbatim in context, returns
+`[unchanged since call <id>: …]` instead of a second copy. The call still runs, so
+changed output is returned in full.
 
 Tool output is bounded at `tool_result_max_bytes` and the full text is spilled to
 `.genji/tmp`. `bash` output keeps its head and its tail, because failures and test

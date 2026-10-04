@@ -171,6 +171,8 @@ pub struct AgentDef {
     pub tools: Vec<String>,
     /// Skills rendered into the system prompt at start.
     pub skills: Vec<String>,
+    /// Workspace files (or `dir/` listings) put in front of a fresh instance's task.
+    pub context: Vec<String>,
     /// Statuses `finish` may use: done | handoff | blocked.
     pub finish: Vec<String>,
     pub model: Option<String>,
@@ -195,6 +197,7 @@ fn parse_agent(name: &str, text: &str) -> AgentDef {
         prompt,
         tools: list(&meta, "tools").unwrap_or_default(),
         skills: list(&meta, "skills").unwrap_or_default(),
+        context: list(&meta, "context").unwrap_or_default(),
         finish: list(&meta, "finish")
             .unwrap_or_else(|| ["done", "handoff", "blocked"].map(String::from).into()),
         model: meta.get("model").filter(|m| !m.is_empty()).cloned(),
@@ -312,6 +315,9 @@ pub struct Skill {
     pub body: String,
     /// Left out of the skills list in the system prompt; still usable through `skills:`.
     pub disable_model_invocation: bool,
+    /// Workspace files the skill maintains (`metadata: context:`), put in front of a fresh
+    /// instance's task for agents that force the skill.
+    pub context: Vec<String>,
 }
 
 /// A skill name: lowercase letters, digits and single hyphens, at most 64 chars.
@@ -353,6 +359,7 @@ fn parse_skill(path: PathBuf, text: &str) -> Result<Skill, String> {
         disable_model_invocation: meta
             .get("disable-model-invocation")
             .is_some_and(|v| v == "true"),
+        context: list(&meta, "context").unwrap_or_default(),
     })
 }
 
@@ -429,6 +436,7 @@ pub(crate) mod tests {
         );
         assert_eq!(agents["plan"].finish, ["done", "blocked"]);
         assert_eq!(agents["build"].finish, ["done", "blocked"]);
+        assert!(agents["build"].context.is_empty());
         assert!(load_skills(&ws).is_empty());
         assert!(!skills_dir(&ws).exists());
     }
@@ -537,7 +545,11 @@ pub(crate) mod tests {
     fn workspace_skills_are_found_recursively() {
         let ws = temp_dir("skills");
         skill(&ws, "formal", "---\nname: formal\ndescription: mine\n---\nbody\n");
-        skill(&ws, "group/pdf-tools", "---\nname: pdf-tools\ndescription: pdfs\n---\nx\n");
+        skill(
+            &ws,
+            "group/pdf-tools",
+            "---\nname: pdf-tools\ndescription: pdfs\nmetadata:\n  context: docs/a.md, docs/adr/\n---\nx\n",
+        );
         skill(&ws, "hidden", "---\ndescription: manual only\ndisable-model-invocation: true\n---\nx\n");
         skill(&ws, "Bad_Name", "---\ndescription: d\n---\nx\n");
         skill(&ws, "nodesc", "---\nname: nodesc\n---\nx\n");
@@ -549,6 +561,8 @@ pub(crate) mod tests {
         assert_eq!(skills["formal"].description, "mine");
         assert!(skills["formal"].path.ends_with(".agents/skills/formal/SKILL.md"));
         assert!(skills["hidden"].disable_model_invocation);
+        assert_eq!(skills["pdf-tools"].context, ["docs/a.md", "docs/adr/"]);
+        assert!(skills["formal"].context.is_empty());
         assert!(render_skill(&skills["formal"]).contains("body"));
     }
 
