@@ -109,7 +109,7 @@ impl Default for Config {
             compact_threshold: 0.70,
             compact_keep_recent: 6,
             tool_result_max_bytes: 24_000,
-            max_tool_iterations: 80,
+            max_tool_iterations: 200,
             llm_max_retries: 6,
             bash_timeout_secs: 120,
             spawn_timeout_secs: 900,

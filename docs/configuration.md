@@ -13,7 +13,7 @@
 | `bash_timeout_secs` | `120` | Default `bash` timeout |
 | `spawn_timeout_secs` | `900` | Subagent timeout |
 | `ask_timeout_secs` | `600` | How long the `ask` tool waits for a human answer before using its recommended option |
-| `max_tool_iterations` | `80` | Max tool rounds per run |
+| `max_tool_iterations` | `200` | Max tool rounds per run |
 | `llm_max_retries` | `6` | Retries per model request on transport errors, 408/409/429/5xx and unparseable responses (exponential backoff, honors `Retry-After`) |
 | `max_subagent_depth` | `2` | Subagent nesting limit |
 | `control_enabled` | `true` | Open the control socket for top-level runs |

@@ -16,6 +16,9 @@ use crate::tools::{self, Verdict};
 const MAX_TRUNCATIONS: u32 = 3;
 const LLM_TIMEOUT_SECS: u64 = 600;
 const STOPPED_BY_USER: &str = "(stopped by user via control socket)";
+/// Sent for the last few tool-call turns so the run ends with a handoff or report, not a cut-off.
+const WRAP_UP: &str = "[note] You are about to run out of tool calls and will be cut off. Wrap up now: stop starting new work, then call hand_off or finish with a standalone report of what is done, what remains, and where the state lives.";
+const WRAP_UP_TURNS: usize = 5;
 const NUDGE: &str = "[note] End by calling finish.";
 const CONTINUE: &str = "Continue from where you left off.";
 const TRUNCATED_HINT: &str = "[note] Your last response was cut off by the output limit. Continue with smaller steps: split large writes into several edits.";
@@ -402,6 +405,9 @@ impl Agent {
             }
             self.set_status();
             self.maybe_compact(self.cfg.compact_threshold, true)?;
+            if hint.is_none() && iterations + WRAP_UP_TURNS >= self.cfg.max_tool_iterations {
+                hint = Some(WRAP_UP);
+            }
             let result = {
                 let ctx = self.context.read().unwrap();
                 self.llm.chat(ctx.messages(), ctx.tools(), hint.take())

@@ -395,6 +395,7 @@ pub struct Next {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Verdict {
     pub status: String,
+    #[serde(default)]
     pub summary: String,
     pub next: Option<Next>,
 }
@@ -420,7 +421,13 @@ fn validate_finish(
     parent: Option<&str>,
     args: &Value,
 ) -> Result<Verdict> {
-    let v: Verdict = parse_args(args)?;
+    let mut v: Verdict = parse_args(args)?;
+    // A handoff's `next.task` is its report; auto fill summary if none
+    if v.summary.trim().is_empty() && v.status == "handoff" {
+        if let Some(n) = &v.next {
+            v.summary = format!("handed off to {}", n.agent);
+        }
+    }
     let allowed = finish_statuses(def, parent.is_some());
     if !allowed.contains(&v.status) {
         bail!("status must be one of: {}", allowed.join(", "));
@@ -852,6 +859,26 @@ fn bounded_result(workspace: &Path, max: usize, name: &str, text: String) -> Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn handoff_without_summary_is_accepted() {
+        let def = crate::config::AgentDef {
+            name: "build".into(),
+            description: String::new(),
+            prompt: String::new(),
+            tools: vec![],
+            skills: vec![],
+            finish: vec!["done".into(), "handoff".into()],
+            model: None,
+            internal: false,
+        };
+        let agents = std::collections::BTreeMap::from([("build".to_string(), def.clone())]);
+        let args = serde_json::json!({"status":"handoff","next":{"agent":"build","task":"t"}});
+        let v = super::validate_finish(&def, &agents, None, &args).unwrap();
+        assert_eq!(v.summary, "handed off to build");
+        let none = serde_json::json!({"status":"done"});
+        assert!(super::validate_finish(&def, &agents, None, &none).is_err());
+    }
+
     #[test]
     fn ask_options_accept_array_or_encoded_array_and_explain_otherwise() {
         let ok = |v: serde_json::Value| super::parse_args::<super::AskArgs>(&v);

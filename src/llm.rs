@@ -441,6 +441,14 @@ fn anthropic_request(
     for (_, blocks) in &mut turns {
         blocks.sort_by_key(|b| b["type"] != "tool_result");
     }
+    // Prompt caching: breakpoints after the tools, the system text and the latest block,
+    // so each request re-reads the unchanged prefix at the cached rate.
+    let cache = serde_json::json!({"type": "ephemeral"});
+    if let Some((_, blocks)) = turns.last_mut() {
+        if let Some(last) = blocks.last_mut() {
+            last["cache_control"] = cache.clone();
+        }
+    }
     let tools: Vec<Value> = tools
         .iter()
         .map(|t| {
@@ -461,10 +469,15 @@ fn anthropic_request(
             .collect::<Vec<_>>(),
     });
     if !system.is_empty() {
-        req["system"] = system.join("\n\n").into();
+        req["system"] = serde_json::json!([
+            {"type": "text", "text": system.join("\n\n"), "cache_control": cache.clone()}
+        ]);
     }
     if !tools.is_empty() {
         req["tools"] = tools.into();
+        if let Some(last) = req["tools"].as_array_mut().and_then(|t| t.last_mut()) {
+            last["cache_control"] = cache;
+        }
     }
     req
 }
@@ -562,6 +575,11 @@ mod tests {
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
 
+    fn m_last_cache(r: &serde_json::Value) -> String {
+        let m = r["messages"].as_array().unwrap().last().unwrap();
+        m["content"].as_array().unwrap().last().unwrap()["cache_control"]["type"].as_str().unwrap().to_string()
+    }
+
     #[test]
     fn anthropic_request_merges_turns_and_maps_tools() {
         let mut a = ChatMessage::default();
@@ -574,7 +592,10 @@ mod tests {
         ];
         let tools = [serde_json::json!({"type":"function","function":{"name":"read","description":"d","parameters":{"type":"object"}}})];
         let r = super::anthropic_request("m", &msgs, Some(ChatMessage::user("[note] h")), &tools, 9);
-        assert_eq!(r["system"], "sys");
+        assert_eq!(r["system"][0]["text"], "sys");
+        assert_eq!(r["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(r["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(m_last_cache(&r), "ephemeral");
         assert_eq!(r["max_tokens"], 9);
         assert_eq!(r["tools"][0]["input_schema"]["type"], "object");
         let m = r["messages"].as_array().unwrap();
