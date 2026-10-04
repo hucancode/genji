@@ -46,13 +46,13 @@ Event types:
 | `compaction` | `summary`, `kept`, `removed`, `used` | history is summarized |
 | `status` | `status` | progress text |
 | `error` | `message` | budget, LLM, loop-limit, handoff-cap problems |
-| `instance_end` | `status` (done/failed/stopped), `tokens_used`, `report`, `result` | the run ends; `result` is the `finish` verdict `{status, summary, next}` or `null` |
+| `instance_end` | `status` (done/failed/stopped), `reason`, `tokens_used`, `report`, `result` | the run ends; `reason` says why a `stopped` run stopped (`token_limit`, `time_limit`, `max_iterations`, `user`) and is `null` otherwise; `result` is the `finish` verdict `{status, summary, next}` or `null` |
 
 `tool_call.id` pairs a request with its `tool_result`.
 
 ## Session file
 
-`.genji/sessions/<id>.jsonl` receives every event; stdout mirrors all of them
+`.genji/sessions/<id>.jsonl` (or `<--sessions-dir>/<id>.jsonl`) receives every event; stdout mirrors all of them
 except `system`. The file is an operation log of the context: `system`, `user`,
 `assistant`, `tool_result`, `prune` and `compaction` replayed in order rebuild
 exactly the messages the model last saw, which is what `--resume` does.
@@ -71,7 +71,7 @@ into the parent's stdout; the child's own session file holds them.
 {"type":"user","seq":3,"instance":"18d9ab","content":"read the readme"}
 {"type":"assistant","seq":5,"instance":"18d9ab","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"finish","arguments":"{\"status\":\"handoff\",\"summary\":\"s\",\"next\":{\"agent\":\"plan\",\"task\":\"README is empty\"}}"}}]}
 {"type":"tool_result","seq":7,"instance":"18d9ab","id":"c1","name":"finish","is_error":false,"duration_ms":0,"result":"ok"}
-{"type":"instance_end","seq":8,"instance":"18d9ab","status":"done","tokens_used":40,"report":"s","result":{"status":"handoff","summary":"s","next":{"agent":"plan","task":"README is empty"}}}
+{"type":"instance_end","seq":8,"instance":"18d9ab","status":"done","reason":null,"tokens_used":40,"report":"s","result":{"status":"handoff","summary":"s","next":{"agent":"plan","task":"README is empty"}}}
 ```
 
 ## Instance-management commands
@@ -104,7 +104,7 @@ instance's workspace or pass `--workspace`.
 
 ```bash
 genji inspect 7ab121
-# stdout: {"id":"7ab121",…,"status":"done","tokens_used":40,"messages":12}
+# stdout: {"id":"7ab121",…,"status":"done","reason":null,"tokens_used":40,"messages":12}
 # stderr:
 # id            7ab121
 # agent         build

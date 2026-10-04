@@ -1,11 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::config::{self, AgentDef, Config, Provider, dot};
+use crate::config::{self, AgentDef, Config, Provider};
 use crate::llm::{self, ChatMessage, LlmClient, Role, ToolCall};
 use crate::socket::Control;
 use crate::storage::context::ContextComposer;
@@ -37,6 +37,8 @@ pub struct Agent {
     pub follow_capped: bool,
     /// How the run ended: done | failed | stopped.
     pub status: &'static str,
+    /// Why a stopped run stopped: token_limit | time_limit | max_iterations | user.
+    pub reason: Option<&'static str>,
     pub llm: LlmClient,
     context: Arc<RwLock<ContextComposer>>,
     control: Option<Arc<Control>>,
@@ -85,17 +87,35 @@ fn build_system(
     if let Some(doc) = doc.filter(|d| !d.trim().is_empty()) {
         s.push_str(&format!("\n\n## Project instructions\n{doc}"));
     }
-    let skills = config::skill_list(workspace);
-    if has("skill_load") && !skills.is_empty() {
-        s.push_str("\n\n## Skills\nLoad one with `skill_load` when it applies.\n");
-        for (name, description) in &skills {
-            s.push_str(&format!("- {name} — {description}\n"));
+    let skills = config::load_skills(workspace);
+    let listed: Vec<_> = skills
+        .values()
+        .filter(|k| !k.disable_model_invocation && !def.skills.contains(&k.name))
+        .collect();
+    if has("read") && !listed.is_empty() {
+        s.push_str(
+            "\n\n## Skills\nWhen a task matches a skill's description, `read` its SKILL.md and follow it. \
+             Paths inside a skill are relative to its directory.\n",
+        );
+        for k in listed {
+            s.push_str(&format!(
+                "- {} — {} ({})\n",
+                k.name,
+                k.description,
+                k.path.display()
+            ));
         }
     }
     for name in &def.skills {
-        let text = config::render_skill(workspace, name)
-            .with_context(|| format!("agent `{}` forces skill `{name}`", def.name))?;
-        s.push_str(&format!("\n\n{text}"));
+        let Some(skill) = skills.get(name) else {
+            let names: Vec<_> = skills.keys().cloned().collect();
+            anyhow::bail!(
+                "agent `{}` forces skill `{name}`, which does not exist. available: {}",
+                def.name,
+                names.join(", ")
+            );
+        };
+        s.push_str(&format!("\n\n{}", config::render_skill(skill)));
     }
     if has("finish") {
         s.push_str("\n\n## Agents\n");
@@ -140,9 +160,12 @@ impl Agent {
     /// tools, model and context come from the session file so the request is the
     /// same prefix the provider already cached.
     pub fn start(p: AgentParams) -> Result<Self> {
-        let session = dot(&p.workspace, "sessions").join(format!("{}.jsonl", p.instance_id));
+        let session = p
+            .cfg
+            .sessions(&p.workspace)
+            .join(format!("{}.jsonl", p.instance_id));
         let window = p.provider.context_window;
-        let token_limit = p.provider.token_limit;
+        let token_limit = p.cfg.token_limit(&p.provider);
         let (model, seq, tokens_used, pending, recorded) = if p.resume {
             let r = events::replay(&session, window)?;
             (r.model, r.seq, r.tokens_used, r.pending, Some(r.ctx))
@@ -197,6 +220,7 @@ impl Agent {
             verdict: None,
             follow_capped: false,
             status: "done",
+            reason: None,
             llm,
             context: p.context,
             control: p.control,
@@ -292,8 +316,13 @@ impl Agent {
             eprintln!("[follow] {msg}");
             self.events.error(&msg);
         }
-        self.events
-            .instance_end(self.status, self.tokens_used, &report, result.as_ref());
+        self.events.instance_end(
+            self.status,
+            self.reason,
+            self.tokens_used,
+            &report,
+            result.as_ref(),
+        );
         Ok(report)
     }
 
@@ -304,24 +333,34 @@ impl Agent {
         msg
     }
 
-    fn stop(&mut self, msg: String) -> String {
+    fn stop(&mut self, reason: &'static str, msg: String) -> String {
         eprintln!("[stop] {msg}");
         self.events.error(&msg);
         self.status = "stopped";
+        self.reason = Some(reason);
         format!("({msg})")
     }
 
-    fn budget_exceeded(&self) -> Option<String> {
+    fn stopped_by_user(&mut self) -> String {
+        self.status = "stopped";
+        self.reason = Some("user");
+        STOPPED_BY_USER.to_string()
+    }
+
+    fn budget_exceeded(&self) -> Option<(&'static str, String)> {
         if self.tokens_used >= self.token_limit {
-            return Some(format!(
-                "token limit reached ({} >= {})",
-                self.tokens_used, self.token_limit
+            return Some((
+                "token_limit",
+                format!(
+                    "token limit reached ({} >= {})",
+                    self.tokens_used, self.token_limit
+                ),
             ));
         }
         if self.started.elapsed().as_secs() >= self.cfg.time_limit_secs.max(1) {
-            return Some(format!(
-                "time limit reached ({}s)",
-                self.cfg.time_limit_secs
+            return Some((
+                "time_limit",
+                format!("time limit reached ({}s)", self.cfg.time_limit_secs),
             ));
         }
         None
@@ -335,14 +374,13 @@ impl Agent {
         // One-request note after the context; never stored.
         let mut hint: Option<&str> = None;
         loop {
-            if let Some(reason) = self.budget_exceeded() {
-                return Ok(self.stop(reason));
+            if let Some((reason, msg)) = self.budget_exceeded() {
+                return Ok(self.stop(reason, msg));
             }
             let (stop, _) = self.poll_control();
             if stop {
                 self.events.status(STOPPED_BY_USER);
-                self.status = "stopped";
-                return Ok(STOPPED_BY_USER.to_string());
+                return Ok(self.stopped_by_user());
             }
             self.set_status();
             self.maybe_compact(self.cfg.compact_threshold, true)?;
@@ -393,8 +431,7 @@ impl Agent {
                 self.log(assistant);
                 let (stop, injected) = self.poll_control();
                 if stop {
-                    self.status = "stopped";
-                    return Ok(STOPPED_BY_USER.to_string());
+                    return Ok(self.stopped_by_user());
                 }
                 if injected {
                     continue;
@@ -419,10 +456,13 @@ impl Agent {
             }
             iterations += 1;
             if iterations >= self.cfg.max_tool_iterations {
-                return Ok(self.stop(format!(
-                    "reached max tool iterations {}",
-                    self.cfg.max_tool_iterations
-                )));
+                return Ok(self.stop(
+                    "max_iterations",
+                    format!(
+                        "reached max tool iterations {}",
+                        self.cfg.max_tool_iterations
+                    ),
+                ));
             }
         }
     }
@@ -521,24 +561,37 @@ mod tests {
     #[test]
     fn system_prompt_sections_follow_the_agent() {
         let ws = temp_dir("system");
+        let skill_dir = ws.join(".agents/skills/formal");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: formal\ndescription: tracks work\n---\nbody\n").unwrap();
+        config::tests::write_agents(
+            &ws,
+            &[
+                ("lead", "---\ndescription: leads\ntools: read, finish\n---\nl"),
+                ("worker", "---\ndescription: works\ntools: read, finish\n---\nw"),
+                ("scout", "---\ndescription: scouts\ntools: read, finish\n---\ns"),
+            ],
+        );
         let agents = config::load_agents(&ws);
-        let plan = build_system(&ws, &agents["plan"], &agents, None).unwrap();
+        let plan = build_system(&ws, &agents["lead"], &agents, None).unwrap();
         assert!(
             plan.contains("## Environment")
                 && plan.contains("## Agents")
-                && plan.contains("- build — ")
+                && plan.contains("- worker — works")
         );
-        assert!(plan.contains("- formal — ") && !plan.contains("# Skill: formal"));
-        assert!(!plan.contains("## Reporting"));
-        let sub = build_system(&ws, &agents["explore"], &agents, Some("plan")).unwrap();
-        assert!(sub.contains("## Reporting") && sub.contains("`next.agent` = `plan`"));
-        let mut forced = agents["build"].clone();
-        forced.skills = vec!["formal".into()];
         assert!(
-            build_system(&ws, &forced, &agents, None)
-                .unwrap()
-                .contains("# Skill: formal")
+            plan.contains("## Skills")
+                && plan.contains("- formal — ")
+                && plan.contains(".agents/skills/formal/SKILL.md)")
+                && !plan.contains("# Skill: formal")
         );
+        assert!(!plan.contains("## Reporting"));
+        let sub = build_system(&ws, &agents["scout"], &agents, Some("lead")).unwrap();
+        assert!(sub.contains("## Reporting") && sub.contains("`next.agent` = `lead`"));
+        let mut forced = agents["worker"].clone();
+        forced.skills = vec!["formal".into()];
+        let text = build_system(&ws, &forced, &agents, None).unwrap();
+        assert!(text.contains("# Skill: formal") && !text.contains("- formal — "));
         forced.skills = vec!["nope".into()];
         assert!(build_system(&ws, &forced, &agents, None).is_err());
     }

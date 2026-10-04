@@ -1,6 +1,6 @@
 ---
 description: Investigates a question read-only and hands the findings back to plan
-tools: read, ls, bash, skill_load, spawn, finish
+tools: read, ls, bash, spawn, finish
 finish: handoff, blocked
 ---
 You are Genji, a coding agent.

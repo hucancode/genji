@@ -1,17 +1,44 @@
 # Skills
 
-A skill is a markdown file with a `description` in the frontmatter:
+Skills follow the [Agent Skills](https://agentskills.io/specification) format,
+the same one pi uses. A skill is a directory holding `SKILL.md`:
+
+```text
+pdf-tools/
+├── SKILL.md
+├── scripts/extract.sh
+└── references/formats.md
+```
 
 ```markdown
 ---
-description: House style for Rust changes
+name: pdf-tools
+description: Extract text and tables from PDF files. Use when reading or converting PDFs.
 ---
-- Run `cargo fmt` and `cargo clippy -- -D warnings` before finishing.
-- Prefer the standard library over new dependencies.
+Read `references/formats.md` first. Run `scripts/extract.sh <file>`.
 ```
 
-Lookup: `.genji/skills/<name>.md`, then the built-in skills (`formal`, see
-[Formal skill](formal.md)). A workspace file shadows a built-in of the same name.
+| Field | Meaning |
+|---|---|
+| `name` | Lowercase letters, digits and single hyphens, at most 64 chars. Defaults to the directory name. |
+| `description` | Required. Shown to the model to decide when the skill applies. |
+| `disable-model-invocation` | `true` leaves the skill out of the prompt's skill list; it is then used only through an agent's `skills:`. |
+| `license`, `compatibility`, `metadata`, `allowed-tools` | Accepted and ignored. |
 
-- **On demand:** the system prompt lists every skill (name — description). An agent with `skill_load` loads one with `skill_load(name)`; the text comes back as a normal tool result.
-- **Forced:** an agent's `skills:` list is rendered into its system prompt at start. An unknown forced skill is a startup error.
+A skill without a description or with an invalid name is skipped with a warning.
+
+## Lookup
+
+- **Directory:** every `SKILL.md` below `.agents/skills/`, found recursively in
+  path order; the first skill of a name wins. Other Agent Skills tools (pi)
+  read the same folder. It is the only skills location.
+
+## Use
+
+- **On demand:** for agents with `read`, the system prompt lists each skill as
+  `- <name> — <description> (<absolute path of SKILL.md>)`. The model reads the
+  `SKILL.md` with `read` when the task matches and resolves paths relative to
+  the skill's directory.
+- **Forced:** an agent's `skills:` list is inlined into its system prompt at
+  start as `# Skill: <name>`, its description, its directory and its body.
+  Forced skills are not listed again. An unknown forced skill is a startup error.

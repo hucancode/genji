@@ -1,7 +1,8 @@
 # Mid-run instructions (control socket)
 
 While a top-level run is active, genji listens on a Unix-domain socket
-(`.genji/control.sock` by default) so you can steer it **without restarting**:
+(`.genji/control.sock` by default, or the path given with `--socket`) so you can
+steer it **without restarting**:
 
 ```bash
 # in another terminal, any workspace

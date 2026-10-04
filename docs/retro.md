@@ -7,6 +7,6 @@
 Improvements are plain files, tracked by git:
 
 - `.genji/agents/<name>.md`: agents, see [Agents](agents.md)
-- `.genji/skills/<name>.md`: skills, see [Skills](skills.md)
+- `.agents/skills/<name>/SKILL.md`: skills, see [Skills](skills.md)
 
 Keep them in git to review, diff and revert.

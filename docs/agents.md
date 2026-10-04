@@ -5,27 +5,40 @@ An agent is a markdown file: frontmatter plus the system prompt.
 ```markdown
 ---
 description: Reviews a diff and reports problems     # shown in `genji --help` and in other agents' prompts
-tools: read, ls, bash, finish                        # read write edit ls bash plan_write skill_load spawn finish
-skills: formal                                       # optional: rendered into the system prompt at start
+tools: read, ls, bash, finish                        # read write edit ls bash plan_write spawn finish
+skills: formal                                         # optional: skills inlined into the system prompt at start
 finish: handoff, blocked                             # optional: statuses `finish` accepts (default: done, handoff, blocked)
 model: some-model                                    # optional: overrides the provider's model
 ---
 You review changes. ...
 ```
 
-Built-ins ship in the binary: `plan`, `build`, `explore`, `retro`. A file
-`.genji/agents/<name>.md` adds an agent or replaces the built-in of that name.
-Every agent is a subcommand: `genji <name> "task"`.
+`.genji/agents/` is the single source of agent definitions: the engine loads
+exactly the `<name>.md` files found there and assumes nothing about their names or
+contents. A deleted file stays deleted.
 
-Names that collide with a command (`list stop instruct inspect reset help`) and
+`genji init [agent...] [--force] [--workspace DIR]` writes the default agents
+(`plan`, `build`, `explore`, `retro`) into that directory and prints
+`{"written":[...],"skipped":[...]}`. Existing files are kept unless `--force`;
+naming agents limits what is written (and, with `--force`, what is reset). Running an agent
+in a workspace without `.genji/agents/` runs `init` first. With the directory present,
+nothing is added to it, and an empty directory means no agents.
+Every agent is a subcommand: `genji <name> "task"`.
+`genji help agent --json` prints the agents in `.genji/agents/` as
+`[{name, description, tools, skills, finish, model}]`; `genji help tool --json`
+prints the tools as `[{name, description, parameters}]`.
+
+Names that collide with a command (`init list stop instruct inspect reset help`) and
 agents that list an unknown tool are skipped with a warning on stderr.
+
+The files `genji init` writes:
 
 | agent | tools | `finish` | role |
 |---|---|---|---|
-| `plan` | read write edit ls bash plan_write skill_load spawn finish | done, handoff, blocked | coordinator; the only built-in agent that can declare the goal done |
-| `build` | read write edit ls bash skill_load spawn finish | handoff, blocked | implements a step, hands evidence back to `plan` |
-| `explore` | read ls bash skill_load spawn finish | handoff, blocked | investigates, hands findings back to `plan` |
-| `retro` | read write edit ls bash skill_load finish | done, blocked | improves agents and skills from recorded sessions |
+| `plan` | read write edit ls bash plan_write spawn finish | done, handoff, blocked | coordinator; the only default agent that can declare the goal done |
+| `build` | read write edit ls bash spawn finish | handoff, blocked | implements a step, hands evidence back to `plan` |
+| `explore` | read ls bash spawn finish | handoff, blocked | investigates, hands findings back to `plan` |
+| `retro` | read write edit ls bash finish | done, blocked | improves agents and skills from recorded sessions |
 
 ## Finishing and handoff
 

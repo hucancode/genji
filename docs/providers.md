@@ -77,7 +77,7 @@ Azure's OpenAI-compatible endpoint takes the deployment name as `model` and an
 | `headers` | `{}` | Extra request headers |
 | `context_window` | `32768` | Model context size, used with `compact_threshold` |
 | `max_output_tokens` | `8192` | Output cap sent to the API |
-| `token_limit` | `4000000` | Max tokens (prompt + completion) per run |
+| `token_limit` | `4000000` | Max tokens (prompt + completion) per run; the top-level `token_limit` and `--token-limit` override it |
 
 ## Same binary, two environments
 

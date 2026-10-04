@@ -17,13 +17,15 @@ use config::{AgentDef, Config, dot};
 use storage::context::ContextComposer;
 use storage::{events, registry};
 
-const COMMANDS: [&str; 5] = ["list", "stop", "instruct", "inspect", "reset"];
+const COMMANDS: [&str; 6] = ["init", "list", "stop", "instruct", "inspect", "reset"];
 const DEFAULT_FOLLOW: u32 = 10;
 
 const USAGE: &str = "usage:
   genji <agent> [task] [--follow[=N]] [--resume ID] [--parent ID] [--workspace DIR] [--provider P] [--label L]
+                [--socket PATH] [--sessions-dir DIR] [--token-limit N]
+  genji init [agent...] [--force] [--workspace DIR]
   genji list | stop <id...|all> | instruct <id> <text...> | inspect <id> | reset [-y]
-  genji --help | --version";
+  genji help [agent|tool] [--json] | --version";
 
 #[derive(Default)]
 struct Opts {
@@ -37,11 +39,16 @@ struct Opts {
     parent_agent: Option<String>,
     instance_id: Option<String>,
     instructions_file: Option<String>,
+    socket: Option<String>,
+    sessions_dir: Option<String>,
+    token_limit: Option<i64>,
     depth: u32,
+    json: bool,
     subagent: bool,
     no_control: bool,
     quiet: bool,
     yes: bool,
+    force: bool,
     help: bool,
     version: bool,
 }
@@ -69,6 +76,11 @@ fn parse(args: Vec<String>) -> Result<Opts> {
             "--parent-agent" => o.parent_agent = Some(value()?),
             "--instance-id" => o.instance_id = Some(value()?),
             "--instructions-file" => o.instructions_file = Some(value()?),
+            "--socket" => o.socket = Some(value()?),
+            "--sessions-dir" => o.sessions_dir = Some(value()?),
+            "--token-limit" => {
+                o.token_limit = Some(value()?.parse().context("--token-limit needs a number")?)
+            }
             "--depth" => o.depth = value()?.parse().context("--depth needs a number")?,
             "--follow" => {
                 o.follow = Some(match &inline {
@@ -79,7 +91,9 @@ fn parse(args: Vec<String>) -> Result<Opts> {
             "--subagent" => o.subagent = true,
             "--no-control" => o.no_control = true,
             "--quiet-startup" => o.quiet = true,
+            "--json" => o.json = true,
             "--yes" | "-y" => o.yes = true,
+            "--force" => o.force = true,
             "--help" | "-h" => o.help = true,
             "--version" | "-V" => o.version = true,
             f if f.starts_with("--") => bail!("unknown option `{f}`"),
@@ -97,8 +111,63 @@ fn workspace(o: &Opts) -> Result<PathBuf> {
     Ok(std::fs::canonicalize(&w).unwrap_or(w))
 }
 
+fn absolute(p: &str) -> Result<PathBuf> {
+    let p = PathBuf::from(p);
+    Ok(if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir()?.join(p)
+    })
+}
+
+/// `--sessions-dir`, made absolute so spawned children agree on it.
+fn sessions_dir(o: &Opts) -> Result<Option<PathBuf>> {
+    o.sessions_dir.as_deref().map(absolute).transpose()
+}
+
+/// Session directory for commands that read sessions without loading the config.
+fn sessions_for(o: &Opts, ws: &Path) -> Result<PathBuf> {
+    Ok(sessions_dir(o)?.unwrap_or_else(|| dot(ws, "sessions")))
+}
+
+/// `genji help agent|tool [--json]`: loaded agents or the tool registry.
+fn cmd_help(o: &Opts, topic: Option<&str>) -> Result<i32> {
+    let agents = config::load_agents(&workspace(o)?);
+    match topic {
+        Some("agent") if o.json => {
+            let arr: Vec<Value> = agents
+                .values()
+                .map(|a| {
+                    json!({ "name": a.name, "description": a.description, "tools": a.tools,
+                            "skills": a.skills, "finish": a.finish, "model": a.model })
+                })
+                .collect();
+            println!("{}", serde_json::to_string(&arr)?);
+        }
+        Some("tool") if o.json => println!("{}", serde_json::to_string(&tools::list())?),
+        Some("tool") => {
+            for t in tools::list() {
+                eprintln!(
+                    "  {:<11} {}",
+                    t["name"].as_str().unwrap_or_default(),
+                    t["description"].as_str().unwrap_or_default()
+                );
+            }
+        }
+        None | Some("agent") => print_usage(&agents),
+        Some(t) => {
+            eprintln!("unknown help topic `{t}` (agent, tool)");
+            return Ok(2);
+        }
+    }
+    Ok(0)
+}
+
 fn print_usage(agents: &BTreeMap<String, AgentDef>) {
     eprintln!("{USAGE}\n\nagents:");
+    if agents.is_empty() {
+        eprintln!("  (none; `genji init` writes the default agents to .genji/agents)");
+    }
     for a in agents.values() {
         eprintln!("  {:<10} {}", a.name, a.description);
     }
@@ -154,12 +223,13 @@ impl Drop for Guard {
 
 fn start_control(
     workspace: &Path,
+    socket_path: PathBuf,
     context: Arc<RwLock<ContextComposer>>,
     id: &str,
     label: &str,
     quiet: bool,
 ) -> Result<Guard> {
-    let control = socket::Control::start(dot(workspace, "control.sock"), context)?;
+    let control = socket::Control::start(socket_path, context)?;
     if !quiet {
         eprintln!("[control] listening on {}", control.path.display());
     }
@@ -180,8 +250,13 @@ fn start_control(
 fn run_agent(o: Opts) -> Result<i32> {
     let ws = workspace(&o)?;
     let mut cfg = Config::load_or_create(&ws)?;
+    cfg.sessions_dir = sessions_dir(&o)?;
+    if let Some(n) = o.token_limit {
+        cfg.token_limit = n;
+    }
+    config::ensure_agents(&ws)?;
     let agents = config::load_agents(&ws);
-    let sessions = dot(&ws, "sessions");
+    let sessions = cfg.sessions(&ws);
     let quiet = o.quiet || o.subagent;
     let mut resume = None;
     if let Some(prefix) = &o.resume {
@@ -236,8 +311,13 @@ fn run_agent(o: Opts) -> Result<i32> {
     let mut guard = if o.no_control || !cfg.control_enabled {
         None
     } else {
+        let socket_path = match &o.socket {
+            Some(p) => absolute(p)?,
+            None => dot(&ws, "control.sock"),
+        };
         Some(start_control(
             &ws,
+            socket_path,
             context.clone(),
             &first_id,
             &o.label,
@@ -410,7 +490,7 @@ fn cmd_inspect(id: &str, o: &Opts) -> Result<()> {
         Some(i) => PathBuf::from(&i.workspace),
         None => workspace(o)?,
     };
-    let mut obj = events::summary(&events::find_session(&dot(&ws, "sessions"), id)?)?;
+    let mut obj = events::summary(&events::find_session(&sessions_for(o, &ws)?, id)?)?;
     if let (Some(map), Some(i)) = (obj.as_object_mut(), &live) {
         map.insert("pid".into(), json!(i.pid));
         map.insert("label".into(), json!(i.label));
@@ -457,7 +537,7 @@ fn count_files(dir: &Path) -> usize {
         .sum()
 }
 
-/// Delete the workspace's sessions, plans and claims. Agents, skills and config stay.
+/// Delete the workspace's sessions and plans. Agents, skills and config stay.
 fn cmd_reset(o: &Opts) -> Result<()> {
     let ws = workspace(o)?;
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
@@ -472,7 +552,7 @@ fn cmd_reset(o: &Opts) -> Result<()> {
             i.id
         );
     }
-    let dirs: Vec<PathBuf> = ["sessions", "plans", "claims"]
+    let dirs: Vec<PathBuf> = ["sessions", "plans"]
         .iter()
         .map(|d| dot(&ws, d))
         .collect();
@@ -508,6 +588,14 @@ fn cmd_reset(o: &Opts) -> Result<()> {
     Ok(())
 }
 
+/// `genji init [agent...] [--force]`: writes the default agent files; prints
+/// `{"written":[...],"skipped":[...]}`.
+fn cmd_init(o: &Opts, only: &[String]) -> Result<()> {
+    let r = config::init_agents(&workspace(o)?, o.force, only)?;
+    println!("{}", serde_json::to_string(&json!({ "written": r.written, "skipped": r.skipped }))?);
+    Ok(())
+}
+
 fn real_main() -> Result<i32> {
     let o = parse(std::env::args().skip(1).collect())?;
     if o.version {
@@ -515,13 +603,17 @@ fn real_main() -> Result<i32> {
         return Ok(0);
     }
     let first = o.positional.first().map(String::as_str);
-    if o.help || first == Some("help") {
+    if first == Some("help") {
+        return cmd_help(&o, o.positional.get(1).map(String::as_str));
+    }
+    if o.help {
         print_usage(&config::load_agents(&workspace(&o)?));
         return Ok(0);
     }
     let rest = o.positional.get(1..).unwrap_or_default();
     match first {
         Some(c) if COMMANDS.contains(&c) => match c {
+            "init" => cmd_init(&o, rest).map(|()| 0),
             "list" => cmd_list().map(|()| 0),
             "stop" => cmd_stop(rest),
             "instruct" => match rest {
@@ -575,6 +667,23 @@ mod tests {
         );
         assert_eq!(p(&["plan", "--follow"]).follow, Some(DEFAULT_FOLLOW));
         assert_eq!(p(&["plan"]).follow, None);
+        let o = p(&[
+            "build",
+            "--socket=/s.sock",
+            "--sessions-dir",
+            "/sess",
+            "--token-limit=500",
+            "--json",
+        ]);
+        assert_eq!(
+            (
+                o.socket.as_deref(),
+                o.sessions_dir.as_deref(),
+                o.token_limit,
+                o.json
+            ),
+            (Some("/s.sock"), Some("/sess"), Some(500), true)
+        );
     }
 
     #[test]
@@ -583,6 +692,7 @@ mod tests {
         assert!(args(&["build", "--nope"]).is_err());
         assert!(args(&["build", "--workspace"]).is_err());
         assert!(args(&["build", "--follow=x"]).is_err());
+        assert!(args(&["build", "--token-limit=x"]).is_err());
     }
 
     #[test]

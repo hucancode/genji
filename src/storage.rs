@@ -345,13 +345,14 @@ pub mod events {
         pub fn instance_end(
             &self,
             status: &str,
+            reason: Option<&str>,
             tokens_used: i64,
             report: &str,
             result: Option<&Value>,
         ) {
             self.emit(json!({
-                "type": "instance_end", "status": status, "tokens_used": tokens_used,
-                "report": report, "result": result,
+                "type": "instance_end", "status": status, "reason": reason,
+                "tokens_used": tokens_used, "report": report, "result": result,
             }));
         }
     }
@@ -621,7 +622,7 @@ pub mod events {
             live.apply_compaction("SUMMARY", kept);
             e.compaction("SUMMARY", kept, 5, 700);
             push(&mut live, ChatMessage::user("after"));
-            e.instance_end("done", 700, "r", None);
+            e.instance_end("done", None, 700, "r", None);
             drop(e);
             let mut text = std::fs::read_to_string(&path).unwrap();
             text.push_str("{\"type\":\"user\",\"content\":\"cut");

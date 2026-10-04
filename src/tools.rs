@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::agent::Agent;
-use crate::config::{self, AgentDef, dot};
+use crate::config::{AgentDef, dot};
 use crate::storage::proc;
 use crate::storage::util::{TempPath, relative_path, slugify, tmp_file, write_file};
 
@@ -344,16 +344,6 @@ fn plan_write(agent: &mut Agent, args: &Value) -> Result<String> {
     Ok(format!("wrote plan to {}", agent.display_path(&path)))
 }
 
-#[derive(Deserialize)]
-struct SkillArgs {
-    name: String,
-}
-
-fn skill_load(agent: &mut Agent, args: &Value) -> Result<String> {
-    let a: SkillArgs = parse_args(args)?;
-    config::render_skill(&agent.workspace, &a.name)
-}
-
 // --- finish ---------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -515,7 +505,8 @@ fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
         .tool_result_max_bytes
         .saturating_sub(1024)
         .max(4096);
-    let session = dot(&agent.workspace, "sessions").join(format!("{child}.jsonl"));
+    let sessions = agent.cfg.sessions(&agent.workspace);
+    let session = sessions.join(format!("{child}.jsonl"));
     let tmp = dot(&agent.workspace, "tmp");
     let instructions = TempPath(tmp_file(&tmp, "subagent", "md"));
     let mut cmd: Vec<String> = [
@@ -531,6 +522,10 @@ fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
     ]
     .map(String::from)
     .into();
+    cmd.extend(["--sessions-dir".into(), sessions.to_string_lossy().into()]);
+    if agent.cfg.token_limit > 0 {
+        cmd.extend(["--token-limit".into(), agent.cfg.token_limit.to_string()]);
+    }
     if let Ok(past) = std::fs::read_to_string(&session) {
         if past.contains("\"type\":\"instance_end\"") {
             return Ok(child_report(&child, &a.agent, &past, false, cap));
@@ -654,11 +649,6 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["title","content"]
             }), plan_write),
-            tool("skill_load", "Load a skill's instructions by name.", json!({
-                "type":"object",
-                "properties":{"name":{"type":"string"}},
-                "required":["name"]
-            }), skill_load),
             tool("spawn", "Run a subagent that works on the instructions and hands its report back as this call's result.", json!({
                 "type":"object",
                 "properties":{
@@ -699,6 +689,14 @@ pub fn check(def: &AgentDef) -> Result<()> {
         bail!("unknown finish status `{s}`");
     }
     Ok(())
+}
+
+/// Every tool as `{name, description, parameters}`.
+pub fn list() -> Vec<Value> {
+    registry()
+        .iter()
+        .map(|t| json!({"name": t.name, "description": t.description, "parameters": t.parameters}))
+        .collect()
 }
 
 /// Tool definitions sent to the model for this agent.
@@ -766,6 +764,7 @@ fn bounded_result(workspace: &Path, max: usize, name: &str, text: String) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
     use crate::storage::util::temp_dir;
 
     fn e(old: &str, new: &str) -> (String, String) {
@@ -812,6 +811,13 @@ mod tests {
     #[test]
     fn specs_follow_the_agent_definition() {
         let ws = temp_dir("specs");
+        config::tests::write_agents(
+            &ws,
+            &[
+                ("lead", "---\ntools: read, plan_write, finish\nfinish: done, handoff, blocked\n---\nl"),
+                ("worker", "---\ntools: read, finish\nfinish: handoff, blocked\n---\nw"),
+            ],
+        );
         let agents = config::load_agents(&ws);
         let names = |d: &AgentDef| {
             specs(d, false)
@@ -819,8 +825,8 @@ mod tests {
                 .map(|s| s["function"]["name"].as_str().unwrap().to_string())
                 .collect::<Vec<_>>()
         };
-        assert!(names(&agents["plan"]).contains(&"plan_write".to_string()));
-        assert!(!names(&agents["build"]).contains(&"plan_write".to_string()));
+        assert!(names(&agents["lead"]).contains(&"plan_write".to_string()));
+        assert!(!names(&agents["worker"]).contains(&"plan_write".to_string()));
         let status = |d: &AgentDef, sub| {
             specs(d, sub)
                 .into_iter()
@@ -829,51 +835,59 @@ mod tests {
                 .clone()
         };
         assert_eq!(
-            status(&agents["plan"], false),
+            status(&agents["lead"], false),
             json!(["done", "handoff", "blocked"])
         );
-        assert_eq!(status(&agents["plan"], true), json!(["handoff", "blocked"]));
+        assert_eq!(status(&agents["lead"], true), json!(["handoff", "blocked"]));
         assert_eq!(
-            status(&agents["build"], false),
+            status(&agents["worker"], false),
             json!(["handoff", "blocked"])
         );
-        assert!(check(&agents["retro"]).is_ok());
+        assert!(check(&agents["lead"]).is_ok());
     }
 
     #[test]
     fn finish_validation() {
         let ws = temp_dir("finish");
+        config::tests::write_agents(
+            &ws,
+            &[
+                ("lead", "---\ntools: read, finish\nfinish: done, handoff, blocked\n---\nl"),
+                ("worker", "---\ntools: read, finish\nfinish: handoff, blocked\n---\nw"),
+                ("scout", "---\ntools: read, finish\nfinish: handoff, blocked\n---\ns"),
+            ],
+        );
         let agents = config::load_agents(&ws);
         let run = |agent: &str, parent: Option<&str>, v: Value| {
             validate_finish(&agents[agent], &agents, parent, &v)
         };
         let handoff = |to: &str| json!({"status": "handoff", "summary": "s", "next": {"agent": to, "task": "t"}});
-        assert!(run("plan", None, json!({"status": "done", "summary": "s"})).is_ok());
+        assert!(run("lead", None, json!({"status": "done", "summary": "s"})).is_ok());
         assert!(
-            run("build", None, json!({"status": "done", "summary": "s"})).is_err(),
+            run("worker", None, json!({"status": "done", "summary": "s"})).is_err(),
             "build cannot declare done"
         );
-        assert!(run("build", None, handoff("plan")).is_ok());
-        assert!(run("build", None, json!({"status": "handoff", "summary": "s"})).is_err());
-        assert!(run("build", None, handoff("nope")).is_err());
+        assert!(run("worker", None, handoff("lead")).is_ok());
+        assert!(run("worker", None, json!({"status": "handoff", "summary": "s"})).is_err());
+        assert!(run("worker", None, handoff("nope")).is_err());
         assert!(
             run(
-                "plan",
+                "lead",
                 None,
-                json!({"status": "done", "summary": "s", "next": {"agent": "build", "task": "t"}})
+                json!({"status": "done", "summary": "s", "next": {"agent": "worker", "task": "t"}})
             )
             .is_err()
         );
-        assert!(run("plan", None, json!({"status": "done", "summary": " "})).is_err());
-        assert!(run("explore", Some("plan"), handoff("plan")).is_ok());
+        assert!(run("lead", None, json!({"status": "done", "summary": " "})).is_err());
+        assert!(run("scout", Some("lead"), handoff("lead")).is_ok());
         assert!(
-            run("explore", Some("plan"), handoff("build")).is_err(),
+            run("scout", Some("lead"), handoff("worker")).is_err(),
             "subagents report to the parent agent"
         );
         assert!(
             run(
-                "plan",
-                Some("build"),
+                "lead",
+                Some("worker"),
                 json!({"status": "done", "summary": "s"})
             )
             .is_err()

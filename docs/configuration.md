@@ -16,19 +16,28 @@
 | `llm_max_retries` | `6` | Retries per model request on transport errors, 408/409/429/5xx and unparseable responses (exponential backoff, honors `Retry-After`) |
 | `max_subagent_depth` | `2` | Subagent nesting limit |
 | `control_enabled` | `true` | Open the control socket for top-level runs |
+| `token_limit` | `0` | Max tokens (prompt + completion) per run; above 0 it overrides the provider's `token_limit` |
 
-`--workspace <dir>` selects the workspace; `--provider <name>` selects a profile.
+Run flags:
+
+| Flag | Meaning |
+|---|---|
+| `--workspace <dir>` | Workspace (default: current directory) |
+| `--provider <name>` | Provider profile |
+| `--socket <path>` | Control socket path (default `.genji/control.sock`) |
+| `--sessions-dir <dir>` | Where session files are written and read (default `.genji/sessions`); spawned subagents inherit it |
+| `--token-limit <n>` | Per-run token budget; overrides `token_limit` in the config and the provider; spawned subagents inherit it |
 
 ## Directory layout
 
 ```
 .genji/
   config.json          # this file
-  agents/*.md          # agents (add or replace built-ins)
-  skills/*.md          # skills
+  agents/*.md          # agent definitions (`genji init` writes the defaults)
   plans/*.md           # plans written with plan_write
   sessions/<id>.jsonl  # one operation log per instance
-  requirements/, tickets/, claims/   # used by the formal skill
   control.sock         # control socket while running
   tmp/                 # scratch space and spilled tool results
+.agents/
+  skills/<name>/SKILL.md   # skills, see [Skills](skills.md)
 ```
