@@ -15,6 +15,5 @@ genji list                                   # list running instances
 genji inspect <id>                           # summary from the session file
 genji instruct <id> "text"                   # send an instruction to a running instance
 genji stop <id>... | all                     # graceful stop
-genji reset [-y]                             # delete sessions and plans
 genji build --resume <id>                    # continue a crashed or finished run
 ```

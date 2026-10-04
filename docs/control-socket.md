@@ -40,6 +40,8 @@ event stream on stdout and `.genji/sessions/<id>.jsonl` are the durable output.
    # inject an instruction (any line not starting with "/")
    printf 'focus on the parser first\n' | nc -U "$SOCK"
    # -> queued (1 pending)
+   # answer a pending `ask` tool call (callId = the tool_call id in the session JSONL)
+   printf '/answer call_abc "Postgres"\n' | nc -U "$SOCK"   # -> answered
    # graceful stop
    printf '/stop\n'   | nc -U "$SOCK"        # -> stopping
  ```

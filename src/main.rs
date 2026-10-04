@@ -8,7 +8,6 @@ mod tools;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -17,14 +16,14 @@ use config::{AgentDef, Config, dot};
 use storage::context::ContextComposer;
 use storage::{events, registry};
 
-const COMMANDS: [&str; 6] = ["init", "list", "stop", "instruct", "inspect", "reset"];
+const COMMANDS: [&str; 5] = ["init", "list", "stop", "instruct", "inspect"];
 const DEFAULT_FOLLOW: u32 = 10;
 
 const USAGE: &str = "usage:
   genji <agent> [task] [--follow[=N]] [--resume ID] [--parent ID] [--workspace DIR] [--provider P] [--label L]
                 [--socket PATH] [--sessions-dir DIR] [--token-limit N]
   genji init [agent...] [--force] [--workspace DIR]
-  genji list | stop <id...|all> | instruct <id> <text...> | inspect <id> | reset [-y]
+  genji list | stop <id...|all> | instruct <id> <text...> | inspect <id>
   genji help [agent|tool] [--json] | --version";
 
 #[derive(Default)]
@@ -522,72 +521,6 @@ fn cmd_inspect(id: &str, o: &Opts) -> Result<()> {
     Ok(())
 }
 
-fn count_files(dir: &Path) -> usize {
-    std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| {
-            if e.path().is_dir() {
-                count_files(&e.path())
-            } else {
-                1
-            }
-        })
-        .sum()
-}
-
-/// Delete the workspace's sessions and plans. Agents, skills and config stay.
-fn cmd_reset(o: &Opts) -> Result<()> {
-    let ws = workspace(o)?;
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    if let Some((i, _)) = registry::list_live()
-        .into_iter()
-        .find(|(i, _)| canon(Path::new(&i.workspace)) == canon(&ws))
-    {
-        bail!(
-            "instance {} (pid {}) is running in this workspace; stop it first with `genji stop {}`",
-            i.id,
-            i.pid,
-            i.id
-        );
-    }
-    let dirs: Vec<PathBuf> = ["sessions", "plans"]
-        .iter()
-        .map(|d| dot(&ws, d))
-        .collect();
-    let total: usize = dirs.iter().map(|d| count_files(d)).sum();
-    if total == 0 {
-        eprintln!("[reset] nothing to delete");
-        return Ok(());
-    }
-    eprintln!(
-        "[reset] this will delete {total} file(s) under {}",
-        dot(&ws, "").display()
-    );
-    if !o.yes {
-        if !std::io::stdin().is_terminal() {
-            bail!("refusing to delete {total} file(s) without confirmation; re-run with --yes");
-        }
-        eprint!("Delete {total} file(s) and start over? [y/N] ");
-        std::io::stderr().flush().ok();
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            eprintln!("[reset] aborted");
-            return Ok(());
-        }
-    }
-    for d in dirs.iter().filter(|d| d.exists()) {
-        std::fs::remove_dir_all(d).with_context(|| format!("deleting {}", d.display()))?;
-    }
-    println!(
-        "{}",
-        serde_json::to_string(&json!({ "workspace": ws.display().to_string(), "deleted": total }))?
-    );
-    Ok(())
-}
-
 /// `genji init [agent...] [--force]`: writes the default agent files; prints
 /// `{"written":[...],"skipped":[...]}`.
 fn cmd_init(o: &Opts, only: &[String]) -> Result<()> {
@@ -620,11 +553,10 @@ fn real_main() -> Result<i32> {
                 [id, text @ ..] => cmd_instruct(id, &text.join(" ")).map(|()| 0),
                 [] => bail!("usage: genji instruct <id> <text...>"),
             },
-            "inspect" => match rest {
+            _ => match rest {
                 [id] => cmd_inspect(id, &o).map(|()| 0),
                 _ => bail!("usage: genji inspect <id>"),
             },
-            _ => cmd_reset(&o).map(|()| 0),
         },
         _ => run_agent(o),
     }

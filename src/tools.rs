@@ -325,16 +325,15 @@ fn bash(agent: &mut Agent, args: &Value) -> Result<String> {
 struct PlanArgs {
     title: String,
     content: String,
-    path: Option<String>,
 }
 
-/// Write a plan (default `.genji/plans/<title-slug>.md`), adding a `# title` heading when missing.
+/// Write a plan to `docs/notes/<title-slug>.md`, adding a `# title` heading when missing.
 fn plan_write(agent: &mut Agent, args: &Value) -> Result<String> {
     let a: PlanArgs = parse_args(args)?;
-    let path = match &a.path {
-        Some(p) => agent.resolve_path(p),
-        None => dot(&agent.workspace, "plans").join(format!("{}.md", slugify(&a.title, "plan"))),
-    };
+    let path = agent
+        .workspace
+        .join("docs/notes")
+        .join(format!("{}.md", slugify(&a.title, "plan")));
     let body = if a.content.trim_start().starts_with("# ") {
         a.content.clone()
     } else {
@@ -342,6 +341,30 @@ fn plan_write(agent: &mut Agent, args: &Value) -> Result<String> {
     };
     write_file(&path, body)?;
     Ok(format!("wrote plan to {}", agent.display_path(&path)))
+}
+
+// --- ask ------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AskArgs {
+    question: String,
+    options: Vec<String>,
+    recommended: String,
+}
+
+/// Ask the human a multiple-choice question and block on the answer.
+fn ask(agent: &mut Agent, args: &Value) -> Result<String> {
+    let a: AskArgs = parse_args(args)?;
+    if a.question.trim().is_empty() {
+        bail!("question is empty");
+    }
+    if !(2..=6).contains(&a.options.len()) {
+        bail!("options must hold 2 to 6 choices, got {}", a.options.len());
+    }
+    if !a.options.contains(&a.recommended) {
+        bail!("recommended must be one of options");
+    }
+    agent.ask(&a.options, &a.recommended)
 }
 
 // --- finish ---------------------------------------------------------------
@@ -640,15 +663,23 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["command"]
             }), bash),
-            tool("plan_write", "Persist an implementation plan as markdown under .genji/plans/. Reuse the same title to refine an existing plan.", json!({
+            tool("plan_write", "Persist an implementation plan as markdown at docs/notes/<title-slug>.md. Reuse the same title to refine an existing plan.", json!({
                 "type":"object",
                 "properties":{
                     "title":{"type":"string","description":"Short plan title; drives the file name and default heading"},
-                    "content":{"type":"string","description":"Plan body in markdown"},
-                    "path":{"type":"string","description":"Optional explicit path (default: .genji/plans/<title-slug>.md)"}
+                    "content":{"type":"string","description":"Plan body in markdown"}
                 },
                 "required":["title","content"]
             }), plan_write),
+            tool("ask", "Ask the human a multiple-choice question and wait for the answer. If nobody replies in time, the recommended option is used. A free-text reply is possible and comes back marked as such.", json!({
+                "type":"object",
+                "properties":{
+                    "question":{"type":"string"},
+                    "options":{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":6},
+                    "recommended":{"type":"string","description":"Your pick; must be one of options"}
+                },
+                "required":["question","options","recommended"]
+            }), ask),
             tool("spawn", "Run a subagent that works on the instructions and hands its report back as this call's result.", json!({
                 "type":"object",
                 "properties":{

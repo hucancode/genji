@@ -12,6 +12,7 @@
 | `tool_result_max_bytes` | `24000` | Inline limit for tool results; larger ones are clipped and the full text goes to `.genji/tmp` |
 | `bash_timeout_secs` | `120` | Default `bash` timeout |
 | `spawn_timeout_secs` | `900` | Subagent timeout |
+| `ask_timeout_secs` | `600` | How long the `ask` tool waits for a human answer before using its recommended option |
 | `max_tool_iterations` | `80` | Max tool rounds per run |
 | `llm_max_retries` | `6` | Retries per model request on transport errors, 408/409/429/5xx and unparseable responses (exponential backoff, honors `Retry-After`) |
 | `max_subagent_depth` | `2` | Subagent nesting limit |
@@ -34,7 +35,6 @@ Run flags:
 .genji/
   config.json          # this file
   agents/*.md          # agent definitions (`genji init` writes the defaults)
-  plans/*.md           # plans written with plan_write
   sessions/<id>.jsonl  # one operation log per instance
   control.sock         # control socket while running
   tmp/                 # scratch space and spilled tool results

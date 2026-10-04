@@ -85,6 +85,8 @@ pub struct Config {
     pub llm_max_retries: u32,
     pub bash_timeout_secs: u64,
     pub spawn_timeout_secs: u64,
+    /// How long `ask` waits for a human answer before using the recommended option.
+    pub ask_timeout_secs: u64,
     pub max_subagent_depth: u32,
     pub control_enabled: bool,
     /// Max tokens (prompt + completion) per run; overrides the provider's when above 0.
@@ -107,6 +109,7 @@ impl Default for Config {
             llm_max_retries: 6,
             bash_timeout_secs: 120,
             spawn_timeout_secs: 900,
+            ask_timeout_secs: 600,
             max_subagent_depth: 2,
             control_enabled: true,
             token_limit: 0,
@@ -414,8 +417,8 @@ pub(crate) mod tests {
             agents.keys().map(String::as_str).collect::<Vec<_>>(),
             ["build", "explore", "plan", "retro"]
         );
-        assert_eq!(agents["plan"].finish, ["done", "handoff", "blocked"]);
-        assert_eq!(agents["build"].finish, ["handoff", "blocked"]);
+        assert_eq!(agents["plan"].finish, ["done", "blocked"]);
+        assert_eq!(agents["build"].finish, ["done", "handoff", "blocked"]);
         assert!(load_skills(&ws).is_empty());
         assert!(!skills_dir(&ws).exists());
     }

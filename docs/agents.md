@@ -5,7 +5,7 @@ An agent is a markdown file: frontmatter plus the system prompt.
 ```markdown
 ---
 description: Reviews a diff and reports problems     # shown in `genji --help` and in other agents' prompts
-tools: read, ls, bash, finish                        # read write edit ls bash plan_write spawn finish
+tools: read, ls, bash, finish                        # read write edit ls bash plan_write spawn ask finish
 skills: formal                                         # optional: skills inlined into the system prompt at start
 finish: handoff, blocked                             # optional: statuses `finish` accepts (default: done, handoff, blocked)
 model: some-model                                    # optional: overrides the provider's model
@@ -28,17 +28,32 @@ Every agent is a subcommand: `genji <name> "task"`.
 `[{name, description, tools, skills, finish, model}]`; `genji help tool --json`
 prints the tools as `[{name, description, parameters}]`.
 
-Names that collide with a command (`init list stop instruct inspect reset help`) and
+Names that collide with a command (`init list stop instruct inspect help`) and
 agents that list an unknown tool are skipped with a warning on stderr.
 
 The files `genji init` writes:
 
 | agent | tools | `finish` | role |
 |---|---|---|---|
-| `plan` | read write edit ls bash plan_write spawn finish | done, handoff, blocked | coordinator; the only default agent that can declare the goal done |
-| `build` | read write edit ls bash spawn finish | handoff, blocked | implements a step, hands evidence back to `plan` |
+| `plan` | read write edit ls bash plan_write spawn ask finish | done, blocked | refines the goal with the human through `ask`, writes the plan to `docs/notes/`; never builds or hands off |
+| `build` | read write edit ls bash spawn finish | done, handoff, blocked | implements and verifies; hands off to a fresh `build` when a batch is done, `done` when the whole task is delivered |
 | `explore` | read ls bash spawn finish | handoff, blocked | investigates, hands findings back to `plan` |
 | `retro` | read write edit ls bash finish | done, blocked | improves agents and skills from recorded sessions |
+
+## The `ask` tool
+
+`ask {question, options (2-6), recommended}` blocks the run until a human answers or
+`ask_timeout_secs` (default 600) passes. `recommended` must be one of `options`. The call
+is logged as a `tool_call` before it blocks, so a pending ask is a `tool_call` without a
+`tool_result`. A human answers over the control socket with
+`/answer <callId> <json string>`, where `callId` is that tool call's id (see
+[Control socket](control-socket.md)). Results:
+
+- `answer: <option>`
+- `answer (free text): <text>` when the answer is not one of `options`
+- `answer: <recommended> (no reply within Ns; recommended option used)` on timeout
+- `answer: <recommended> (no human attached; recommended option used)` without a control socket (subagents, `--no-control`)
+- an error result when the run is stopped while waiting
 
 ## Finishing and handoff
 

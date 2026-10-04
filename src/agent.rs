@@ -32,6 +32,8 @@ pub struct Agent {
     pub depth: u32,
     /// The id of the tool call being dispatched, safe for use in a file name.
     pub call_tag: String,
+    /// The id of the tool call being dispatched, as logged in the session.
+    pub call_id: String,
     pub verdict: Option<Verdict>,
     /// Set when a handoff will not be followed because the `--follow` cap is reached.
     pub follow_capped: bool,
@@ -217,6 +219,7 @@ impl Agent {
             instance_id: p.instance_id,
             depth: p.depth,
             call_tag: String::new(),
+            call_id: String::new(),
             verdict: None,
             follow_capped: false,
             status: "done",
@@ -243,6 +246,28 @@ impl Agent {
 
     pub fn resolve_path(&self, path: &str) -> PathBuf {
         resolve_path(&self.workspace, path)
+    }
+
+    /// Block the current tool call on a human answer sent as `/answer <call_id> <json string>`.
+    /// A value outside `options` is free text. Without a control socket the
+    /// recommended option is used at once; after `ask_timeout_secs` too.
+    pub fn ask(&self, options: &[String], recommended: &str) -> Result<String> {
+        let Some(ctrl) = &self.control else {
+            return Ok(format!(
+                "answer: {recommended} (no human attached; recommended option used)"
+            ));
+        };
+        let secs = self.cfg.ask_timeout_secs;
+        match ctrl.wait_answer(&self.call_id, Duration::from_secs(secs)) {
+            Some(v) if options.contains(&v) => Ok(format!("answer: {v}")),
+            Some(v) => Ok(format!("answer (free text): {v}")),
+            None if ctrl.stop_requested() => {
+                anyhow::bail!("stopped by user while waiting for an answer")
+            }
+            None => Ok(format!(
+                "answer: {recommended} (no reply within {secs}s; recommended option used)"
+            )),
+        }
     }
 
     pub fn display_path(&self, path: &Path) -> String {
@@ -280,6 +305,7 @@ impl Agent {
 
     fn run_call(&mut self, tc: &ToolCall) {
         self.call_tag = sanitize(&tc.id);
+        self.call_id = tc.id.clone();
         let start = Instant::now();
         let (result, is_error) = match serde_json::from_str::<Value>(tc.args()) {
             Ok(args) => tools::dispatch(self, tc.name(), &args),

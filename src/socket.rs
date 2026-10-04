@@ -4,9 +4,10 @@ use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::storage::context::ContextComposer;
 
@@ -14,6 +15,7 @@ use crate::storage::context::ContextComposer;
 ///
 /// Protocol: one newline-terminated line per connection:
 ///
+/// - `/answer <callId> <json string>` -> answers the pending `ask` tool call `callId`
 /// - any other text -> queued as a user instruction
 /// - `/status` -> returns the agent's current status
 /// - `/context` -> returns the live context snapshot (messages + tools)
@@ -25,7 +27,7 @@ use crate::storage::context::ContextComposer;
 pub struct Control {
     pub path: PathBuf,
     state: Mutex<State>,
-    /// Signalled when an instruction is queued or a stop is requested.
+    /// Signalled when an instruction is queued, an answer arrives or a stop is requested.
     wake: Condvar,
     context: Arc<RwLock<ContextComposer>>,
 }
@@ -34,6 +36,8 @@ struct State {
     queue: Vec<String>,
     stop: bool,
     status: String,
+    /// Answers to `ask` calls, by tool call id, until taken by `wait_answer`.
+    answers: HashMap<String, String>,
 }
 
 impl Control {
@@ -65,6 +69,7 @@ impl Control {
                 queue: Vec::new(),
                 stop: false,
                 status: "starting".to_string(),
+                answers: HashMap::new(),
             }),
             wake: Condvar::new(),
             context,
@@ -103,6 +108,23 @@ impl Control {
         Some(std::mem::take(&mut st.queue))
     }
 
+    /// Block until an answer for `id` arrives (`Some`), the deadline passes or a
+    /// stop is requested (`None`).
+    pub fn wait_answer(&self, id: &str, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        let mut st = self.state();
+        loop {
+            if let Some(a) = st.answers.remove(id) {
+                return Some(a);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if st.stop || left.is_zero() {
+                return None;
+            }
+            st = self.wake.wait_timeout(st, left).unwrap().0;
+        }
+    }
+
     pub fn stop_requested(&self) -> bool {
         self.state().stop
     }
@@ -132,6 +154,21 @@ fn handle(mut stream: UnixStream, c: &Control) -> Result<()> {
             "stopping".to_string()
         }
         "/ping" => "pong".to_string(),
+        _ if line.starts_with("/answer ") => {
+            let parsed = line["/answer ".len()..].trim_start().split_once(' ').and_then(|(id, v)| {
+                serde_json::from_str::<String>(v.trim())
+                    .ok()
+                    .map(|v| (id.to_string(), v))
+            });
+            match parsed {
+                Some((id, v)) => {
+                    c.state().answers.insert(id, v);
+                    c.wake.notify_all();
+                    "answered".to_string()
+                }
+                None => "error: usage: /answer <callId> <json string>".to_string(),
+            }
+        }
         _ => {
             let mut st = c.state();
             st.queue.push(line.to_string());
@@ -172,6 +209,7 @@ mod tests {
     use crate::storage::context::ContextComposer;
     use crate::storage::util::temp_dir;
     use std::sync::{Arc, RwLock};
+    use std::time::Duration;
 
     #[test]
     fn context_command_measures_the_shared_composer() {
@@ -191,6 +229,35 @@ mod tests {
         );
         assert!(snapshot.contains("\"messages\""), "got: {snapshot}");
         assert!(snapshot.contains("\"system\""), "got: {snapshot}");
+
+        ctrl.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn answer_command_wakes_wait_answer() {
+        let dir = temp_dir("control-answer");
+        let sock = dir.join("control.sock");
+        let composer = Arc::new(RwLock::new(ContextComposer::new(String::new(), Vec::new(), 1000)));
+        let ctrl = Control::start(sock.clone(), composer).expect("start control");
+
+        assert_eq!(
+            send(&sock, "/answer call_1 \"blue\"").unwrap(),
+            "answered"
+        );
+        assert_eq!(
+            ctrl.wait_answer("call_1", Duration::from_secs(2)).as_deref(),
+            Some("blue")
+        );
+        assert!(send(&sock, "/answer call_1 not-json").unwrap().starts_with("error"));
+        assert!(ctrl.drain().is_empty());
+        assert_eq!(ctrl.wait_answer("call_2", Duration::from_millis(50)), None);
+
+        let c = ctrl.clone();
+        let h = std::thread::spawn(move || c.wait_answer("call_3", Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(100));
+        send(&sock, "/stop").unwrap();
+        assert_eq!(h.join().unwrap(), None);
 
         ctrl.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
