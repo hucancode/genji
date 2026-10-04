@@ -1,6 +1,6 @@
 # genji
 
-A minimal, headless coding agent. Agents are markdown files; every agent is a subcommand.
+A minimal, headless coding agent.
 
 ```bash
 cargo build

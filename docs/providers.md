@@ -64,11 +64,25 @@ Azure's OpenAI-compatible endpoint takes the deployment name as `model` and an
 }
 ```
 
+Anthropic Messages endpoint (for example Claude on Azure Foundry):
+
+```json
+{"provider": "claude", "providers": {"claude": {
+  "api": "anthropic",
+  "base_url": "https://<resource>.services.ai.azure.com/anthropic/v1",
+  "api_key_env": "AZURE_MODEL_API_KEY",
+  "model": "claude-sonnet-5",
+  "context_window": 200000,
+  "max_output_tokens": 16384
+}}}
+```
+
 ## Endpoint profile fields
 
 | Field | Default | Meaning |
 |---|---|---|
-| `base_url` | `http://127.0.0.1:8080/v1` | Requests go to `<base_url>/chat/completions` |
+| `base_url` | `http://127.0.0.1:8080/v1` | Requests go to `<base_url>/chat/completions`, or `<base_url>/messages` when `api` is `anthropic` |
+| `api` | `chat` | `chat` is OpenAI chat-completions; `anthropic` is the Messages API (sends `x-api-key` and `anthropic-version`; `auth` and `max_tokens_field` are ignored) |
 | `api_key` / `api_key_env` | empty | Literal key, or the env var holding it |
 | `auth` | `bearer` | `bearer` sends `Authorization: Bearer`, `api-key` sends an `api-key` header |
 | `model` | `qwen3-coder-30b-a3b` | Model or deployment name; an agent's `model:` overrides it |

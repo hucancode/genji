@@ -32,9 +32,11 @@ pub struct Provider {
     pub api_key: String,
     /// Env var consulted when `api_key` is empty.
     pub api_key_env: String,
-    /// "bearer" (Authorization) or "api-key" (Azure).
+    /// "bearer" (Authorization) or "api-key" (Azure). The anthropic api always sends `x-api-key`.
     pub auth: String,
     pub model: String,
+    /// Wire format: "chat" (OpenAI chat-completions) or "anthropic" (Messages API).
+    pub api: String,
     /// "max_tokens" or "max_completion_tokens".
     pub max_tokens_field: String,
     pub send_tool_choice: bool,
@@ -53,6 +55,7 @@ impl Default for Provider {
             api_key_env: String::new(),
             auth: "bearer".into(),
             model: "qwen3-coder-30b-a3b".into(),
+            api: "chat".into(),
             max_tokens_field: "max_tokens".into(),
             send_tool_choice: true,
             headers: BTreeMap::new(),

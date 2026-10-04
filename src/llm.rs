@@ -226,17 +226,25 @@ impl LlmClient {
         hint: Option<&str>,
     ) -> Result<LlmResponse> {
         let p = &self.provider;
-        let body = serde_json::to_vec(&Request {
-            model: &self.model,
-            messages: Messages(
+        let hint = hint.map(|h| ChatMessage::user(format!("[note] {h}")));
+        let body = if p.api == "anthropic" {
+            serde_json::to_vec(&anthropic_request(
+                &self.model,
                 messages,
-                hint.map(|h| ChatMessage::user(format!("[note] {h}"))),
-            ),
+                hint,
+                tools,
+                p.max_output_tokens,
+            ))?
+        } else {
+            serde_json::to_vec(&Request {
+            model: &self.model,
+            messages: Messages(messages, hint),
             stream: false,
             tools,
             tool_choice: (p.send_tool_choice && !tools.is_empty()).then_some("auto"),
             max_tokens: BTreeMap::from([(p.max_tokens_field.as_str(), p.max_output_tokens)]),
-        })?;
+            })?
+        };
         if let Some(dir) = std::env::var_os("GENJI_DUMP_REQUESTS") {
             let path = crate::storage::util::tmp_file(dir.as_ref(), "request", "json");
             let _ = crate::storage::util::write_file(&path, &body);
@@ -267,14 +275,24 @@ impl LlmClient {
             retry_after: None,
         };
         let p = &self.provider;
-        let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
+        let anthropic = p.api == "anthropic";
+        let url = format!(
+            "{}/{}",
+            p.base_url.trim_end_matches('/'),
+            if anthropic { "messages" } else { "chat/completions" }
+        );
         let mut req = self
             .agent
             .post(&url)
             .set("Content-Type", "application/json");
+        if anthropic {
+            req = req.set("anthropic-version", "2023-06-01");
+        }
         let key = p.api_key();
         if !key.is_empty() {
-            req = if p.auth == "api-key" {
+            req = if anthropic {
+                req.set("x-api-key", &key)
+            } else if p.auth == "api-key" {
                 req.set("api-key", &key)
             } else {
                 req.set("Authorization", &format!("Bearer {key}"))
@@ -289,7 +307,8 @@ impl LlmClient {
                     .into_string()
                     .map_err(|e| fail(anyhow!("reading llm response: {e}"), true))?;
                 // A garbled 200 (truncated JSON, a proxy's HTML page) is transient.
-                parse_response(&text).map_err(|e| fail(e, true))
+                (if anthropic { parse_anthropic(&text) } else { parse_response(&text) })
+                    .map_err(|e| fail(e, true))
             }
             Err(ureq::Error::Status(code, r)) => {
                 let retry_after = r
@@ -362,6 +381,133 @@ fn parse_response(text: &str) -> Result<LlmResponse> {
     })
 }
 
+/// Chat-completions history as an Anthropic Messages request. System text
+/// becomes `system`; assistant tool calls become `tool_use` blocks; tool
+/// results become `tool_result` blocks of a user turn, merged with adjacent
+/// user content because the API wants strictly alternating roles.
+fn anthropic_request(
+    model: &str,
+    messages: &[ChatMessage],
+    hint: Option<ChatMessage>,
+    tools: &[Value],
+    max_tokens: i64,
+) -> Value {
+    let mut system = Vec::new();
+    let mut turns: Vec<(&str, Vec<Value>)> = Vec::new();
+    let mut push = |role: &'static str, block: Value| match turns.last_mut() {
+        Some((r, blocks)) if *r == role => blocks.push(block),
+        _ => turns.push((role, vec![block])),
+    };
+    for m in messages.iter().chain(hint.iter()) {
+        match m.role {
+            Role::System => system.push(m.content.as_str()),
+            Role::User => {
+                if !m.content.is_empty() {
+                    push("user", serde_json::json!({"type": "text", "text": m.content}));
+                }
+            }
+            Role::Tool => push(
+                "user",
+                serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": m.tool_call_id.as_deref().unwrap_or_default(),
+                    "content": if m.content.is_empty() { "(empty)" } else { m.content.as_str() },
+                }),
+            ),
+            Role::Assistant => {
+                let mut any = false;
+                if !m.content.is_empty() {
+                    any = true;
+                    push("assistant", serde_json::json!({"type": "text", "text": m.content}));
+                }
+                for c in &m.tool_calls {
+                    any = true;
+                    let input = serde_json::from_str::<Value>(c.args())
+                        .ok()
+                        .filter(Value::is_object)
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    push(
+                        "assistant",
+                        serde_json::json!({"type": "tool_use", "id": c.id, "name": c.name(), "input": input}),
+                    );
+                }
+                if !any {
+                    push("assistant", serde_json::json!({"type": "text", "text": "(no output)"}));
+                }
+            }
+        }
+    }
+    // tool_result blocks must lead the user turn that answers a tool_use.
+    for (_, blocks) in &mut turns {
+        blocks.sort_by_key(|b| b["type"] != "tool_result");
+    }
+    let tools: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            let f = &t["function"];
+            serde_json::json!({
+                "name": f["name"],
+                "description": f["description"],
+                "input_schema": f["parameters"],
+            })
+        })
+        .collect();
+    let mut req = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": turns
+            .into_iter()
+            .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
+            .collect::<Vec<_>>(),
+    });
+    if !system.is_empty() {
+        req["system"] = system.join("\n\n").into();
+    }
+    if !tools.is_empty() {
+        req["tools"] = tools.into();
+    }
+    req
+}
+
+fn parse_anthropic(text: &str) -> Result<LlmResponse> {
+    let v: Value = serde_json::from_str(text)
+        .with_context(|| format!("parsing llm response: {}", truncate(text, 400)))?;
+    let blocks = v["content"]
+        .as_array()
+        .ok_or_else(|| anyhow!("llm response has no content: {}", truncate(text, 400)))?;
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    for b in blocks {
+        match b["type"].as_str() {
+            Some("text") => content.push_str(b["text"].as_str().unwrap_or_default()),
+            Some("thinking") => reasoning.push_str(b["thinking"].as_str().unwrap_or_default()),
+            Some("tool_use") => tool_calls.push(ToolCall::new(
+                b["id"].as_str().unwrap_or_default(),
+                b["name"].as_str().unwrap_or_default(),
+                b["input"].to_string(),
+            )),
+            _ => {}
+        }
+    }
+    let u = &v["usage"];
+    let n = |k: &str| u[k].as_i64().unwrap_or(0);
+    let cached = n("cache_read_input_tokens");
+    Ok(LlmResponse {
+        message: ChatMessage {
+            role: Role::Assistant,
+            content,
+            tool_calls,
+            tool_call_id: None,
+            reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+        },
+        prompt_tokens: n("input_tokens") + cached + n("cache_creation_input_tokens"),
+        completion_tokens: n("output_tokens"),
+        cached_tokens: cached,
+        truncated: v["stop_reason"].as_str() == Some("max_tokens"),
+    })
+}
+
 pub fn truncate(s: &str, max: usize) -> Cow<'_, str> {
     if s.len() <= max {
         return Cow::Borrowed(s);
@@ -414,6 +560,38 @@ mod tests {
         let back: ChatMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tool_calls[0].name(), "read");
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn anthropic_request_merges_turns_and_maps_tools() {
+        let mut a = ChatMessage::default();
+        a.tool_calls.push(ToolCall::new("t1", "read", r#"{"path":"x"}"#));
+        let msgs = [
+            ChatMessage::system("sys"),
+            ChatMessage::user("go"),
+            a,
+            ChatMessage::tool_result("t1", "ok"),
+        ];
+        let tools = [serde_json::json!({"type":"function","function":{"name":"read","description":"d","parameters":{"type":"object"}}})];
+        let r = super::anthropic_request("m", &msgs, Some(ChatMessage::user("[note] h")), &tools, 9);
+        assert_eq!(r["system"], "sys");
+        assert_eq!(r["max_tokens"], 9);
+        assert_eq!(r["tools"][0]["input_schema"]["type"], "object");
+        let m = r["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[1]["content"][0]["input"]["path"], "x");
+        assert_eq!(m[2]["content"][0]["type"], "tool_result");
+        assert_eq!(m[2]["content"][1]["text"], "[note] h");
+    }
+
+    #[test]
+    fn parses_anthropic_response() {
+        let body = r#"{"content":[{"type":"text","text":"hi"},{"type":"tool_use","id":"t","name":"read","input":{"path":"x"}}],"stop_reason":"max_tokens","usage":{"input_tokens":5,"cache_read_input_tokens":3,"output_tokens":2}}"#;
+        let r = super::parse_anthropic(body).unwrap();
+        assert_eq!(r.message.content, "hi");
+        assert_eq!(r.message.tool_calls[0].args(), r#"{"path":"x"}"#);
+        assert_eq!((r.prompt_tokens, r.cached_tokens, r.completion_tokens), (8, 3, 2));
+        assert!(r.truncated);
     }
 
     #[test]
