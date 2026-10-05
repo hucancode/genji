@@ -1,35 +1,47 @@
 use anyhow::{Context, Result, bail};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::Shutdown;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
+use std::io::BufRead;
+#[cfg(feature = "socket")]
+use std::io::{BufReader, Write};
+#[cfg(feature = "socket")]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(feature = "socket")]
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+#[cfg(feature = "socket")]
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::storage::context::ContextComposer;
 
-/// A control socket that lets a user inject instructions into a running agent.
+/// Lines buffered per watcher before further output is dropped for it.
+#[cfg(feature = "socket")]
+const WATCH_BACKLOG: usize = 256;
+
+#[cfg(feature = "socket")]
+const HELP: &str = "<text> queues an instruction | /watch follows events | /status | /context (JSON) | /answer <callId> <text> | /stop | /ping | /help";
+
+/// The control of a running agent: queued instructions, answers to `ask` calls, a stop
+/// request and a status line, fed from stdin (`read_commands`) and, with the `socket`
+/// feature, from a Unix socket for humans.
 ///
-/// Protocol: one newline-terminated line per connection:
-///
-/// - `/answer <callId> <json string>` -> answers the pending `ask` tool call `callId`
-/// - any other text -> queued as a user instruction
-/// - `/status` -> returns the agent's current status
-/// - `/context` -> returns the live context snapshot (messages + tools)
-/// - `/stop` -> requests a graceful stop
-/// - `/ping` -> liveness check
-///
-/// Each command receives one response line and the server then closes its
-/// write side. The append-only event trace remains the complete event record.
+/// The socket lets a person inject instructions and watch the agent work.
+/// Connections are long-lived. Each line is a command and gets one reply line;
+/// `/watch` additionally streams events as readable text until the client disconnects.
+/// Machines use stdout (the JSONL event stream, also in the session file) and stdin
+/// (`read_commands`).
 pub struct Control {
-    pub path: PathBuf,
+    /// The socket's path; `None` when nothing listens.
+    pub path: Option<PathBuf>,
     state: Mutex<State>,
     /// Signalled when an instruction is queued, an answer arrives or a stop is requested.
     wake: Condvar,
+    #[cfg_attr(not(feature = "socket"), allow(dead_code))]
     context: Arc<RwLock<ContextComposer>>,
+    #[cfg(feature = "socket")]
+    watchers: Mutex<Vec<SyncSender<String>>>,
 }
 
 struct State {
@@ -43,29 +55,9 @@ struct State {
 }
 
 impl Control {
-    pub fn start(path: PathBuf, context: Arc<RwLock<ContextComposer>>) -> Result<Arc<Self>> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        if path.exists() {
-            // A live listener means another agent is already running here; a
-            // refused connection means the socket is stale and can be removed.
-            match UnixStream::connect(&path) {
-                Ok(_) => bail!(
-                    "another genji process is already listening on {}",
-                    path.display()
-                ),
-                Err(_) => {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-        let listener = UnixListener::bind(&path)
-            .with_context(|| format!("binding control socket {}", path.display()))?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("securing control socket {}", path.display()))?;
-        let ctrl = Arc::new(Control {
+    /// A control that does not listen: its queue, answers and stop work.
+    pub fn new(path: Option<PathBuf>, context: Arc<RwLock<ContextComposer>>) -> Arc<Self> {
+        Arc::new(Control {
             path,
             state: Mutex::new(State {
                 queue: Vec::new(),
@@ -76,18 +68,61 @@ impl Control {
             }),
             wake: Condvar::new(),
             context,
-        });
+            #[cfg(feature = "socket")]
+            watchers: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// A control that listens on `path`, if given and this build has the `socket` feature.
+    pub fn open(path: Option<PathBuf>, context: Arc<RwLock<ContextComposer>>) -> Result<Arc<Self>> {
+        let ctrl = Self::new(path, context);
+        #[cfg(feature = "socket")]
+        if ctrl.path.is_some() {
+            ctrl.listen()?;
+        }
+        Ok(ctrl)
+    }
+
+    #[cfg(feature = "socket")]
+    fn listen(self: &Arc<Self>) -> Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        if path.exists() {
+            // A live listener means another agent is already running here; a
+            // refused connection means the socket is stale and can be removed.
+            match UnixStream::connect(path) {
+                Ok(_) => bail!(
+                    "another genji process is already listening on {}",
+                    path.display()
+                ),
+                Err(_) => {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let listener = UnixListener::bind(path)
+            .with_context(|| format!("binding control socket {}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("securing control socket {}", path.display()))?;
         // Blocks in `accept` for the life of the process; `shutdown` removes the
-        // socket file and process exit ends the thread.
-        let c = ctrl.clone();
+        // socket file and process exit ends the threads.
+        let c = self.clone();
         thread::Builder::new()
             .name("genji-control".into())
             .spawn(move || {
                 for stream in listener.incoming().flatten() {
-                    let _ = handle(stream, &c);
+                    let c = c.clone();
+                    thread::spawn(move || {
+                        let _ = serve(stream, &c);
+                    });
                 }
             })?;
-        Ok(ctrl)
+        Ok(())
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -145,125 +180,241 @@ impl Control {
     }
 
     pub fn shutdown(&self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(feature = "socket")]
+    /// Send a line to every watcher. A watcher that is not keeping up misses lines;
+    /// one that has gone is forgotten. Never blocks.
+    pub fn publish(&self, line: &str) {
+        self.watchers
+            .lock()
+            .unwrap()
+            .retain(|tx| !matches!(tx.try_send(line.to_string()), Err(TrySendError::Disconnected(_))));
+    }
+
+    #[cfg(feature = "socket")]
+    /// Stream published lines to `out` until it fails.
+    fn watch(&self, out: Arc<Mutex<UnixStream>>) {
+        let (tx, rx) = sync_channel::<String>(WATCH_BACKLOG);
+        self.watchers.lock().unwrap().push(tx);
+        thread::spawn(move || {
+            for line in rx {
+                let mut w = out.lock().unwrap();
+                if writeln!(w, "{line}").and_then(|()| w.flush()).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "socket")]
+    /// Run one command line and return its reply.
+    fn command(&self, line: &str) -> String {
+        match line {
+            "/help" => HELP.to_string(),
+            "/status" => format!("status: {}", self.state().status),
+            "/context" => serde_json::to_string(&self.context.read().unwrap().snapshot())
+                .unwrap_or_else(|e| format!("error: {e}")),
+            "/stop" => {
+                self.request_stop();
+                "stopping".to_string()
+            }
+            "/ping" => "pong".to_string(),
+            _ if line.starts_with("/answer") => self.answer(line["/answer".len()..].trim()),
+            _ if line.starts_with('/') => {
+                let cmd = line.split_whitespace().next().unwrap_or(line);
+                format!("error: unknown command {cmd} (try /help)")
+            }
+            _ => format!("queued ({} pending)", self.queue(line)),
+        }
+    }
+
+    /// Queue a user instruction; returns how many are pending.
+    fn queue(&self, text: &str) -> usize {
+        let mut st = self.state();
+        st.queue.push(text.to_string());
+        self.wake.notify_all();
+        st.queue.len()
+    }
+
+    fn request_stop(&self) {
+        self.state().stop = true;
+        self.wake.notify_all();
+    }
+
+    /// Hand `value` to the `ask` call `id` if it is waiting.
+    fn give_answer(&self, id: &str, value: String) -> bool {
+        let mut st = self.state();
+        let waiting = st.waiting.contains(id);
+        if waiting {
+            st.answers.insert(id.to_string(), value);
+            self.wake.notify_all();
+        }
+        waiting
+    }
+
+    /// Apply the JSONL commands of `input` (the machine interface, normally stdin), one per
+    /// line, in the background: `{"type":"instruction","text":…}`,
+    /// `{"type":"answer","id":…,"text":…}` and `{"type":"stop"}`. A bad line is reported on
+    /// stderr and skipped; the end of input changes nothing.
+    pub fn read_commands(self: &Arc<Self>, input: impl BufRead + Send + 'static) {
+        let c = self.clone();
+        thread::spawn(move || {
+            for line in input.lines().map_while(std::result::Result::ok) {
+                let line = line.trim();
+                if !line.is_empty()
+                    && let Err(e) = c.apply(line)
+                {
+                    eprintln!("error: stdin command `{}`: {e:#}", crate::llm::truncate(line, 80));
+                }
+            }
+        });
+    }
+
+    fn apply(&self, line: &str) -> Result<()> {
+        let v: serde_json::Value = serde_json::from_str(line).context("not JSON")?;
+        let field = |k: &str| v[k].as_str().with_context(|| format!("missing `{k}`"));
+        match v["type"].as_str() {
+            Some("instruction") => {
+                self.queue(field("text")?);
+            }
+            Some("answer") => {
+                let id = field("id")?;
+                if !self.give_answer(id, field("text")?.to_string()) {
+                    bail!("no ask call {id} is waiting");
+                }
+            }
+            Some("stop") => self.request_stop(),
+            _ => bail!("`type` must be instruction, answer or stop"),
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "socket")]
+    /// `<callId> <text>`: the text is a JSON string, or else taken as it is.
+    fn answer(&self, args: &str) -> String {
+        let Some((id, text)) = args.split_once(char::is_whitespace) else {
+            return "error: usage: /answer <callId> <text>".into();
+        };
+        let text = text.trim();
+        let value = serde_json::from_str::<String>(text).unwrap_or_else(|_| text.to_string());
+        if self.give_answer(id, value) {
+            "answered".to_string()
+        } else {
+            format!("error: no ask call {id} is waiting")
+        }
     }
 }
 
-fn handle(mut stream: UnixStream, c: &Control) -> Result<()> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
-    let line = line.trim();
-    let resp = match line {
-        "" => "error: empty command".to_string(),
-        "/status" => format!("status: {}", c.state().status),
-        "/context" => serde_json::to_string(&c.context.read().unwrap().snapshot())
-            .unwrap_or_else(|e| format!("error: {e}")),
-        "/stop" => {
-            c.state().stop = true;
-            c.wake.notify_all();
-            "stopping".to_string()
+#[cfg(feature = "socket")]
+/// One client: a command per line, a reply per command, until it disconnects.
+fn serve(stream: UnixStream, c: &Control) -> Result<()> {
+    let out = Arc::new(Mutex::new(stream.try_clone()?));
+    let mut watching = false;
+    for line in BufReader::new(stream).lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
         }
-        "/ping" => "pong".to_string(),
-        _ if line.starts_with("/answer ") => {
-            let parsed = line["/answer ".len()..].trim_start().split_once(' ').and_then(|(id, v)| {
-                serde_json::from_str::<String>(v.trim())
-                    .ok()
-                    .map(|v| (id.to_string(), v))
-            });
-            match parsed {
-                Some((id, v)) => {
-                    let mut st = c.state();
-                    if st.waiting.contains(&id) {
-                        st.answers.insert(id, v);
-                        c.wake.notify_all();
-                        "answered".to_string()
-                    } else {
-                        format!("error: no ask call {id} is waiting")
-                    }
-                }
-                None => "error: usage: /answer <callId> <json string>".to_string(),
+        let reply = if line == "/watch" {
+            if !std::mem::replace(&mut watching, true) {
+                c.watch(out.clone());
             }
-        }
-        _ => {
-            let mut st = c.state();
-            st.queue.push(line.to_string());
-            c.wake.notify_all();
-            eprintln!(
-                "[control] received user instruction ({} pending)",
-                st.queue.len()
-            );
-            format!("queued ({} pending)", st.queue.len())
-        }
-    };
-    let _ = stream.write_all(format!("{resp}\n").as_bytes());
-    let _ = stream.flush();
-    let _ = stream.shutdown(Shutdown::Write);
+            "watching".to_string()
+        } else {
+            c.command(line)
+        };
+        let mut w = out.lock().unwrap();
+        writeln!(w, "{reply}")?;
+        w.flush()?;
+    }
     Ok(())
-}
-
-/// Client: connect to a running agent's control socket and send one line.
-pub fn send(path: &Path, msg: &str) -> Result<String> {
-    let mut stream = UnixStream::connect(path).with_context(|| {
-        format!(
-            "connecting to control socket {} (is genji running in this workspace?)",
-            path.display()
-        )
-    })?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    stream.write_all(msg.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    let mut resp = String::new();
-    let _ = stream.read_to_string(&mut resp);
-    Ok(resp.trim().to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Control, send};
+    use super::Control;
     use crate::storage::context::ContextComposer;
-    use crate::storage::util::temp_dir;
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
 
     #[test]
-    fn context_command_measures_the_shared_composer() {
-        let dir = temp_dir("control-ctx");
-        let sock = dir.join("control.sock");
-        let composer = Arc::new(RwLock::new(ContextComposer::new(
-            "system".to_string(),
-            Vec::new(),
-            1000,
-        )));
-        let ctrl = Control::start(sock.clone(), composer).expect("start control");
-
-        let snapshot = send(&sock, "/context").expect("send /context");
-        assert!(
-            snapshot.contains("\"context_window\":1000"),
-            "got: {snapshot}"
+    fn stdin_commands_queue_answer_and_stop() {
+        let ctrl = Control::new(None, Arc::new(RwLock::new(ContextComposer::new(String::new(), Vec::new(), 1000))));
+        let c = ctrl.clone();
+        let h = std::thread::spawn(move || c.wait_answer("c1", Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(100));
+        let input = concat!(
+            "{\"type\":\"instruction\",\"text\":\"/not a command\"}\n",
+            "garbage\n\n",
+            "{\"type\":\"answer\",\"id\":\"c1\",\"text\":\"pg\"}\n",
+            "{\"type\":\"stop\"}\n",
         );
+        ctrl.read_commands(std::io::Cursor::new(input));
+        assert_eq!(h.join().unwrap().as_deref(), Some("pg"));
+        for _ in 0..50 {
+            if ctrl.stop_requested() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(ctrl.stop_requested());
+        assert_eq!(ctrl.drain(), ["/not a command"]);
+    }
+}
+
+#[cfg(all(test, feature = "socket"))]
+mod socket_tests {
+    use super::Control;
+    use crate::storage::context::ContextComposer;
+    use crate::storage::util::temp_dir;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+    use std::sync::{Arc, RwLock};
+    use std::time::Duration;
+
+    /// One command on its own connection.
+    fn send(path: &Path, msg: &str) -> std::io::Result<String> {
+        let mut s = UnixStream::connect(path)?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        writeln!(s, "{msg}")?;
+        s.shutdown(std::net::Shutdown::Write)?;
+        let mut resp = String::new();
+        s.read_to_string(&mut resp)?;
+        Ok(resp.trim().to_string())
+    }
+
+    fn start(tag: &str, system: &str) -> (Arc<Control>, std::path::PathBuf) {
+        let sock = temp_dir(tag).join("control.sock");
+        let composer = Arc::new(RwLock::new(ContextComposer::new(system.into(), Vec::new(), 1000)));
+        (Control::open(Some(sock.clone()), composer).expect("start control"), sock)
+    }
+
+    #[test]
+    fn context_command_measures_the_shared_composer() {
+        let (ctrl, sock) = start("control-ctx", "system");
+        let snapshot = send(&sock, "/context").expect("send /context");
+        assert!(snapshot.contains("\"context_window\":1000"), "got: {snapshot}");
         assert!(snapshot.contains("\"messages\""), "got: {snapshot}");
         assert!(snapshot.contains("\"system\""), "got: {snapshot}");
-
         ctrl.shutdown();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn answer_command_wakes_wait_answer() {
-        let dir = temp_dir("control-answer");
-        let sock = dir.join("control.sock");
-        let composer = Arc::new(RwLock::new(ContextComposer::new(String::new(), Vec::new(), 1000)));
-        let ctrl = Control::start(sock.clone(), composer).expect("start control");
-
+        let (ctrl, sock) = start("control-answer", "");
         assert!(send(&sock, "/answer call_1 \"blue\"").unwrap().starts_with("error"));
         let c = ctrl.clone();
         let h = std::thread::spawn(move || c.wait_answer("call_1", Duration::from_secs(2)));
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(send(&sock, "/answer call_1 \"blue\"").unwrap(), "answered");
         assert_eq!(h.join().unwrap().as_deref(), Some("blue"));
-        assert!(send(&sock, "/answer call_1 not-json").unwrap().starts_with("error"));
+        assert!(send(&sock, "/answer call_1").unwrap().starts_with("error"));
         assert!(ctrl.drain().is_empty());
         assert_eq!(ctrl.wait_answer("call_2", Duration::from_millis(50)), None);
 
@@ -272,8 +423,62 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         send(&sock, "/stop").unwrap();
         assert_eq!(h.join().unwrap(), None);
-
         ctrl.shutdown();
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn answer_accepts_bare_text() {
+        let (ctrl, sock) = start("control-bare", "");
+        let c = ctrl.clone();
+        let h = std::thread::spawn(move || c.wait_answer("c9", Duration::from_secs(2)));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(send(&sock, "/answer c9 Postgres 16").unwrap(), "answered");
+        assert_eq!(h.join().unwrap().as_deref(), Some("Postgres 16"));
+        ctrl.shutdown();
+    }
+
+    #[test]
+    fn one_connection_carries_many_commands_and_rejects_unknown_ones() {
+        let (ctrl, sock) = start("control-many", "");
+        let s = UnixStream::connect(&sock).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let mut ask = |cmd: &str| {
+            writeln!(w, "{cmd}").unwrap();
+            let mut l = String::new();
+            r.read_line(&mut l).unwrap();
+            l.trim().to_string()
+        };
+        assert_eq!(ask("/ping"), "pong");
+        assert!(ask("/help").contains("/watch"));
+        assert_eq!(ask("/ping"), "pong", "/help is a single reply line");
+        assert_eq!(ask("focus on the parser"), "queued (1 pending)");
+        assert!(ask("/context stats").starts_with("error: unknown command /context"));
+        assert!(ask("/nope").starts_with("error: unknown command /nope"));
+        assert_eq!(ctrl.drain(), ["focus on the parser"]);
+        ctrl.shutdown();
+    }
+
+    #[test]
+    fn watch_streams_published_lines_on_the_same_connection() {
+        let (ctrl, sock) = start("control-watch", "");
+        let s = UnixStream::connect(&sock).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        writeln!(w, "/watch").unwrap();
+        let mut l = String::new();
+        r.read_line(&mut l).unwrap();
+        assert_eq!(l.trim(), "watching");
+        ctrl.publish("hello");
+        l.clear();
+        r.read_line(&mut l).unwrap();
+        assert_eq!(l.trim(), "hello");
+        writeln!(w, "/ping").unwrap();
+        l.clear();
+        r.read_line(&mut l).unwrap();
+        assert_eq!(l.trim(), "pong");
+        ctrl.shutdown();
     }
 }

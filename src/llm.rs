@@ -485,10 +485,10 @@ fn anthropic_request(
     // Prompt caching: breakpoints after the tools, the system text and the latest block,
     // so each request re-reads the unchanged prefix at the cached rate.
     let cache = serde_json::json!({"type": "ephemeral"});
-    if let Some((_, blocks)) = turns.last_mut() {
-        if let Some(last) = blocks.last_mut() {
-            last["cache_control"] = cache.clone();
-        }
+    if let Some((_, blocks)) = turns.last_mut()
+        && let Some(last) = blocks.last_mut()
+    {
+        last["cache_control"] = cache.clone();
     }
     let tools: Vec<Value> = tools
         .iter()

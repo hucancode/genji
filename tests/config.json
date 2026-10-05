@@ -23,6 +23,5 @@
   "llm_max_retries": 6,
   "bash_timeout_secs": 120,
   "spawn_timeout_secs": 900,
-  "max_subagent_depth": 2,
-  "control_enabled": true
+  "max_subagent_depth": 2
 }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::config::{self, AgentDef, Config, Provider};
+use crate::config::{self, AgentDef, Config, Provider, Skill};
 use crate::llm::{self, ChatMessage, LlmClient, Role, ToolCall};
 use crate::socket::Control;
 use crate::storage::context::ContextComposer;
@@ -33,7 +33,7 @@ const CACHE_COLD_MIN_FREE_TOKENS: i64 = 500;
 /// Past this fraction of the window, any stale content goes (before compaction is needed).
 const PRUNE_PRESSURE: f64 = 0.5;
 const CONTINUE: &str = "Continue from where you left off.";
-const TRUNCATED_HINT: &str = "[note] Your last response was cut off by the output limit. Continue with smaller steps: split large writes into several edits.";
+const TRUNCATED_HINT: &str = "Your last response was cut off by the output limit. Continue with smaller steps: split large writes into several edits.";
 const INTERRUPTED: &str = "ERROR: interrupted — genji stopped while this tool was running; it may have partially run. Verify the current state before retrying.";
 
 pub struct Agent {
@@ -45,8 +45,6 @@ pub struct Agent {
     pub parent_agent: Option<String>,
     pub instance_id: String,
     pub depth: u32,
-    /// The id of the tool call being dispatched, safe for use in a file name.
-    pub call_tag: String,
     /// The id of the tool call being dispatched, as logged in the session.
     pub call_id: String,
     pub verdict: Option<Verdict>,
@@ -57,8 +55,9 @@ pub struct Agent {
     /// Why a stopped run stopped: token_limit | time_limit | max_iterations | user.
     pub reason: Option<&'static str>,
     pub llm: LlmClient,
+    skills: BTreeMap<String, Skill>,
     context: Arc<RwLock<ContextComposer>>,
-    control: Option<Arc<Control>>,
+    pub control: Arc<Control>,
     events: EventEmitter,
     tokens_used: i64,
     token_limit: i64,
@@ -80,7 +79,7 @@ pub struct AgentParams {
     pub resume: bool,
     /// Shown in `instance_start`.
     pub task: String,
-    pub control: Option<Arc<Control>>,
+    pub control: Arc<Control>,
     /// Shared with the control socket; replaced by this run's context.
     pub context: Arc<RwLock<ContextComposer>>,
 }
@@ -90,6 +89,7 @@ fn build_system(
     workspace: &Path,
     def: &AgentDef,
     agents: &BTreeMap<String, AgentDef>,
+    skills: &BTreeMap<String, Skill>,
     parent_agent: Option<&str>,
 ) -> Result<String> {
     let has = |t: &str| def.tools.iter().any(|n| n == t);
@@ -106,7 +106,6 @@ fn build_system(
     if let Some(doc) = doc.filter(|d| !d.trim().is_empty()) {
         s.push_str(&format!("\n\n## Project instructions\n{doc}"));
     }
-    let skills = config::load_skills(workspace);
     let listed: Vec<_> = skills
         .values()
         .filter(|k| !k.disable_model_invocation && !def.skills.contains(&k.name))
@@ -260,15 +259,6 @@ fn is_context_overflow(err: &str) -> bool {
     .any(|k| e.contains(k))
 }
 
-fn sanitize(id: &str) -> String {
-    let s: String = id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-        .take(40)
-        .collect();
-    if s.is_empty() { "call".into() } else { s }
-}
-
 impl Agent {
     /// Start a run, or with `resume` continue the recorded one: its system prompt,
     /// tools, model and context come from the session file so the request is the
@@ -301,7 +291,7 @@ impl Agent {
             p.cfg.llm_max_retries,
             LLM_TIMEOUT_SECS,
         );
-        let events = EventEmitter::open(&p.instance_id, &session, seq)?;
+        let events = EventEmitter::open(&p.instance_id, &session, seq)?.with_tap(p.control.clone());
         events.instance_start(
             &p.workspace.display().to_string(),
             &p.def.name,
@@ -311,11 +301,17 @@ impl Agent {
             &p.task,
             p.resume,
         );
+        let skills = config::load_skills(&p.workspace);
         let ctx = match recorded {
             Some(ctx) => ctx,
             None => {
-                let system =
-                    build_system(&p.workspace, &p.def, &p.agents, p.parent_agent.as_deref())?;
+                let system = build_system(
+                    &p.workspace,
+                    &p.def,
+                    &p.agents,
+                    &skills,
+                    p.parent_agent.as_deref(),
+                )?;
                 let tools = tools::specs(&p.def, p.parent_agent.is_some());
                 events.system(&system, &tools);
                 ContextComposer::new(system, tools, window)
@@ -330,13 +326,13 @@ impl Agent {
             parent_agent: p.parent_agent,
             instance_id: p.instance_id,
             depth: p.depth,
-            call_tag: String::new(),
             call_id: String::new(),
             verdict: None,
             handed_off: false,
             status: "done",
             reason: None,
             llm,
+            skills,
             context: p.context,
             control: p.control,
             events,
@@ -350,7 +346,6 @@ impl Agent {
             if matches!(tc.name(), "spawn" | "finish" | "hand_off" | "verdict") {
                 agent.run_call(&tc);
             } else {
-                eprintln!("[resume] {} was running when genji stopped", tc.name());
                 agent.log_result(&tc, INTERRUPTED.to_string(), true, Duration::ZERO);
             }
         }
@@ -362,19 +357,17 @@ impl Agent {
     }
 
     /// Block the current tool call on a human answer sent as `/answer <call_id> <json string>`.
-    /// A value outside `options` is free text. Without a control socket the
-    /// recommended option is used at once; after `ask_timeout_secs` too.
+    /// A value outside `options` is free text. After `ask_timeout_secs` without an
+    /// answer the recommended option is used.
     pub fn ask(&self, options: &[String], recommended: &str) -> Result<String> {
-        let Some(ctrl) = &self.control else {
-            return Ok(format!(
-                "answer: {recommended} (no human attached; recommended option used)"
-            ));
-        };
         let secs = self.cfg.ask_timeout_secs;
-        match ctrl.wait_answer(&self.call_id, Duration::from_secs(secs)) {
+        match self
+            .control
+            .wait_answer(&self.call_id, Duration::from_secs(secs))
+        {
             Some(v) if options.contains(&v) => Ok(format!("answer: {v}")),
             Some(v) => Ok(format!("answer (free text): {v}")),
-            None if ctrl.stop_requested() => {
+            None if self.control.stop_requested() => {
                 anyhow::bail!("stopped by user while waiting for an answer")
             }
             None => Ok(format!(
@@ -403,13 +396,6 @@ impl Agent {
         let ms = i64::try_from(took.as_millis()).unwrap_or(i64::MAX);
         self.events
             .tool_result(&tc.id, tc.name(), is_error, ms, &result);
-        if is_error {
-            eprintln!(
-                "[tool] {}({}) -> ERROR ({ms}ms)",
-                tc.name(),
-                llm::truncate(tc.args(), 120)
-            );
-        }
         self.context
             .write()
             .unwrap()
@@ -417,7 +403,6 @@ impl Agent {
     }
 
     fn run_call(&mut self, tc: &ToolCall) {
-        self.call_tag = sanitize(&tc.id);
         self.call_id = tc.id.clone();
         let start = Instant::now();
         let (mut result, is_error) = match serde_json::from_str::<Value>(tc.args()) {
@@ -433,9 +418,8 @@ impl Agent {
 
     /// The agent's `context:` files, then those of the skills it forces, without repeats.
     fn context_paths(&self) -> Vec<String> {
-        let skills = config::load_skills(&self.workspace);
         let mut out: Vec<String> = Vec::new();
-        let forced = self.def.skills.iter().filter_map(|n| skills.get(n));
+        let forced = self.def.skills.iter().filter_map(|n| self.skills.get(n));
         for p in self.def.context.iter().chain(forced.flat_map(|k| &k.context)) {
             if !out.contains(p) {
                 out.push(p.clone());
@@ -491,7 +475,6 @@ impl Agent {
     }
 
     fn stop(&mut self, reason: &'static str, msg: String) -> String {
-        eprintln!("[stop] {msg}");
         self.events.error(&msg);
         self.status = "stopped";
         self.reason = Some(reason);
@@ -499,6 +482,7 @@ impl Agent {
     }
 
     fn stopped_by_user(&mut self) -> String {
+        self.events.status(STOPPED_BY_USER);
         self.status = "stopped";
         self.reason = Some("user");
         STOPPED_BY_USER.to_string()
@@ -543,7 +527,6 @@ impl Agent {
             }
             let (stop, _) = self.poll_control();
             if stop {
-                self.events.status(STOPPED_BY_USER);
                 return Ok(self.stopped_by_user());
             }
             self.set_status();
@@ -551,7 +534,7 @@ impl Agent {
             self.maybe_prune(&mut pruned_at, last_call);
             if hint.is_none() && iterations + WRAP_UP_TURNS >= self.cfg.max_tool_iterations {
                 // Sent for the last few tool-call turns so the run ends with a report, not a cut-off.
-                hint = Some(format!("[note] You are about to run out of tool calls and will be cut off. Wrap up now: stop starting new work, then call {ends} with a standalone report of what is done, what remains, and where the state lives."));
+                hint = Some(format!("You are about to run out of tool calls and will be cut off. Wrap up now: stop starting new work, then call {ends} with a standalone report of what is done, what remains, and where the state lives."));
             }
             let result = {
                 let ctx = self.context.read().unwrap();
@@ -562,7 +545,7 @@ impl Agent {
                 Ok(r) => r,
                 Err(e) if !overflow_retried && is_context_overflow(&format!("{e:#}")) => {
                     overflow_retried = true;
-                    eprintln!("[llm] context overflow; compacting and retrying");
+                    self.events.error("context overflow; compacting and retrying");
                     self.maybe_compact(0.0, false)?;
                     continue;
                 }
@@ -608,7 +591,7 @@ impl Agent {
                 }
                 if !nudged && !ends.is_empty() {
                     nudged = true;
-                    hint = Some(format!("[note] End by calling {ends}."));
+                    hint = Some(format!("End by calling {ends}."));
                     continue;
                 }
                 return Ok(text);
@@ -644,27 +627,19 @@ impl Agent {
             self.tokens_used,
             self.started.elapsed().as_secs()
         );
-        if let Some(c) = &self.control {
-            c.set_status(status.clone());
-            self.events.status(&status);
-        }
+        self.control.set_status(status.clone());
+        self.events.status(&status);
     }
 
     /// Queued user instructions enter the context. Returns (stop requested, injected).
     /// A review pass leaves them queued: instructions belong to the work pass.
     fn poll_control(&mut self) -> (bool, bool) {
-        let Some(ctrl) = self.control.clone() else {
-            return (false, false);
-        };
+        let ctrl = self.control.clone();
         if self.def.worker() != self.def.name {
             return (ctrl.stop_requested(), false);
         }
         let queued = ctrl.drain();
         for ins in &queued {
-            eprintln!(
-                "[control] injecting instruction: {}",
-                llm::truncate(ins, 160)
-            );
             self.log(ChatMessage::user(format!("{}{ins}", events::INSTRUCTION)));
         }
         (ctrl.stop_requested(), !queued.is_empty())
@@ -682,18 +657,13 @@ impl Agent {
         }
         *pruned_at = len;
         let keep = self.cfg.prune_keep_recent;
-        let ctx = self.context.read().unwrap();
+        let idle = last_call.elapsed();
         // Old results stay verbatim (cache and facts intact) until the window fills.
-        let bulk = ctx.over(PRUNE_PRESSURE);
-        let gain = ctx.prune_gain(keep, bulk);
-        let go = should_prune(
-            gain,
-            ctx.est_tokens(),
-            ctx.context_window(),
-            last_call.elapsed(),
-        );
-        drop(ctx);
-        if go && self.context.write().unwrap().prune(keep, bulk) {
+        let bulk = self.context.read().unwrap().over(PRUNE_PRESSURE);
+        let pruned = self.context.write().unwrap().prune_if(keep, bulk, |freed, ctx| {
+            should_prune(freed, ctx.est_tokens(), ctx.context_window(), idle)
+        });
+        if pruned {
             self.events.prune(keep, bulk);
         }
     }
@@ -744,7 +714,6 @@ impl Agent {
             .write()
             .unwrap()
             .apply_compaction(&summary, kept);
-        eprintln!("[compact] summarized {removed} messages");
         Ok(())
     }
 }
@@ -814,6 +783,12 @@ mod tests {
     }
 
     #[test]
+    fn hints_carry_no_note_prefix_of_their_own() {
+        // `LlmClient::chat` adds the `[note]` prefix.
+        assert!(!TRUNCATED_HINT.contains("[note]"));
+    }
+
+    #[test]
     fn detects_context_overflow_errors() {
         assert!(is_context_overflow(
             "HTTP 400: {\"code\":\"context_length_exceeded\"}"
@@ -850,14 +825,15 @@ mod tests {
             ],
         );
         let agents = config::load_agents(&ws);
-        let plan = build_system(&ws, &agents["lead"], &agents, None).unwrap();
+        let skills = config::load_skills(&ws);
+        let plan = build_system(&ws, &agents["lead"], &agents, &skills, None).unwrap();
         assert!(
             plan.contains("## Environment")
                 && plan.contains("## Agents")
                 && plan.contains("- scout — scouts")
                 && !plan.contains("- worker — works")
         );
-        let worker = build_system(&ws, &agents["worker"], &agents, None).unwrap();
+        let worker = build_system(&ws, &agents["worker"], &agents, &skills, None).unwrap();
         assert!(!worker.contains("## Agents"), "no spawn tool, no agent list");
         assert!(
             plan.contains("## Skills")
@@ -866,19 +842,13 @@ mod tests {
                 && !plan.contains("# Skill: formal")
         );
         assert!(!plan.contains("## Reporting"));
-        let sub = build_system(&ws, &agents["scout"], &agents, Some("lead")).unwrap();
+        let sub = build_system(&ws, &agents["scout"], &agents, &skills, Some("lead")).unwrap();
         assert!(sub.contains("## Reporting") && sub.contains("`next.agent` = `lead`"));
         let mut forced = agents["worker"].clone();
         forced.skills = vec!["formal".into()];
-        let text = build_system(&ws, &forced, &agents, None).unwrap();
+        let text = build_system(&ws, &forced, &agents, &skills, None).unwrap();
         assert!(text.contains("# Skill: formal") && !text.contains("- formal — "));
         forced.skills = vec!["nope".into()];
-        assert!(build_system(&ws, &forced, &agents, None).is_err());
-    }
-
-    #[test]
-    fn call_tags_are_file_safe() {
-        assert_eq!(sanitize("call_abc/../1"), "call_abc1");
-        assert_eq!(sanitize("///"), "call");
+        assert!(build_system(&ws, &forced, &agents, &skills, None).is_err());
     }
 }

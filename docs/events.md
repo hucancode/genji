@@ -1,24 +1,36 @@
 # Trace events
 
-genji exposes the same structured run events through two machine-facing
-outputs:
+genji talks to **machines** over stdin and stdout, and to **humans** over the
+[control socket](control-socket.md). stderr is for real errors only.
 
-- **Session file** `.genji/sessions/<id>.jsonl` is the complete, durable, append-only JSONL log.
-- **stdout** mirrors the JSONL stream for process-based integrations.
-
-**stderr** is cosmetic human output: startup banners, tool progress, retries,
-budget/timeout notices, warnings, and a final `[report] …` line. A machine
-frontend must not depend on stderr.
-
-Nothing structured ever goes to stderr and nothing unstructured ever goes to
-stdout, so a UI (or another agent) can parse stdout line by line with no
-filtering.
+- **stdout** is the JSONL event stream, one event per line. Nothing else goes to stdout
+  during a run, so a UI (or another agent) can parse it line by line with no filtering.
+- **Session file** `.genji/sessions/<id>.jsonl` holds the same events, durably and append-only.
+- **stdin** takes JSONL commands (below).
+- **stderr** carries errors: a failed run, rejected LLM requests and their retries, a bad
+  agent or skill definition, a bad stdin line. It never carries progress or reports.
 
 ```bash
-genji build "add a flag" 2>/tmp/genji.log
+genji build "add a flag" > run.jsonl 2> errors.log
 ```
 
-The final report is delivered in the `instance_end`. A human still sees it summarised on stderr.
+The final report is delivered in `instance_end`. `instance_start` carries the
+`control_socket` path.
+
+## Commands on stdin
+
+When stdin is not a terminal, genji reads one JSON object per line and applies it to the
+running agent. A bad line is reported on stderr and skipped; end of input changes nothing.
+A subagent's stdin is closed, so it takes commands over its socket only.
+
+```json
+{"type":"instruction","text":"focus on the parser first"}
+{"type":"answer","id":"call_abc","text":"Postgres"}
+{"type":"stop"}
+```
+
+`answer` replies to a pending `ask` call; take `id` from that call's `tool_call` event.
+These are the same actions as the socket's plain-text commands.
 
 ## Events
 
@@ -82,48 +94,7 @@ into the parent's stdout; the child's own session file holds them.
 {"type":"instance_end","seq":8,"instance":"18d9ab","status":"done","reason":null,"tokens_used":40,"report":"s","result":{"status":"handoff","summary":"s","next":{"agent":"plan","task":"README is empty"}}}
 ```
 
-## Instance-management commands
-
-`genji list`, `stop`, and `instruct` follow the same rule: stdout is machine
-JSON (no redundant `type`/`action` wrapper), the human-readable view goes to
-stderr.
-
-```bash
-genji list
-# stdout: [{"id":"…","root":true,"pid":1234,"status":"idle"},…]
-# stderr: the usual ID/ROOT/PID/UPTIME/WORKSPACE table (`*` = root/control owner)
-
-genji stop <id>
-# stdout: [{"id":"…","ok":true,"message":"stopping"}]
-
-genji instruct <id> "focus on the parser"
-# stdout: {"id":"…","message":"queued (1 pending)"}
-```
-
-### `genji inspect <id>` — a brief summary
-
-`<id>` is an instance id (or unique prefix), live or finished. `inspect` reads
-the instance's session file and prints a single JSON object
-to stdout and a short human summary to stderr: id, agent, model, parent, depth,
-task, status, tokens used, message count, start/end times and report. For a live
-instance (found via `genji list`, which also supplies its workspace) it adds pid,
-uptime, control socket and live status. For a finished instance, run it from the
-instance's workspace or pass `--workspace`.
-
-```bash
-genji inspect 7ab121
-# stdout: {"id":"7ab121",…,"status":"done","reason":null,"tokens_used":40,"messages":12}
-# stderr:
-# id            7ab121
-# agent         build
-# status        done
-# …
-```
-
-Errors (unknown ids, unreachable sockets, missing arguments) go to stderr with a
-non-zero exit code.
-
-### Following the stream
+## Following the stream
 
 The stream is the process's stdout. Redirect it to a file to keep it, and tail
 that file to follow a run:

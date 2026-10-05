@@ -8,23 +8,23 @@ mod tools;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use agent::{Agent, AgentParams};
 use config::{AgentDef, Config, dot};
 use storage::context::ContextComposer;
-use storage::{events, registry};
-
-const COMMANDS: [&str; 5] = ["init", "list", "stop", "instruct", "inspect"];
+use storage::events;
 
 const USAGE: &str = "usage:
   genji <agent> [task] [--resume ID] [--parent ID] [--workspace DIR] [--provider P] [--label L]
-                [--socket PATH] [--sessions-dir DIR] [--token-limit N]
+                [--socket PATH | --socket-disabled] [--sessions-dir DIR] [--token-limit N]
                 [--config FILE] [--config-json JSON] [--agents-dir DIR]
   genji init [agent...] [--force] [--workspace DIR]
-  genji list | stop <id...|all> | instruct <id> <text...> | inspect <id>
-  genji help [agent|tool] [--json] | --version";
+  genji help [agent|tool] [--json] | --version
+
+control (while running): nc -U .genji/control.sock, then /help; or JSON lines on stdin";
 
 #[derive(Default)]
 struct Opts {
@@ -41,14 +41,12 @@ struct Opts {
     config: Option<String>,
     agents_dir: Option<String>,
     socket: Option<String>,
+    socket_disabled: bool,
     sessions_dir: Option<String>,
     token_limit: Option<i64>,
     depth: u32,
     json: bool,
     subagent: bool,
-    no_control: bool,
-    quiet: bool,
-    yes: bool,
     force: bool,
     help: bool,
     version: bool,
@@ -81,16 +79,14 @@ fn parse(args: Vec<String>) -> Result<Opts> {
             "--config" => o.config = Some(value()?),
             "--agents-dir" => o.agents_dir = Some(value()?),
             "--socket" => o.socket = Some(value()?),
+            "--socket-disabled" => o.socket_disabled = true,
             "--sessions-dir" => o.sessions_dir = Some(value()?),
             "--token-limit" => {
                 o.token_limit = Some(value()?.parse().context("--token-limit needs a number")?)
             }
             "--depth" => o.depth = value()?.parse().context("--depth needs a number")?,
             "--subagent" => o.subagent = true,
-            "--no-control" => o.no_control = true,
-            "--quiet-startup" => o.quiet = true,
             "--json" => o.json = true,
-            "--yes" | "-y" => o.yes = true,
             "--force" => o.force = true,
             "--help" | "-h" => o.help = true,
             "--version" | "-V" => o.version = true,
@@ -126,16 +122,6 @@ fn absolute(p: &str) -> Result<PathBuf> {
     })
 }
 
-/// `--sessions-dir`, made absolute so spawned children agree on it.
-fn sessions_dir(o: &Opts) -> Result<Option<PathBuf>> {
-    o.sessions_dir.as_deref().map(absolute).transpose()
-}
-
-/// Session directory for commands that read sessions without loading the config.
-fn sessions_for(o: &Opts, ws: &Path) -> Result<PathBuf> {
-    Ok(sessions_dir(o)?.unwrap_or_else(|| dot(ws, "sessions")))
-}
-
 /// `genji help agent|tool [--json]`: loaded agents or the tool registry.
 fn cmd_help(o: &Opts, topic: Option<&str>) -> Result<i32> {
     let agents = load_agents(o)?;
@@ -154,14 +140,14 @@ fn cmd_help(o: &Opts, topic: Option<&str>) -> Result<i32> {
         Some("tool") if o.json => println!("{}", serde_json::to_string(&tools::list())?),
         Some("tool") => {
             for t in tools::list() {
-                eprintln!(
+                println!(
                     "  {:<11} {}",
                     t["name"].as_str().unwrap_or_default(),
                     t["description"].as_str().unwrap_or_default()
                 );
             }
         }
-        None | Some("agent") => print_usage(&agents),
+        None | Some("agent") => println!("{}", usage(&agents)),
         Some(t) => {
             eprintln!("unknown help topic `{t}` (agent, tool)");
             return Ok(2);
@@ -170,14 +156,15 @@ fn cmd_help(o: &Opts, topic: Option<&str>) -> Result<i32> {
     Ok(0)
 }
 
-fn print_usage(agents: &BTreeMap<String, AgentDef>) {
-    eprintln!("{USAGE}\n\nagents:");
+fn usage(agents: &BTreeMap<String, AgentDef>) -> String {
+    let mut out = format!("{USAGE}\n\nagents:");
     if agents.is_empty() {
-        eprintln!("  (none; `genji init` writes the default agents to .genji/agents)");
+        out.push_str("\n  (none; `genji init` writes the default agents to .genji/agents)");
     }
     for a in agents.values().filter(|a| !a.internal) {
-        eprintln!("  {:<10} {}", a.name, a.description);
+        out.push_str(&format!("\n  {:<10} {}", a.name, a.description));
     }
+    out
 }
 
 fn exit_code(status: &str) -> i32 {
@@ -204,54 +191,24 @@ fn read_task(file: Option<&str>, words: &[String]) -> Result<Option<String>> {
     Ok((!task.trim().is_empty()).then_some(task))
 }
 
-/// Keeps the control socket and registry entry alive; removes both on drop.
+/// Keeps the control socket alive; removes it on drop.
 struct Guard {
-    instance: registry::Instance,
     control: Arc<socket::Control>,
-}
-
-impl Guard {
-    /// Point the registry entry at the instance now running, so `genji list` shows it.
-    fn rebind(&mut self, id: &str) {
-        registry::remove(&self.instance.id);
-        self.instance.id = id.to_string();
-        if let Err(e) = self.instance.save() {
-            eprintln!("[registry] warning: could not register instance: {e:#}");
-        }
-    }
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
         self.control.shutdown();
-        registry::remove(&self.instance.id);
     }
 }
 
-fn start_control(
-    workspace: &Path,
-    socket_path: PathBuf,
-    context: Arc<RwLock<ContextComposer>>,
-    id: &str,
-    label: &str,
-    quiet: bool,
-) -> Result<Guard> {
-    let control = socket::Control::start(socket_path, context)?;
-    if !quiet {
-        eprintln!("[control] listening on {}", control.path.display());
+fn start_control(socket_path: Option<PathBuf>, context: Arc<RwLock<ContextComposer>>) -> Result<Guard> {
+    let control = socket::Control::open(socket_path, context)?;
+    // Machines drive a run through stdin; a terminal is for the socket.
+    if !std::io::stdin().is_terminal() {
+        control.read_commands(std::io::BufReader::new(std::io::stdin()));
     }
-    let instance = registry::Instance {
-        id: id.to_string(),
-        pid: std::process::id(),
-        workspace: workspace.display().to_string(),
-        control_socket: control.path.display().to_string(),
-        label: label.to_string(),
-        started_at: storage::util::unix_secs(),
-    };
-    if let Err(e) = instance.save() {
-        eprintln!("[registry] warning: could not register instance: {e:#}");
-    }
-    Ok(Guard { instance, control })
+    Ok(Guard { control })
 }
 
 fn run_agent(o: Opts) -> Result<i32> {
@@ -260,11 +217,11 @@ fn run_agent(o: Opts) -> Result<i32> {
         Some(j) => Config::from_json(j)?,
         None => Config::load_or_create(&ws, o.config.as_deref().map(absolute).transpose()?.as_deref())?,
     };
-    if o.sessions_dir.is_some() {
-        cfg.sessions_dir = sessions_dir(&o)?;
+    if let Some(d) = &o.sessions_dir {
+        cfg.sessions_dir = Some(absolute(d)?);
     }
-    if o.agents_dir.is_some() {
-        cfg.agents_dir = o.agents_dir.as_deref().map(absolute).transpose()?;
+    if let Some(d) = &o.agents_dir {
+        cfg.agents_dir = Some(absolute(d)?);
     }
     if let Some(d) = &cfg.skills_dir {
         config::set_skills_dir(d.clone());
@@ -275,19 +232,12 @@ fn run_agent(o: Opts) -> Result<i32> {
     if cfg.agents_dir.is_none() {
         config::ensure_agents(&ws)?;
     }
-    let agents = match &cfg.agents_dir {
-        Some(d) => config::load_agents_from(d),
-        None => load_agents(&o)?,
-    };
+    let agents = config::load_agents_from(&cfg.agents(&ws));
     let sessions = cfg.sessions(&ws);
-    let quiet = o.quiet || o.subagent;
     let mut resume = None;
     if let Some(prefix) = &o.resume {
         let s = events::summary(&events::find_session(&sessions, prefix)?)?;
         let id = s["id"].as_str().unwrap_or_default().to_string();
-        if registry::find(&id).is_ok() {
-            bail!("instance {id} is still running; stop it before resuming");
-        }
         let parent = s["parent"].as_str().map(String::from);
         resume = Some((id, s["agent"].as_str().unwrap_or_default().to_string(), parent));
     }
@@ -295,7 +245,7 @@ fn run_agent(o: Opts) -> Result<i32> {
         (Some(n), _) => n.clone(),
         (None, Some((_, a, _))) => a.clone(),
         (None, None) => {
-            print_usage(&agents);
+            eprintln!("{}", usage(&agents));
             return Ok(2);
         }
     };
@@ -306,8 +256,7 @@ fn run_agent(o: Opts) -> Result<i32> {
             .and_then(AgentDef::reviewer)
     });
     let Some(mut def) = found else {
-        eprintln!("unknown agent or command `{name}`\n");
-        print_usage(&agents);
+        eprintln!("unknown agent or command `{name}`\n\n{}", usage(&agents));
         return Ok(2);
     };
     if let Some(p) = o
@@ -324,57 +273,36 @@ fn run_agent(o: Opts) -> Result<i32> {
     let first_id = match (&resume, &o.instance_id) {
         (Some((id, ..)), _) => id.clone(),
         (None, Some(id)) => id.clone(),
-        (None, None) => registry::new_id(),
+        (None, None) => storage::util::new_id(),
     };
-    if !quiet {
-        eprintln!(
-            "[genji] agent={name} provider={} base_url={} instance={first_id}",
-            cfg.provider, provider.base_url
-        );
-    }
     let model = def.model.clone().unwrap_or_else(|| provider.model.clone());
-    let (window, source) = effective_window(
+    let window = effective_window(
         cfg.preferred_context_size,
         provider.context_window,
         llm::model_context_window(&provider, &model),
     );
     provider.context_window = window;
-    if !quiet {
-        eprintln!("[genji] context_window={window} ({source})");
-    }
-    // Top-level runs open a control socket and register, so list/stop/instruct/inspect find them.
+    // Every run listens on a control socket for humans (unless disabled) and reads commands
+    // from stdin for machines.
     let context = Arc::new(RwLock::new(ContextComposer::new(
         String::new(),
         Vec::new(),
         provider.context_window,
     )));
-    let mut guard = if o.no_control || !cfg.control_enabled {
-        None
-    } else {
-        let socket_path = match &o.socket {
-            Some(p) => absolute(p)?,
-            None => dot(&ws, "control.sock"),
-        };
-        Some(start_control(
-            &ws,
-            socket_path,
-            context.clone(),
-            &first_id,
-            &o.label,
-            quiet,
-        )?)
-    };
-    if task.is_none() && (resume.is_none() || guard.is_some()) {
-        let Some(g) = &guard else {
-            eprintln!("[genji] no task given and no control socket to wait on");
-            return Ok(2);
-        };
-        g.control.set_status("idle");
-        eprintln!(
-            "[genji] no task given; waiting on {} (genji instruct {first_id} \"<task>\")",
-            g.control.path.display()
-        );
-        match g.control.wait_for_instruction() {
+    if o.socket.is_some() && !cfg!(feature = "socket") {
+        bail!("--socket needs a genji built with the `socket` feature");
+    }
+    let socket_path = (cfg!(feature = "socket") && !o.socket_disabled)
+        .then(|| match &o.socket {
+            Some(p) => absolute(p),
+            None => Ok(dot(&ws, "control.sock")),
+        })
+        .transpose()?;
+    let guard = start_control(socket_path, context.clone())?;
+    // A resumed subagent continues where it stopped; anything else without a task waits for one.
+    if task.is_none() && !(o.subagent && resume.is_some()) {
+        guard.control.set_status("idle");
+        match guard.control.wait_for_instruction() {
             Some(queued) => task = Some(queued.join("\n")),
             None => return Ok(0),
         }
@@ -398,11 +326,10 @@ fn run_agent(o: Opts) -> Result<i32> {
             depth: o.depth,
             resume: resuming,
             task: task.clone().unwrap_or_default(),
-            control: guard.as_ref().map(|g| g.control.clone()),
+            control: guard.control.clone(),
             context: context.clone(),
         })?;
-        let report = a.run(task.as_deref())?;
-        eprintln!("[report] {report}");
+        a.run(task.as_deref())?;
         // Two passes: a top-level work pass that submits or runs out of tool iterations is
         // judged by a review pass with a fresh context.
         let submitted = a.verdict.as_ref().is_some_and(|v| v.status == "done")
@@ -416,7 +343,7 @@ fn run_agent(o: Opts) -> Result<i32> {
             id = format!("{id}-review-{n}");
             def = reviewer;
             resuming = false;
-        } else if let Some(back) = back_to_work(&a, guard.as_ref().map(|g| &*g.control)) {
+        } else if let Some(back) = back_to_work(&a, &guard.control) {
             // The work instance continues in its own context: its id is the review's parent.
             id = parent.clone().unwrap_or_default();
             let s = events::summary(&sessions.join(format!("{id}.jsonl")))?;
@@ -429,21 +356,10 @@ fn run_agent(o: Opts) -> Result<i32> {
                 return Ok(exit_code(a.status));
             };
             parent = Some(id.clone());
-            id = registry::new_id();
+            id = storage::util::new_id();
             def = agents[&next.agent].clone();
             task = Some(next.task);
             resuming = false;
-        }
-        if let Some(g) = &mut guard {
-            g.rebind(&id);
-        }
-        if !quiet {
-            let tag = if def.worker() != def.name || resuming {
-                "pass"
-            } else {
-                "hand_off"
-            };
-            eprintln!("[{tag}] {} -> {} (instance {id})", a.def.name, def.name);
         }
     }
 }
@@ -451,13 +367,13 @@ fn run_agent(o: Opts) -> Result<i32> {
 /// After a review pass, whether its work instance continues, and with what message:
 /// the findings of a `reject`, or none for a `done` while user instructions wait (the work
 /// pass drains them itself).
-fn back_to_work(a: &Agent, control: Option<&socket::Control>) -> Option<Option<String>> {
+fn back_to_work(a: &Agent, control: &socket::Control) -> Option<Option<String>> {
     if a.def.worker() == a.def.name {
         return None;
     }
     match a.verdict.as_ref()? {
         v if v.status == "reject" => Some(Some(format!("{}{}", events::REJECTED, v.summary))),
-        v if v.status == "done" && control.is_some_and(|c| c.pending()) => Some(None),
+        v if v.status == "done" && control.pending() => Some(None),
         _ => None,
     }
 }
@@ -489,149 +405,13 @@ fn next_instance(a: &Agent, task: Option<&str>) -> Option<tools::Next> {
 }
 
 /// The smallest non-zero of the project's preferred size, the provider's window and the
-/// server-reported model window, with where it came from.
-fn effective_window(project: i64, provider: i64, model: Option<i64>) -> (i64, &'static str) {
-    [
-        (project, "preferred_context_size"),
-        (provider, "provider"),
-        (model.unwrap_or(0), "model"),
-    ]
-    .into_iter()
-    .filter(|(n, _)| *n > 0)
-    .min_by_key(|(n, _)| *n)
-    .unwrap_or((provider, "provider"))
-}
-
-fn format_uptime(secs: u64) -> String {
-    match secs {
-        0..60 => format!("{secs}s"),
-        60..3600 => format!("{}m{}s", secs / 60, secs % 60),
-        _ => format!("{}h{}m", secs / 3600, (secs % 3600) / 60),
-    }
-}
-
-/// Running instances with their live status: JSON on stdout, a table on stderr.
-fn cmd_list() -> Result<()> {
-    let rows = registry::list_live();
-    let arr: Vec<Value> = rows
-        .iter()
-        .map(|(i, status)| {
-            json!({ "id": i.id, "pid": i.pid, "uptime_secs": i.uptime_secs(), "workspace": i.workspace,
-                    "label": i.label, "control_socket": i.control_socket, "status": status })
-        })
-        .collect();
-    println!("{}", serde_json::to_string(&arr)?);
-    if rows.is_empty() {
-        eprintln!("no running genji instances");
-    }
-    for (i, status) in &rows {
-        eprintln!(
-            "{:<8} {:<7} {:<8} {:<38} {status}",
-            i.id,
-            i.pid,
-            format_uptime(i.uptime_secs()),
-            i.workspace
-        );
-    }
-    Ok(())
-}
-
-fn cmd_stop(ids: &[String]) -> Result<i32> {
-    let targets: Vec<&str> = ids
-        .iter()
-        .flat_map(|s| s.split(','))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if targets.is_empty() {
-        eprintln!("`genji stop` needs one or more instance ids, or `all`");
-        return Ok(2);
-    }
-    let mut failed = false;
-    let instances: Vec<registry::Instance> = if targets.contains(&"all") {
-        registry::list_live().into_iter().map(|(i, _)| i).collect()
-    } else {
-        targets
-            .iter()
-            .filter_map(|id| {
-                registry::find(id)
-                    .inspect_err(|e| {
-                        eprintln!("{e:#}");
-                        failed = true;
-                    })
-                    .ok()
-            })
-            .collect()
-    };
-    let mut results = Vec::new();
-    for i in &instances {
-        let r = socket::send(Path::new(&i.control_socket), "/stop");
-        failed |= r.is_err();
-        let message = r.unwrap_or_else(|e| format!("{e:#}"));
-        eprintln!("stop {} (pid {}): {message}", i.id, i.pid);
-        results.push(json!({ "id": i.id, "pid": i.pid, "message": message }));
-    }
-    println!("{}", serde_json::to_string(&results)?);
-    Ok(i32::from(failed))
-}
-
-fn cmd_instruct(id: &str, text: &str) -> Result<()> {
-    if text.trim().is_empty() {
-        bail!("missing instruction (usage: genji instruct <id> <text...>)");
-    }
-    let inst = registry::find(id)?;
-    let reply = socket::send(Path::new(&inst.control_socket), text)?;
-    // Structured replies (e.g. `/context`) are passed through unchanged.
-    if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(&reply) {
-        println!("{}", serde_json::to_string_pretty(&v)?);
-        return Ok(());
-    }
-    let message = reply.strip_prefix("status:").unwrap_or(&reply).trim();
-    println!(
-        "{}",
-        serde_json::to_string(&json!({ "id": inst.id, "message": message }))?
-    );
-    eprintln!("{message}");
-    Ok(())
-}
-
-/// Recorded summary of an instance from its session file, plus live details when it is running.
-fn cmd_inspect(id: &str, o: &Opts) -> Result<()> {
-    let live = registry::find(id).ok();
-    let ws = match &live {
-        Some(i) => PathBuf::from(&i.workspace),
-        None => workspace(o)?,
-    };
-    let mut obj = events::summary(&events::find_session(&sessions_for(o, &ws)?, id)?)?;
-    if let (Some(map), Some(i)) = (obj.as_object_mut(), &live) {
-        map.insert("pid".into(), json!(i.pid));
-        map.insert("label".into(), json!(i.label));
-        map.insert("control_socket".into(), json!(i.control_socket));
-        map.insert("uptime_secs".into(), json!(i.uptime_secs()));
-        map.insert("live_status".into(), json!(i.status()));
-    }
-    println!("{}", serde_json::to_string(&obj)?);
-    for key in [
-        "id",
-        "agent",
-        "model",
-        "parent",
-        "depth",
-        "task",
-        "status",
-        "live_status",
-        "tokens_used",
-        "messages",
-        "pid",
-    ] {
-        if let Some(v) = obj.get(key).filter(|v| !v.is_null()) {
-            eprintln!(
-                "{key:<14}{}",
-                v.as_str().map_or_else(|| v.to_string(), String::from)
-            );
-        }
-    }
-    Ok(())
+/// server-reported model window.
+fn effective_window(project: i64, provider: i64, model: Option<i64>) -> i64 {
+    [project, provider, model.unwrap_or(0)]
+        .into_iter()
+        .filter(|n| *n > 0)
+        .min()
+        .unwrap_or(provider)
 }
 
 /// `genji init [agent...] [--force]`: writes the default agent files; prints
@@ -653,24 +433,11 @@ fn real_main() -> Result<i32> {
         return cmd_help(&o, o.positional.get(1).map(String::as_str));
     }
     if o.help {
-        print_usage(&load_agents(&o)?);
+        println!("{}", usage(&load_agents(&o)?));
         return Ok(0);
     }
-    let rest = o.positional.get(1..).unwrap_or_default();
     match first {
-        Some(c) if COMMANDS.contains(&c) => match c {
-            "init" => cmd_init(&o, rest).map(|()| 0),
-            "list" => cmd_list().map(|()| 0),
-            "stop" => cmd_stop(rest),
-            "instruct" => match rest {
-                [id, text @ ..] => cmd_instruct(id, &text.join(" ")).map(|()| 0),
-                [] => bail!("usage: genji instruct <id> <text...>"),
-            },
-            _ => match rest {
-                [id] => cmd_inspect(id, &o).map(|()| 0),
-                _ => bail!("usage: genji inspect <id>"),
-            },
-        },
+        Some("init") => cmd_init(&o, &o.positional[1..]).map(|()| 0),
         _ => run_agent(o),
     }
 }
@@ -691,10 +458,10 @@ mod tests {
 
     #[test]
     fn effective_window_is_the_smallest_known_size() {
-        assert_eq!(effective_window(0, 32_768, None), (32_768, "provider"));
-        assert_eq!(effective_window(0, 200_000, Some(128_000)), (128_000, "model"));
-        assert_eq!(effective_window(64_000, 200_000, Some(128_000)), (64_000, "preferred_context_size"));
-        assert_eq!(effective_window(0, 0, Some(0)), (0, "provider"));
+        assert_eq!(effective_window(0, 32_768, None), 32_768);
+        assert_eq!(effective_window(0, 200_000, Some(128_000)), 128_000);
+        assert_eq!(effective_window(64_000, 200_000, Some(128_000)), 64_000);
+        assert_eq!(effective_window(0, 0, Some(0)), 0);
     }
 
     fn p(args: &[&str]) -> Opts {
@@ -710,12 +477,11 @@ mod tests {
             "--workspace",
             "/w",
             "--resume=ab",
-            "-y",
         ]);
         assert_eq!(o.positional, ["build", "fix", "the bug"]);
         assert_eq!(
-            (o.workspace.as_deref(), o.resume.as_deref(), o.yes),
-            (Some("/w"), Some("ab"), true)
+            (o.workspace.as_deref(), o.resume.as_deref()),
+            (Some("/w"), Some("ab"))
         );
         let o = p(&[
             "build",
@@ -742,6 +508,5 @@ mod tests {
             (exit_code("done"), exit_code("failed"), exit_code("stopped")),
             (0, 1, 2)
         );
-        assert_eq!(format_uptime(75), "1m15s");
     }
 }

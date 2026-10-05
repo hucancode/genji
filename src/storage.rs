@@ -62,6 +62,7 @@ pub mod context {
             self.est_tokens() >= (self.context_window as f64 * fraction) as i64
         }
 
+        #[cfg(feature = "socket")]
         pub fn snapshot(&self) -> Value {
             json!({
                 "context_window": self.context_window,
@@ -81,13 +82,20 @@ pub mod context {
             changed
         }
 
-        /// Estimated tokens `prune(keep, bulk)` would free, without changing anything.
-        pub fn prune_gain(&self, keep: usize, bulk: bool) -> i64 {
-            let mut copy = self.messages.clone();
-            if !prune_messages(&mut copy, keep, bulk) {
-                return 0;
+        /// Like `prune`, but applied only when `worth(freed_tokens, self)` agrees; the prune is
+        /// computed once, on a copy that replaces the messages if it is worth it.
+        pub fn prune_if(&mut self, keep: usize, bulk: bool, worth: impl FnOnce(i64, &Self) -> bool) -> bool {
+            let mut pruned = self.messages.clone();
+            if !prune_messages(&mut pruned, keep, bulk) {
+                return false;
             }
-            llm::estimate_messages(&self.messages) - llm::estimate_messages(&copy)
+            let freed = llm::estimate_messages(&self.messages) - llm::estimate_messages(&pruned);
+            if !worth(freed, self) {
+                return false;
+            }
+            self.messages = pruned;
+            self.last_prompt_tokens = 0;
+            true
         }
 
         /// The content of the tool result answering call `id`, if it is still in context.
@@ -258,17 +266,20 @@ pub mod context {
         }
 
         #[test]
-        fn prune_gain_previews_without_changing() {
+        fn prune_if_applies_only_when_worth_it() {
             let mut c = ContextComposer::new("sys".into(), vec![], 100);
             c.push(ChatMessage::tool_result("1", "x".repeat(5000)));
             c.push(ChatMessage::user("mid"));
             c.push(ChatMessage::tool_result("2", "y".repeat(5000)));
             let before = c.messages()[1].content.len();
-            let gain = c.prune_gain(2, true);
-            assert!(gain > 1000);
+            assert!(!c.prune_if(2, true, |freed, _| {
+                assert!(freed > 1000);
+                false
+            }));
             assert_eq!(c.messages()[1].content.len(), before);
-            assert!(c.prune(2, true));
-            assert_eq!(c.prune_gain(2, true), 0);
+            assert!(c.prune_if(2, true, |_, _| true));
+            assert!(c.messages()[1].content.len() < before);
+            assert!(!c.prune_if(2, true, |_, _| panic!("nothing left to free")));
         }
 
         #[test]
@@ -367,10 +378,11 @@ pub mod events {
     use std::fs::File;
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::context::ContextComposer;
     use crate::llm::{ChatMessage, Role, ToolCall};
+    use crate::socket::Control;
 
     struct Sink {
         seq: u64,
@@ -381,6 +393,8 @@ pub mod events {
     pub struct EventEmitter {
         instance: String,
         out: Mutex<Sink>,
+        /// Control socket whose watchers get each event rendered as text.
+        tap: Option<Arc<Control>>,
     }
 
     impl EventEmitter {
@@ -416,7 +430,14 @@ pub mod events {
             Self {
                 instance: instance.to_string(),
                 out: Mutex::new(Sink { seq, stdout, file }),
+                tap: None,
             }
+        }
+
+        /// Also show every event to the watchers of `control`.
+        pub fn with_tap(mut self, control: Arc<Control>) -> Self {
+            self.tap = Some(control);
+            self
         }
 
         fn write(&self, mut event: Value, to_stdout: bool) {
@@ -434,6 +455,12 @@ pub mod events {
             if to_stdout {
                 let _ = writeln!(s.stdout, "{line}");
                 let _ = s.stdout.flush();
+            }
+            #[cfg(feature = "socket")]
+            if let Some(t) = &self.tap
+                && let Some(text) = render(&event)
+            {
+                t.publish(&text);
             }
         }
 
@@ -456,6 +483,7 @@ pub mod events {
                 "type": "instance_start", "resumed": resumed, "workspace": workspace,
                 "agent": agent, "model": model, "parent": parent, "depth": depth,
                 "task": task, "pid": std::process::id(),
+                "control_socket": self.tap.as_ref().and_then(|c| c.path.as_ref()).map(|p| p.display().to_string()),
             }));
         }
 
@@ -537,16 +565,68 @@ pub mod events {
         }
     }
 
+    #[cfg(feature = "socket")]
+    /// An event as a short human-readable block for `/watch`; `None` for events a person
+    /// has no use for (token counts, status ticks, the system prompt).
+    pub fn render(e: &Value) -> Option<String> {
+        let s = |k: &str| e[k].as_str().unwrap_or_default();
+        let clip = |t: &str, n: usize| crate::llm::truncate(t.trim(), n).replace('\n', " ");
+        Some(match e["type"].as_str()? {
+            "instance_start" => format!("== {} started ({}): {}", s("agent"), s("model"), clip(s("task"), 200)),
+            "instance_end" => match e["reason"].as_str() {
+                Some(r) => format!("== ended: {} ({r})", s("status")),
+                None => format!("== ended: {}", s("status")),
+            },
+            "user" => format!("> {}", s("content").trim()),
+            "assistant" => {
+                let text = s("content").trim();
+                if text.is_empty() {
+                    return None;
+                }
+                text.to_string()
+            }
+            "tool_call" if e["name"] == "ask" => {
+                let a = &e["arguments"];
+                let options: Vec<&str> = a["options"]
+                    .as_array()
+                    .map(|o| o.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                format!(
+                    "? {}\n  options: {}\n  recommended: {}\n  reply with: /answer {} <text>",
+                    a["question"].as_str().unwrap_or_default(),
+                    options.join(" | "),
+                    a["recommended"].as_str().unwrap_or_default(),
+                    s("id")
+                )
+            }
+            "tool_call" => {
+                let args = match e.get("arguments") {
+                    Some(a) => a.to_string(),
+                    None => s("raw_arguments").to_string(),
+                };
+                format!("-> {}({})", s("name"), clip(&args, 120))
+            }
+            "tool_result" => {
+                let size = s("result").len();
+                if e["is_error"] == true {
+                    format!("<- {} ERROR: {}", s("name"), clip(s("result"), 160))
+                } else {
+                    format!("<- {} ok {}ms ({size} bytes)", s("name"), e["duration_ms"])
+                }
+            }
+            "compaction" => format!("~ summarized {} messages", e["removed"]),
+            "prune" => "~ pruned old output".to_string(),
+            "error" => format!("! {}", s("message")),
+            _ => return None,
+        })
+    }
+
     /// A session folded back into the state the run had when it stopped.
     pub struct Replayed {
-        pub id: String,
-        pub agent: String,
         pub model: String,
         pub ctx: ContextComposer,
         pub seq: u64,
         pub tokens_used: i64,
-        /// The run ended (an `instance_end` is the last lifecycle event).
-        pub ended: bool,
         /// Calls of the last assistant turn that have no result.
         pub pending: Vec<ToolCall>,
     }
@@ -569,34 +649,38 @@ pub mod events {
             .collect()
     }
 
+    /// The JSON events of `text` (one per line); unparseable lines (a write cut off by a
+    /// crash) are dropped.
+    pub fn parse_lines(text: &str) -> Vec<Value> {
+        text.lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// The events recorded in a session file.
+    pub fn read(path: &Path) -> Result<Vec<Value>> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Ok(parse_lines(&text))
+    }
+
     /// Fold the log through the same context operations the run applied.
     /// Unparseable lines (a write cut off by a crash) are dropped.
     pub fn replay(path: &Path, context_window: i64) -> Result<Replayed> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut ctx: Option<ContextComposer> = None;
         let mut r = Replayed {
-            id: String::new(),
-            agent: String::new(),
             model: String::new(),
             ctx: ContextComposer::new(String::new(), vec![], context_window),
             seq: 0,
             tokens_used: 0,
-            ended: false,
             pending: Vec::new(),
         };
         let text_of = |e: &Value, k: &str| e[k].as_str().unwrap_or_default().to_string();
-        for e in text
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        {
+        for e in read(path)? {
             r.seq = r.seq.max(e["seq"].as_u64().unwrap_or(0));
             match (e["type"].as_str().unwrap_or_default(), ctx.as_mut()) {
                 ("instance_start", _) => {
-                    r.id = text_of(&e, "instance");
-                    r.agent = text_of(&e, "agent");
                     r.model = text_of(&e, "model");
-                    r.ended = false;
                 }
                 ("system", c) => {
                     let tools = e["tools"].as_array().cloned().unwrap_or_default();
@@ -640,7 +724,6 @@ pub mod events {
                     r.tokens_used = r.tokens_used.max(e["used"].as_i64().unwrap_or(0));
                     c.set_last_prompt_tokens(e["prompt"].as_i64().unwrap_or(0));
                 }
-                ("instance_end", _) => r.ended = true,
                 _ => {}
             }
         }
@@ -661,18 +744,15 @@ pub mod events {
     /// resumes lose nothing: the request, the user's instructions, the `ask` decisions,
     /// earlier review findings, and the work pass's last report.
     pub fn review_input(path: &Path) -> Result<String> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let events: Vec<Value> = text
-            .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
+        let events = read(path)?;
         let str_of = |e: &Value, k: &str| e[k].as_str().unwrap_or_default().to_string();
-        let request = events
-            .iter()
-            .find(|e| e["type"] == "instance_start")
+        // The first start carries the request; a resume with a task is a follow-up request.
+        let mut starts = events.iter().filter(|e| e["type"] == "instance_start");
+        let request = starts.next().map(|e| str_of(e, "task")).unwrap_or_default();
+        let follow_ups: Vec<String> = starts
             .map(|e| str_of(e, "task"))
-            .unwrap_or_default();
+            .filter(|t| !t.trim().is_empty() && !t.starts_with(REJECTED))
+            .collect();
         let mut instructions = Vec::new();
         let mut findings = Vec::new();
         let mut decisions = Vec::new();
@@ -711,6 +791,7 @@ A: {answer}",
             .unwrap_or_default();
         let mut out = format!("# Request\n{request}\n");
         for (title, items) in [
+            ("Follow-up requests", &follow_ups),
             ("User instructions given while working", &instructions),
             ("Decisions made with the human", &decisions),
             ("Earlier review findings", &findings),
@@ -757,11 +838,7 @@ A: {answer}",
 
     /// Identity, progress and outcome of a recorded instance.
     pub fn summary(path: &Path) -> Result<Value> {
-        let text = std::fs::read_to_string(path)?;
-        let events: Vec<Value> = text
-            .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
+        let events = read(path)?;
         let first = |t: &str| events.iter().find(|e| e["type"] == t);
         let last = |t: &str| events.iter().rev().find(|e| e["type"] == t);
         let Some(start) = first("instance_start") else {
@@ -891,10 +968,7 @@ A: {answer}",
                 serde_json::to_string(live.messages()).unwrap()
             );
             assert_eq!(r.ctx.tools(), live.tools());
-            assert_eq!(
-                (r.agent.as_str(), r.tokens_used, r.ended),
-                ("build", 700, true)
-            );
+            assert_eq!((r.model.as_str(), r.tokens_used), ("m", 700));
             assert_eq!(r.ctx.est_tokens(), live.est_tokens());
             assert_eq!(summary(&path).unwrap()["status"], "done");
             assert_eq!(find_session(&dir, "s").unwrap(), path);
@@ -919,10 +993,33 @@ A: {answer}",
             drop(e);
             let out = review_input(&path).unwrap();
             assert!(out.starts_with("# Request\nadd a flag\n"), "{out}");
+            assert!(out.contains("# Follow-up requests\n- fix\n"), "{out}");
             assert!(out.contains("- name it --fast"), "{out}");
             assert!(out.contains("- Q: default on?\n  A: answer: no"), "{out}");
             assert!(out.contains("# Earlier review findings\n- missing test"), "{out}");
             assert!(out.ends_with("# Work pass report\n(stopped: max_iterations) added test\n"), "{out}");
+        }
+
+        #[cfg(feature = "socket")]
+        #[test]
+        fn render_is_readable_and_skips_noise() {
+            let r = |e: Value| render(&e);
+            assert_eq!(r(json!({"type":"user","content":" hi "})).as_deref(), Some("> hi"));
+            assert_eq!(r(json!({"type":"assistant","content":" "})), None);
+            assert_eq!(r(json!({"type":"tokens","used":1})), None);
+            assert_eq!(r(json!({"type":"status","status":"x"})), None);
+            assert_eq!(
+                r(json!({"type":"tool_call","id":"a","name":"read","arguments":{"path":"x"}})).as_deref(),
+                Some(r#"-> read({"path":"x"})"#)
+            );
+            let ok = r(json!({"type":"tool_result","name":"bash","is_error":false,"duration_ms":12,"result":"abc"})).unwrap();
+            assert_eq!(ok, "<- bash ok 12ms (3 bytes)");
+            let err = r(json!({"type":"tool_result","name":"bash","is_error":true,"result":"boom\nmore"})).unwrap();
+            assert_eq!(err, "<- bash ERROR: boom more");
+            let ask = r(json!({"type":"tool_call","id":"c7","name":"ask","arguments":
+                {"question":"db?","options":["pg","sqlite"],"recommended":"pg"}})).unwrap();
+            assert!(ask.contains("? db?") && ask.contains("pg | sqlite") && ask.contains("/answer c7 <text>"), "{ask}");
+            assert_eq!(r(json!({"type":"instance_end","status":"stopped","reason":"user"})).as_deref(), Some("== ended: stopped (user)"));
         }
 
         #[test]
@@ -1099,166 +1196,6 @@ mod proc_tests {
     }
 }
 
-pub mod registry {
-    //! A lightweight registry of running genji instances.
-
-    use anyhow::{Context, Result, bail};
-    use serde::{Deserialize, Serialize};
-    use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use crate::storage::util::unix_secs;
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct Instance {
-        pub id: String,
-        pub pid: u32,
-        pub workspace: String,
-        pub control_socket: String,
-        #[serde(default)]
-        pub label: String,
-        pub started_at: u64,
-    }
-
-    impl Instance {
-        fn path(&self) -> PathBuf {
-            dir().join(format!("{}.json", self.id))
-        }
-
-        pub fn save(&self) -> Result<()> {
-            let d = dir();
-            std::fs::create_dir_all(&d)
-                .with_context(|| format!("creating instance registry {}", d.display()))?;
-            // Write then rename so readers never see (and delete) a partial record.
-            let p = self.path();
-            let tmp = p.with_extension("json.tmp");
-            let text = serde_json::to_string_pretty(self)?;
-            std::fs::write(&tmp, format!("{text}\n"))
-                .with_context(|| format!("writing instance record {}", tmp.display()))?;
-            std::fs::rename(&tmp, &p)
-                .with_context(|| format!("writing instance record {}", p.display()))
-        }
-
-        pub fn uptime_secs(&self) -> u64 {
-            unix_secs().saturating_sub(self.started_at)
-        }
-
-        /// The live status line, or `None` when the instance does not answer.
-        pub fn status(&self) -> Option<String> {
-            let reply = crate::socket::send(Path::new(&self.control_socket), "/status").ok()?;
-            (!reply.is_empty()).then(|| {
-                reply
-                    .strip_prefix("status:")
-                    .unwrap_or(&reply)
-                    .trim()
-                    .to_string()
-            })
-        }
-    }
-
-    pub fn dir() -> PathBuf {
-        if let Ok(d) = std::env::var("GENJI_REGISTRY_DIR")
-            && !d.trim().is_empty()
-        {
-            return PathBuf::from(d);
-        }
-        if let Ok(home) = std::env::var("HOME")
-            && !home.trim().is_empty()
-        {
-            return PathBuf::from(home).join(".genji").join("instances");
-        }
-        std::env::temp_dir().join("genji-instances")
-    }
-
-    /// A short, human-friendly instance id, unique among currently-registered ids.
-    pub fn new_id() -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-        let mut x =
-            (nanos ^ (u64::from(std::process::id()) << 21)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        x ^= x >> 32;
-        let d = dir();
-        loop {
-            let id = format!("{:06x}", x & 0x00ff_ffff);
-            if !d.join(format!("{id}.json")).exists() {
-                return id;
-            }
-            x = x.wrapping_add(1);
-        }
-    }
-
-    /// Every registry record, oldest first, without checking liveness.
-    /// Unreadable records are removed.
-    fn records() -> Vec<Instance> {
-        let Ok(rd) = std::fs::read_dir(dir()) else {
-            return Vec::new();
-        };
-        let mut out: Vec<Instance> = rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-            .filter_map(|p| {
-                let inst = std::fs::read_to_string(&p)
-                    .ok()
-                    .and_then(|t| serde_json::from_str(&t).ok());
-                if inst.is_none() {
-                    let _ = std::fs::remove_file(&p);
-                }
-                inst
-            })
-            .collect();
-        out.sort_by(|a, b| (a.started_at, &a.id).cmp(&(b.started_at, &b.id)));
-        out
-    }
-
-    /// The instance with its live status, or `None` (and its record removed)
-    /// when it does not answer.
-    fn live(inst: Instance) -> Option<(Instance, String)> {
-        let status = inst.status();
-        if status.is_none() {
-            remove(&inst.id);
-        }
-        status.map(|s| (inst, s))
-    }
-
-    /// Running instances with their live status. Stale records are removed.
-    pub fn list_live() -> Vec<(Instance, String)> {
-        records().into_iter().filter_map(live).collect()
-    }
-
-    /// The running instance whose id equals or uniquely starts with `id`.
-    /// Only matching records are probed.
-    pub fn find(id: &str) -> Result<Instance> {
-        let id = id.trim();
-        if id.is_empty() {
-            bail!("missing instance id (see `genji list`)");
-        }
-        let mut matches: Vec<Instance> = records()
-            .into_iter()
-            .filter(|i| i.id.starts_with(id))
-            .filter_map(|i| live(i).map(|(i, _)| i))
-            .collect();
-        if let Some(i) = matches.iter().position(|i| i.id == id) {
-            return Ok(matches.swap_remove(i));
-        }
-        match matches.len() {
-            1 => Ok(matches.remove(0)),
-            0 => bail!("no running genji instance with id `{id}` (see `genji list`)"),
-            _ => {
-                let ids: Vec<&str> = matches.iter().map(|i| i.id.as_str()).collect();
-                bail!(
-                    "instance id `{id}` is ambiguous; matches: {} (use a longer prefix)",
-                    ids.join(", ")
-                )
-            }
-        }
-    }
-
-    pub fn remove(id: &str) {
-        let _ = std::fs::remove_file(dir().join(format!("{id}.json")));
-    }
-}
 pub mod util {
     //! Small shared filesystem helpers.
 
@@ -1293,10 +1230,14 @@ pub mod util {
         }
     }
 
-    pub fn unix_secs() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
+    /// A short random-looking instance id (6 hex digits).
+    pub fn new_id() -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut x = (unix_millis() ^ (u64::from(std::process::id()) << 21) ^ n)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        x ^= x >> 32;
+        format!("{:06x}", x & 0x00ff_ffff)
     }
 
     pub fn unix_millis() -> u64 {
@@ -1343,6 +1284,16 @@ pub mod util {
             return (meta, body.strip_prefix('\n').unwrap_or(body).to_owned());
         }
         (meta, text.to_owned())
+    }
+
+    /// `id` reduced to letters, digits, `-` and `_` (at most 40 chars), safe in a file name.
+    pub fn sanitize(id: &str) -> String {
+        let s: String = id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            .take(40)
+            .collect();
+        if s.is_empty() { "call".into() } else { s }
     }
 
     /// A bare file-name slug: letters, digits, `-` and `_`, at most 64 chars.
@@ -1397,6 +1348,12 @@ pub mod util {
             let ws = Path::new("/workspace");
             assert_eq!(resolve_path(ws, "src/main.rs"), ws.join("src/main.rs"));
             assert_eq!(resolve_path(ws, "/tmp/file"), Path::new("/tmp/file"));
+        }
+
+        #[test]
+        fn call_tags_are_file_safe() {
+            assert_eq!(sanitize("call_abc/../1"), "call_abc1");
+            assert_eq!(sanitize("///"), "call");
         }
 
         #[test]

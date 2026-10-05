@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::storage::util::{split_frontmatter, tmp_file, valid_slug, write_file};
 
 /// Subcommand names an agent may not take.
-pub const RESERVED: [&str; 7] = ["init", "list", "stop", "instruct", "inspect", "reset", "help"];
+pub const RESERVED: [&str; 2] = ["init", "help"];
 
 /// The agent definitions `genji init` writes, with their review prompts; they are not read at run time.
 const DEFAULT_AGENTS: [(&str, &str, Option<&str>); 4] = [
@@ -106,7 +106,6 @@ pub struct Config {
     /// How long `ask` waits for a human answer before using the recommended option.
     pub ask_timeout_secs: u64,
     pub max_subagent_depth: u32,
-    pub control_enabled: bool,
     /// Max tokens (prompt + completion) per run; overrides the provider's when above 0.
     pub token_limit: i64,
     /// Where session files live; `--sessions-dir`, defaulting to `.genji/sessions`.
@@ -133,7 +132,6 @@ impl Default for Config {
             spawn_timeout_secs: 900,
             ask_timeout_secs: 600,
             max_subagent_depth: 2,
-            control_enabled: true,
             token_limit: 0,
             sessions_dir: None,
             agents_dir: None,
@@ -156,7 +154,6 @@ impl Config {
         if path == default && !path.exists() {
             let cfg = Config::default();
             write_file(path, format!("{}\n", serde_json::to_string_pretty(&cfg)?))?;
-            eprintln!("[config] created default config at {}", path.display());
             return Ok(cfg);
         }
         let text = std::fs::read_to_string(path)
@@ -168,6 +165,13 @@ impl Config {
         self.sessions_dir
             .clone()
             .unwrap_or_else(|| dot(workspace, "sessions"))
+    }
+
+    /// Where agent definitions live: `agents_dir`, else `<workspace>/.genji/agents`.
+    pub fn agents(&self, workspace: &Path) -> PathBuf {
+        self.agents_dir
+            .clone()
+            .unwrap_or_else(|| agents_dir(workspace))
     }
 
     /// The per-run token budget: the top-level `token_limit` when set, else the provider's.
@@ -589,7 +593,7 @@ pub(crate) mod tests {
             "---\ntools: read, ls\nskills: formal\n---\ncustom",
         )
         .unwrap();
-        std::fs::write(dir.join("list.md"), "---\ntools: read\n---\nx").unwrap();
+        std::fs::write(dir.join("help.md"), "---\ntools: read\n---\nx").unwrap();
         std::fs::write(dir.join("bad.md"), "---\ntools: nope\n---\nx").unwrap();
         std::fs::write(
             dir.join("check.md"),
@@ -610,7 +614,7 @@ pub(crate) mod tests {
         assert!(agents["build"].review.is_none());
         assert_eq!(agents["check"].description, "checks");
         assert_eq!(agents["check"].review.as_deref(), Some("judge"));
-        assert!(!agents.contains_key("list") && !agents.contains_key("bad"));
+        assert!(!agents.contains_key("help") && !agents.contains_key("bad"));
         assert!(!agents.contains_key("lone") && !agents.contains_key("review"));
     }
 

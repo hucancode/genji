@@ -8,7 +8,7 @@ and for subagents a reporting section), the **tools** of the agent, and the
 **turn messages**. `ContextComposer` owns all three and the operations that
 shape them: push, prune and compaction.
 
-`genji instruct <id> /context` prints the live prompt the model will receive
+`/context` on the control socket returns the live prompt the model will receive
 next. Context is pull-only: it is never written to the event stream.
 
 ## Pruning and compaction

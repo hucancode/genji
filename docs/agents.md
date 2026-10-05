@@ -33,7 +33,7 @@ Every agent is a subcommand: `genji <name> "task"`.
 `[{name, description, tools, skills, finish, model, internal, review}]`; `genji help tool --json`
 prints the tools as `[{name, description, parameters}]`.
 
-Names that collide with a command (`init list stop instruct inspect help`) and
+Names that collide with a command (`init help`) and
 agents that list an unknown tool are skipped with a warning on stderr.
 
 The files `genji init` writes:
@@ -57,7 +57,6 @@ is logged as a `tool_call` before it blocks, so a pending ask is a `tool_call` w
 - `answer: <option>`
 - `answer (free text): <text>` when the answer is not one of `options`
 - `answer: <recommended> (no reply within Ns; recommended option used)` on timeout
-- `answer: <recommended> (no human attached; recommended option used)` without a control socket (subagents, `--no-control`)
 - an error result when the run is stopped while waiting
 
 ## Finishing and handoff
@@ -85,9 +84,8 @@ failure, 2 stopped (limit or `stop`).
 `hand_off {agent, task}` ends the run and continues in the same process with a
 fresh instance of `agent` (it may be the caller) working on `task`: new id,
 `parent` = the previous one, its own session file, empty context, the next
-agent's prompt and tools, behind the same control socket. `genji list` shows the
-instance that is running now. `task` must stand alone. Chains are not capped;
-`stop` ends one. Subagents cannot `hand_off`.
+agent's prompt and tools, behind the same control socket. `task` must stand alone.
+Chains are not capped; `/stop` on the control socket ends one. Subagents cannot `hand_off`.
 
 A review pass's `handoff` verdict uses the same path (see [Review pass](#review-pass)).
 
@@ -101,14 +99,14 @@ An agent with `review: true` runs in two passes. Its review prompt is
 with a warning.
 
 1. **Work pass**: the agent's own run. It edits, asks the human, and receives the
-   instructions sent with `genji instruct`.
+   instructions sent over the control socket.
 2. **Review pass**: when the work pass calls `finish done` or runs out of tool
    iterations, a fresh instance `<work id>-review-<n>` (agent `<name>:review`,
    `parent` = the work id) starts with an empty context. Its system prompt is the
    review prompt, with the same environment, project instructions and skills. Its tools are the
    work tools without `hand_off`/`finish`, plus `verdict`. Its task is built from the work
    instance's session file, so compaction and resumes lose nothing: the request (the
-   first `instance_start` task), the user instructions, the `ask` questions and
+   first `instance_start` task), follow-up requests (the tasks of later resumes), the user instructions, the `ask` questions and
    answers, earlier review findings, and the work pass's last report.
 
 `verdict {verdict, notes}` ends the review:

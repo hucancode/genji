@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use crate::agent::Agent;
 use crate::config::AgentDef;
+use crate::storage::events;
 use crate::storage::proc;
-use crate::storage::util::{TempPath, relative_path, slugify, tmp_file, write_file};
+use crate::storage::util::{TempPath, relative_path, sanitize, slugify, tmp_file, write_file};
 
 /// Deserialize a tool payload.
 fn parse_args<'a, T: Deserialize<'a>>(args: &'a Value) -> Result<T> {
@@ -184,16 +185,23 @@ struct LsArgs {
 }
 
 /// Names in `dir` that git ignores (none outside a repository).
-fn git_ignored(dir: &Path, names: &[String], scratch: &Path) -> Vec<String> {
-    let list = TempPath(tmp_file(scratch, "ls", "txt"));
-    let run = || -> Result<Vec<String>> {
-        write_file(&list.0, names.join("\n"))?;
-        let out = std::process::Command::new("git")
+fn git_ignored(dir: &Path, names: &[String]) -> HashSet<String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let run = || -> Result<HashSet<String>> {
+        let mut child = Command::new("git")
             .args(["check-ignore", "--stdin"])
             .current_dir(dir)
-            .stdin(std::fs::File::open(&list.0)?)
-            .stderr(std::process::Stdio::null())
-            .output()?;
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut stdin = child.stdin.take().context("git stdin")?;
+        let input = names.join("\n");
+        // Written on a thread so a long listing cannot deadlock against git's output.
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let out = child.wait_with_output()?;
+        let _ = writer.join();
         Ok(String::from_utf8_lossy(&out.stdout)
             .lines()
             .map(str::to_string)
@@ -206,7 +214,6 @@ fn walk(
     dir: &Path,
     depth: usize,
     hidden: bool,
-    scratch: &Path,
     lines: &mut Vec<String>,
     counts: &mut (usize, usize),
     base: &Path,
@@ -215,17 +222,20 @@ fn walk(
         .into_iter()
         .flatten()
         .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name != ".git" && (hidden || !name.starts_with('.'))
+        })
         .collect();
     entries.sort_by_key(std::fs::DirEntry::file_name);
-    let mut names: Vec<String> = entries
+    let names: Vec<String> = entries
         .iter()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    names.retain(|n| n != ".git" && (hidden || !n.starts_with('.')));
-    let ignored = git_ignored(dir, &names, scratch);
-    for e in entries {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if !names.contains(&name) || ignored.contains(&name) {
+    let ignored = git_ignored(dir, &names);
+    for (e, name) in entries.into_iter().zip(&names) {
+        if ignored.contains(name) {
             continue;
         }
         let path = e.path();
@@ -235,7 +245,7 @@ fn walk(
                 counts.0 += 1;
                 lines.push(format!("d        {shown}/"));
                 if depth > 0 {
-                    walk(&path, depth - 1, hidden, scratch, lines, counts, base);
+                    walk(&path, depth - 1, hidden, lines, counts, base);
                 }
             }
             Ok(m) => {
@@ -255,13 +265,10 @@ fn ls(agent: &mut Agent, args: &Value) -> Result<String> {
         bail!("not a directory: {}", root.display());
     }
     let (mut lines, mut counts) = (Vec::new(), (0, 0));
-    let scratch = std::env::temp_dir();
-    std::fs::create_dir_all(&scratch)?;
     walk(
         &root,
         a.max_depth.unwrap_or(0),
         a.show_hidden.unwrap_or(false),
-        &scratch,
         &mut lines,
         &mut counts,
         &agent.workspace,
@@ -426,10 +433,11 @@ fn validate_finish(
 ) -> Result<Verdict> {
     let mut v: Verdict = parse_args(args)?;
     // A handoff's `next.task` is its report; auto fill summary if none
-    if v.summary.trim().is_empty() && v.status == "handoff" {
-        if let Some(n) = &v.next {
-            v.summary = format!("handed off to {}", n.agent);
-        }
+    if v.summary.trim().is_empty()
+        && v.status == "handoff"
+        && let Some(n) = &v.next
+    {
+        v.summary = format!("handed off to {}", n.agent);
     }
     let allowed = finish_statuses(def, parent.is_some());
     if !allowed.contains(&v.status) {
@@ -557,11 +565,7 @@ struct SpawnArgs {
 
 /// The `spawn` tool result for a finished child: its handoff (or a `blocked`
 /// report when it ended without one), built from its event lines.
-fn child_report(child: &str, agent: &str, events: &str, timed_out: bool, cap: usize) -> String {
-    let events: Vec<Value> = events
-        .lines()
-        .filter_map(|l| serde_json::from_str(l.trim()).ok())
-        .collect();
+fn child_report(child: &str, agent: &str, events: &[Value], timed_out: bool, cap: usize) -> String {
     let end = events.iter().rev().find(|e| e["type"] == "instance_end");
     let last_text = events
         .iter()
@@ -620,7 +624,7 @@ fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
             agent.cfg.max_subagent_depth
         );
     }
-    let child = format!("{}-{}", agent.instance_id, agent.call_tag);
+    let child = format!("{}-{}", agent.instance_id, sanitize(&agent.call_id));
     let cap = agent
         .cfg
         .tool_result_max_bytes
@@ -638,12 +642,18 @@ fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
         &agent.def.name,
         "--depth",
         &(agent.depth + 1).to_string(),
-        "--quiet-startup",
-        "--no-control",
     ]
     .map(String::from)
     .into();
     cmd.extend(["--sessions-dir".into(), sessions.to_string_lossy().into()]);
+    // The child's own socket, next to this one; none when this run has none.
+    match &agent.control.path {
+        Some(p) => {
+            let socket = p.with_file_name(format!("control-{child}.sock"));
+            cmd.extend(["--socket".into(), socket.to_string_lossy().into()]);
+        }
+        None => cmd.push("--socket-disabled".into()),
+    }
     if let Some(d) = &agent.cfg.agents_dir {
         cmd.extend(["--agents-dir".into(), d.to_string_lossy().into()]);
         cmd.extend(["--config-json".into(), serde_json::to_string(&agent.cfg)?]);
@@ -651,14 +661,12 @@ fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
     if agent.cfg.token_limit > 0 {
         cmd.extend(["--token-limit".into(), agent.cfg.token_limit.to_string()]);
     }
-    if let Ok(past) = std::fs::read_to_string(&session) {
-        if past.contains("\"type\":\"instance_end\"") {
+    if session.exists() {
+        let past = events::read(&session)?;
+        if past.iter().any(|e| e["type"] == "instance_end") {
             return Ok(child_report(&child, &a.agent, &past, false, cap));
         }
-        let pid = past
-            .lines()
-            .find_map(|l| serde_json::from_str::<Value>(l).ok())
-            .and_then(|e| e["pid"].as_u64());
+        let pid = past.first().and_then(|e| e["pid"].as_u64());
         if let Some(pid) = pid
             .and_then(|p| u32::try_from(p).ok())
             .filter(|p| proc::alive(*p))
@@ -677,21 +685,17 @@ fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
         ]);
     }
     let exe = std::env::current_exe().unwrap_or_else(|_| "genji".into());
-    // The child's stdout is a JSONL event stream; its last lines carry the handoff, so read it whole.
+    // The child records its events in its session file; its stdout is not needed.
     let res = proc::run_capture(
         &exe.to_string_lossy(),
         &cmd,
         &agent.workspace,
         &tmp,
         Duration::from_secs(agent.cfg.spawn_timeout_secs),
-        usize::MAX,
+        1,
     )?;
-    let events = if res.stdout.trim().is_empty() {
-        &res.stderr
-    } else {
-        &res.stdout
-    };
-    Ok(child_report(&child, &a.agent, events, res.timed_out, cap))
+    let events = events::read(&session).unwrap_or_default();
+    Ok(child_report(&child, &a.agent, &events, res.timed_out, cap))
 }
 
 // --- registry -------------------------------------------------------------
@@ -910,14 +914,10 @@ fn bounded_result(workspace: &Path, max: usize, name: &str, text: String) -> Str
     } else {
         crate::llm::truncate(&text, max)
     };
-    let safe: String = name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
-        .collect();
-    let path: PathBuf = tmp_file(&std::env::temp_dir(), &format!("tool-{safe}"), "log");
+    let path: PathBuf = tmp_file(&std::env::temp_dir(), &format!("tool-{}", sanitize(name)), "log");
     match write_file(&path, &text) {
         Ok(()) => format!(
-            "{clipped}\n[full result ({} bytes) written to {}; read it with the read tool]",
+            "{clipped}\n[result ({} bytes) written to {}; read it with the read tool]",
             text.len(),
             relative_path(workspace, &path)
         ),
@@ -990,6 +990,9 @@ mod tests {
 
     fn agent_for(def: config::AgentDef) -> Agent {
         use std::sync::{Arc, RwLock};
+        let context = Arc::new(RwLock::new(
+            crate::storage::context::ContextComposer::new(String::new(), vec![], 1000),
+        ));
         Agent::start(crate::agent::AgentParams {
             cfg: config::Config::default(),
             workspace: temp_dir("verdict"),
@@ -1002,10 +1005,8 @@ mod tests {
             depth: 0,
             resume: false,
             task: String::new(),
-            control: None,
-            context: Arc::new(RwLock::new(
-                crate::storage::context::ContextComposer::new(String::new(), vec![], 1000),
-            )),
+            control: crate::socket::Control::new(None, context.clone()),
+            context,
         })
         .unwrap()
     }
@@ -1054,6 +1055,25 @@ mod tests {
             "fn a() {\n    let z = 3;\n}\n"
         );
         assert!(apply_edits("  a\n  b\n    a\n    b\n", &[e("a\nb", "c")], false).is_err());
+    }
+
+    #[test]
+    fn ls_skips_git_ignored_and_hidden_entries() {
+        let ws = temp_dir("ls");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::write(ws.join(".gitignore"), "skip.txt\n").unwrap();
+        for f in ["keep.txt", "skip.txt", "sub/inner.txt"] {
+            std::fs::write(ws.join(f), "x").unwrap();
+        }
+        let git = std::process::Command::new("git").arg("init").arg("-q").current_dir(&ws).status();
+        let (mut lines, mut counts) = (Vec::new(), (0, 0));
+        walk(&ws, 1, false, &mut lines, &mut counts, &ws);
+        let text = lines.join("\n");
+        assert!(text.contains("keep.txt") && text.contains("sub/inner.txt"), "{text}");
+        assert!(!text.contains(".gitignore"), "{text}");
+        if git.is_ok_and(|s| s.success()) {
+            assert!(!text.contains("skip.txt"), "{text}");
+        }
     }
 
     #[test]
@@ -1167,7 +1187,7 @@ mod tests {
             json!({"status": "handoff", "summary": "s", "next": {"agent": "plan", "task": "findings"}}),
         );
         let v: Value =
-            serde_json::from_str(&child_report("c", "explore", &ok, false, 1000)).unwrap();
+            serde_json::from_str(&child_report("c", "explore", &events::parse_lines(&ok), false, 1000)).unwrap();
         assert_eq!(
             (
                 v["status"].as_str(),
@@ -1182,10 +1202,10 @@ mod tests {
             end(Value::Null)
         );
         let v: Value =
-            serde_json::from_str(&child_report("c", "explore", &no_verdict, false, 1000)).unwrap();
+            serde_json::from_str(&child_report("c", "explore", &events::parse_lines(&no_verdict), false, 1000)).unwrap();
         assert_eq!(v["status"], "blocked");
         assert!(v["report"].as_str().unwrap().contains("I looked"));
-        let v: Value = serde_json::from_str(&child_report("c", "explore", "", true, 1000)).unwrap();
+        let v: Value = serde_json::from_str(&child_report("c", "explore", &[], true, 1000)).unwrap();
         assert_eq!(
             (v["status"].as_str(), v["run"].as_str()),
             (Some("blocked"), Some("timed_out"))

@@ -20,7 +20,6 @@
 | `max_tool_iterations` | `200` | Max tool rounds per run |
 | `llm_max_retries` | `6` | Retries per model request on transport errors, 408/409/429/5xx and unparseable responses (exponential backoff, honors `Retry-After`) |
 | `max_subagent_depth` | `2` | Subagent nesting limit |
-| `control_enabled` | `true` | Open the control socket for top-level runs |
 | `token_limit` | `0` | Max tokens (prompt + completion) per run; above 0 it overrides the provider's `token_limit` |
 
 Run flags:
@@ -29,7 +28,8 @@ Run flags:
 |---|---|
 | `--workspace <dir>` | Workspace (default: current directory) |
 | `--provider <name>` | Provider profile |
-| `--socket <path>` | Control socket path (default `.genji/control.sock`) |
+| `--socket <path>` | Control socket path (default `.genji/control.sock`); spawned subagents listen next to it |
+| `--socket-disabled` | Do not open a control socket (subagents inherit this). Stdin commands still work |
 | `--sessions-dir <dir>` | Where session files are written and read (default `.genji/sessions`); spawned subagents inherit it |
 | `--token-limit <n>` | Per-run token budget; overrides `token_limit` in the config and the provider; spawned subagents inherit it |
 
