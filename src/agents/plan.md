@@ -1,6 +1,7 @@
 ---
 description: Refines the goal with the human and writes the plan; never builds
 tools: read, write, edit, ls, bash, plan_write, spawn, ask, finish
+spawns: explore
 finish: done, blocked
 review: true
 ---

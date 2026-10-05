@@ -487,12 +487,14 @@ fn hand_off(agent: &mut Agent, args: &Value) -> Result<String> {
     if agent.parent_agent.is_some() {
         bail!("a subagent reports with `finish`, not `hand_off`");
     }
-    if !agent.agents.contains_key(&a.agent) {
-        bail!(
-            "unknown agent `{}`; available: {}",
-            a.agent,
-            agent.agents.keys().cloned().collect::<Vec<_>>().join(", ")
-        );
+    let allowed: Vec<_> = agent
+        .agents
+        .keys()
+        .filter(|n| agent.def.may_spawn(n))
+        .cloned()
+        .collect();
+    if !allowed.contains(&a.agent) {
+        bail!("cannot spawn `{}`; available: {}", a.agent, allowed.join(", "));
     }
     if a.task.trim().is_empty() {
         bail!("task must not be empty");
@@ -943,6 +945,7 @@ mod tests {
             skills: vec![],
             context: vec![],
             finish: vec!["done".into(), "handoff".into()],
+            spawns: None,
             model: None,
             internal: false,
             review: None,
@@ -978,6 +981,7 @@ mod tests {
             skills: vec![],
             context: vec![],
             finish: vec!["done".into()],
+            spawns: None,
             model: None,
             internal: false,
             review: Some("judge".into()),

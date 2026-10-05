@@ -136,9 +136,9 @@ fn build_system(
         };
         s.push_str(&format!("\n\n{}", config::render_skill(skill)));
     }
-    if has("finish") {
+    if has("spawn") || has("hand_off") {
         s.push_str("\n\n## Agents\n");
-        for a in agents.values() {
+        for a in agents.values().filter(|a| def.may_spawn(&a.name)) {
             s.push_str(&format!("- {} — {}\n", a.name, a.description));
         }
     }
@@ -150,6 +150,26 @@ fn build_system(
         ));
     }
     Ok(s)
+}
+
+/// Drops timestamp keys (`created`, `updated`, ...) from a leading YAML frontmatter block;
+/// they cost tokens and carry nothing the agent acts on.
+fn strip_timestamps(text: &str) -> String {
+    let Some(rest) = text.strip_prefix("---\n") else {
+        return text.to_string();
+    };
+    let Some(end) = rest.find("\n---") else {
+        return text.to_string();
+    };
+    let (front, tail) = rest.split_at(end);
+    let kept: Vec<_> = front
+        .lines()
+        .filter(|l| {
+            let key = l.split(':').next().unwrap_or("").trim();
+            !matches!(key, "created" | "updated" | "created_at" | "updated_at")
+        })
+        .collect();
+    format!("---\n{}{tail}", kept.join("\n"))
 }
 
 /// The `context:` files of an agent definition, rendered for the first message: file contents
@@ -177,6 +197,7 @@ fn project_docs(workspace: &Path, paths: &[String]) -> String {
         }
         match std::fs::read_to_string(&full) {
             Ok(text) => {
+                let text = strip_timestamps(&text);
                 let body = llm::truncate(&text, MAX);
                 out.push_str(&format!("\n## {p}\n{}\n", body.trim_end()));
             }
@@ -749,6 +770,13 @@ mod tests {
     }
 
     #[test]
+    fn pinned_files_drop_timestamp_frontmatter() {
+        let t = "---\nid: R1\ncreated: 2026-01-01\nstatus: open\nupdated: 2026-02-02\n---\nbody created: x\n";
+        assert_eq!(strip_timestamps(t), "---\nid: R1\nstatus: open\n---\nbody created: x\n");
+        assert_eq!(strip_timestamps("no front\n"), "no front\n");
+    }
+
+    #[test]
     fn repeated_output_still_in_context_is_deduped() {
         let mut seen = HashMap::new();
         let mut ctx = ContextComposer::new("sys".into(), vec![], 1000);
@@ -809,7 +837,7 @@ mod tests {
             &[
                 (
                     "lead",
-                    "---\ndescription: leads\ntools: read, finish\n---\nl",
+                    "---\ndescription: leads\ntools: read, spawn, finish\nspawns: scout\n---\nl",
                 ),
                 (
                     "worker",
@@ -826,8 +854,11 @@ mod tests {
         assert!(
             plan.contains("## Environment")
                 && plan.contains("## Agents")
-                && plan.contains("- worker — works")
+                && plan.contains("- scout — scouts")
+                && !plan.contains("- worker — works")
         );
+        let worker = build_system(&ws, &agents["worker"], &agents, None).unwrap();
+        assert!(!worker.contains("## Agents"), "no spawn tool, no agent list");
         assert!(
             plan.contains("## Skills")
                 && plan.contains("- formal — ")

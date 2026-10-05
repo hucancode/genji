@@ -1,6 +1,7 @@
 ---
 description: Implements the task and verifies it; a review pass then checks the work with a fresh context
 tools: read, write, edit, ls, bash, spawn, finish
+spawns: explore
 finish: done, blocked
 review: true
 ---

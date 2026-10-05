@@ -199,6 +199,8 @@ pub struct AgentDef {
     pub context: Vec<String>,
     /// Statuses `finish` may use: done | handoff | blocked.
     pub finish: Vec<String>,
+    /// Agents `spawn` may start; `None` allows every agent.
+    pub spawns: Option<Vec<String>>,
     pub model: Option<String>,
     /// Reached only through `hand_off`/`spawn`; front ends do not offer it for a new session.
     pub internal: bool,
@@ -232,6 +234,11 @@ impl AgentDef {
         })
     }
 
+    /// Whether `spawn` may start `agent`.
+    pub fn may_spawn(&self, agent: &str) -> bool {
+        self.spawns.as_ref().is_none_or(|l| l.iter().any(|n| n == agent))
+    }
+
     /// The agent whose work this pass belongs to: itself, or for a review pass its worker.
     pub fn worker(&self) -> &str {
         self.name.strip_suffix(REVIEW_SUFFIX).unwrap_or(&self.name)
@@ -258,6 +265,7 @@ fn parse_agent(name: &str, text: &str) -> AgentDef {
         context: list(&meta, "context").unwrap_or_default(),
         finish: list(&meta, "finish")
             .unwrap_or_else(|| ["done", "handoff", "blocked"].map(String::from).into()),
+        spawns: list(&meta, "spawns"),
         model: meta.get("model").filter(|m| !m.is_empty()).cloned(),
         internal: meta.get("internal").is_some_and(|v| v == "true"),
         review: None,
