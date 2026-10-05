@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::agent::Agent;
-use crate::config::{AgentDef, dot};
+use crate::config::AgentDef;
 use crate::storage::proc;
 use crate::storage::util::{TempPath, relative_path, slugify, tmp_file, write_file};
 
@@ -255,7 +255,7 @@ fn ls(agent: &mut Agent, args: &Value) -> Result<String> {
         bail!("not a directory: {}", root.display());
     }
     let (mut lines, mut counts) = (Vec::new(), (0, 0));
-    let scratch = dot(&agent.workspace, "tmp");
+    let scratch = std::env::temp_dir();
     std::fs::create_dir_all(&scratch)?;
     walk(
         &root,
@@ -299,7 +299,7 @@ fn bash(agent: &mut Agent, args: &Value) -> Result<String> {
         "bash",
         &["-c".into(), a.command.clone()],
         &cwd,
-        &dot(&agent.workspace, "tmp"),
+        &std::env::temp_dir(),
         timeout,
         cap,
     )
@@ -593,7 +593,7 @@ fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
         .max(4096);
     let sessions = agent.cfg.sessions(&agent.workspace);
     let session = sessions.join(format!("{child}.jsonl"));
-    let tmp = dot(&agent.workspace, "tmp");
+    let tmp = std::env::temp_dir();
     let instructions = TempPath(tmp_file(&tmp, "subagent", "md"));
     let mut cmd: Vec<String> = [
         "--subagent",
@@ -867,7 +867,7 @@ fn bounded_result(workspace: &Path, max: usize, name: &str, text: String) -> Str
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
         .collect();
-    let path: PathBuf = tmp_file(&dot(workspace, "tmp"), &format!("tool-{safe}"), "log");
+    let path: PathBuf = tmp_file(&std::env::temp_dir(), &format!("tool-{safe}"), "log");
     match write_file(&path, &text) {
         Ok(()) => format!(
             "{clipped}\n[full result ({} bytes) written to {}; read it with the read tool]",
@@ -954,10 +954,10 @@ mod tests {
         let ws = temp_dir("bounded");
         assert_eq!(bounded_result(&ws, 100, "bash", "short".into()), "short");
         let out = bounded_result(&ws, 100, "bash", "x".repeat(500));
-        assert!(out.contains("written to .genji/tmp/tool-bash-"), "{out}");
-        let logs: Vec<_> = std::fs::read_dir(dot(&ws, "tmp")).unwrap().collect();
+        assert!(out.contains("written to /tmp/tool-bash-"), "{out}");
+        let log = out.split("written to ").nth(1).unwrap().split(';').next().unwrap();
         assert_eq!(
-            std::fs::read_to_string(logs[0].as_ref().unwrap().path())
+            std::fs::read_to_string(log)
                 .unwrap()
                 .len(),
             500

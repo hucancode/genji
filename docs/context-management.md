@@ -45,7 +45,7 @@ output is identical and whose earlier result is still verbatim in context, retur
 changed output is returned in full.
 
 Tool output is bounded at `tool_result_max_bytes` and the full text is spilled to
-`.genji/tmp`. `bash` output keeps its head and its tail, because failures and test
+`/tmp`. `bash` output keeps its head and its tail, because failures and test
 summaries come last. `read` returns at most 500 lines unless `limit` is given.
 
 ## Resume

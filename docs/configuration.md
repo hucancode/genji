@@ -10,7 +10,7 @@
 | `compact_threshold` | `0.70` | Fraction of `context_window` that triggers compaction |
 | `compact_keep_recent` | `6` | Messages kept verbatim during compaction |
 | `prune_keep_recent` | `24` | Messages kept verbatim by the cache-aware batched prune that drops superseded reads and elides old bulky tool output, `write`/`edit` payloads and reasoning |
-| `tool_result_max_bytes` | `24000` | Inline limit for tool results; larger ones are clipped and the full text goes to `.genji/tmp` |
+| `tool_result_max_bytes` | `24000` | Inline limit for tool results; larger ones are clipped and the full text goes to `/tmp` |
 | `bash_timeout_secs` | `120` | Default `bash` timeout |
 | `spawn_timeout_secs` | `900` | Subagent timeout |
 | `ask_timeout_secs` | `600` | How long the `ask` tool waits for a human answer before using its recommended option |
@@ -38,7 +38,6 @@ Run flags:
   agents/*.md          # agent definitions (`genji init` writes the defaults)
   sessions/<id>.jsonl  # one operation log per instance
   control.sock         # control socket while running
-  tmp/                 # scratch space and spilled tool results
 .agents/
   skills/<name>/SKILL.md   # skills, see [Skills](skills.md)
 ```
