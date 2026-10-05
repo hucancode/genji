@@ -489,21 +489,27 @@ struct HandOffArgs {
     task: String,
 }
 
-/// Ends this run; genji continues with a fresh instance of `agent` working on `task`.
-fn hand_off(agent: &mut Agent, args: &Value) -> Result<String> {
-    let a: HandOffArgs = parse_args(args)?;
-    if agent.parent_agent.is_some() {
-        bail!("a subagent reports with `finish`, not `hand_off`");
-    }
+/// Fails unless this agent's definition allows starting `target` (`spawns:`; default: every agent).
+fn check_may_spawn(agent: &Agent, target: &str) -> Result<()> {
     let allowed: Vec<_> = agent
         .agents
         .keys()
         .filter(|n| agent.def.may_spawn(n))
         .cloned()
         .collect();
-    if !allowed.contains(&a.agent) {
-        bail!("cannot spawn `{}`; available: {}", a.agent, allowed.join(", "));
+    if !allowed.iter().any(|n| n == target) {
+        bail!("cannot spawn `{target}`; available: {}", allowed.join(", "));
     }
+    Ok(())
+}
+
+/// Ends this run; genji continues with a fresh instance of `agent` working on `task`.
+fn hand_off(agent: &mut Agent, args: &Value) -> Result<String> {
+    let a: HandOffArgs = parse_args(args)?;
+    if agent.parent_agent.is_some() {
+        bail!("a subagent reports with `finish`, not `hand_off`");
+    }
+    check_may_spawn(agent, &a.agent)?;
     if a.task.trim().is_empty() {
         bail!("task must not be empty");
     }
@@ -610,13 +616,7 @@ fn child_report(child: &str, agent: &str, events: &[Value], timed_out: bool, cap
 /// delivered as is, an unfinished one is stopped and resumed.
 fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
     let a: SpawnArgs = parse_args(args)?;
-    if !agent.agents.contains_key(&a.agent) {
-        bail!(
-            "unknown agent `{}`; available: {}",
-            a.agent,
-            agent.agents.keys().cloned().collect::<Vec<_>>().join(", ")
-        );
-    }
+    check_may_spawn(agent, &a.agent)?;
     if agent.depth >= agent.cfg.max_subagent_depth {
         bail!(
             "subagent depth limit reached ({} >= {})",
@@ -1029,6 +1029,21 @@ mod tests {
         let mut a = agent_for(r);
         verdict(&mut a, &json!({"verdict":"reject","notes":"no test"})).unwrap();
         assert!(!a.handed_off && a.verdict.unwrap().next.is_none());
+    }
+
+    #[test]
+    fn spawn_and_hand_off_honour_the_spawns_gate() {
+        let mut def = reviewed_build();
+        def.spawns = Some(vec!["explore".into()]);
+        let mut a = agent_for(def.clone());
+        for n in ["explore", "plan"] {
+            a.agents.insert(n.into(), config::AgentDef { name: n.into(), ..def.clone() });
+        }
+        let err = |r: Result<String>| format!("{:#}", r.unwrap_err());
+        let e = err(spawn(&mut a, &json!({"agent":"plan","instructions":"x"})));
+        assert!(e.contains("cannot spawn `plan`") && e.contains("explore"), "{e}");
+        let e = err(hand_off(&mut a, &json!({"agent":"plan","task":"x"})));
+        assert!(e.contains("cannot spawn `plan`"), "{e}");
     }
 
     fn e(old: &str, new: &str) -> (String, String) {
