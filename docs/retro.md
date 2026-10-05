@@ -10,3 +10,8 @@ Improvements are plain files, tracked by git:
 - `.agents/skills/<name>/SKILL.md`: skills, see [Skills](skills.md)
 
 Keep them in git to review, diff and revert.
+
+It measures before it edits: runs by end status, tokens per agent and run, context
+peak, tool error rates and repeated calls. It reads the costliest and failed runs to
+find where each first went wrong, classifies the causes, and changes the agents or
+skills only for a cause seen in two or more sessions.
