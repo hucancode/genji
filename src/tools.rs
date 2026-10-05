@@ -609,6 +609,10 @@ fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
     .map(String::from)
     .into();
     cmd.extend(["--sessions-dir".into(), sessions.to_string_lossy().into()]);
+    if let Some(d) = &agent.cfg.agents_dir {
+        cmd.extend(["--agents-dir".into(), d.to_string_lossy().into()]);
+        cmd.extend(["--config-json".into(), serde_json::to_string(&agent.cfg)?]);
+    }
     if agent.cfg.token_limit > 0 {
         cmd.extend(["--token-limit".into(), agent.cfg.token_limit.to_string()]);
     }

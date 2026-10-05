@@ -21,6 +21,7 @@ const COMMANDS: [&str; 5] = ["init", "list", "stop", "instruct", "inspect"];
 const USAGE: &str = "usage:
   genji <agent> [task] [--resume ID] [--parent ID] [--workspace DIR] [--provider P] [--label L]
                 [--socket PATH] [--sessions-dir DIR] [--token-limit N]
+                [--config FILE] [--config-json JSON] [--agents-dir DIR]
   genji init [agent...] [--force] [--workspace DIR]
   genji list | stop <id...|all> | instruct <id> <text...> | inspect <id>
   genji help [agent|tool] [--json] | --version";
@@ -36,6 +37,9 @@ struct Opts {
     parent_agent: Option<String>,
     instance_id: Option<String>,
     instructions_file: Option<String>,
+    config_json: Option<String>,
+    config: Option<String>,
+    agents_dir: Option<String>,
     socket: Option<String>,
     sessions_dir: Option<String>,
     token_limit: Option<i64>,
@@ -73,6 +77,9 @@ fn parse(args: Vec<String>) -> Result<Opts> {
             "--parent-agent" => o.parent_agent = Some(value()?),
             "--instance-id" => o.instance_id = Some(value()?),
             "--instructions-file" => o.instructions_file = Some(value()?),
+            "--config-json" => o.config_json = Some(value()?),
+            "--config" => o.config = Some(value()?),
+            "--agents-dir" => o.agents_dir = Some(value()?),
             "--socket" => o.socket = Some(value()?),
             "--sessions-dir" => o.sessions_dir = Some(value()?),
             "--token-limit" => {
@@ -92,6 +99,14 @@ fn parse(args: Vec<String>) -> Result<Opts> {
         }
     }
     Ok(o)
+}
+
+/// The agents of `--agents-dir`, else of the workspace's `.genji/agents`.
+fn load_agents(o: &Opts) -> Result<BTreeMap<String, AgentDef>> {
+    Ok(match &o.agents_dir {
+        Some(d) => config::load_agents_from(&absolute(d)?),
+        None => config::load_agents(&workspace(o)?),
+    })
 }
 
 fn workspace(o: &Opts) -> Result<PathBuf> {
@@ -123,7 +138,7 @@ fn sessions_for(o: &Opts, ws: &Path) -> Result<PathBuf> {
 
 /// `genji help agent|tool [--json]`: loaded agents or the tool registry.
 fn cmd_help(o: &Opts, topic: Option<&str>) -> Result<i32> {
-    let agents = config::load_agents(&workspace(o)?);
+    let agents = load_agents(o)?;
     match topic {
         Some("agent") if o.json => {
             let arr: Vec<Value> = agents
@@ -240,13 +255,29 @@ fn start_control(
 
 fn run_agent(o: Opts) -> Result<i32> {
     let ws = workspace(&o)?;
-    let mut cfg = Config::load_or_create(&ws)?;
-    cfg.sessions_dir = sessions_dir(&o)?;
+    let mut cfg = match &o.config_json {
+        Some(j) => Config::from_json(j)?,
+        None => Config::load_or_create(&ws, o.config.as_deref().map(absolute).transpose()?.as_deref())?,
+    };
+    if o.sessions_dir.is_some() {
+        cfg.sessions_dir = sessions_dir(&o)?;
+    }
+    if o.agents_dir.is_some() {
+        cfg.agents_dir = o.agents_dir.as_deref().map(absolute).transpose()?;
+    }
+    if let Some(d) = &cfg.skills_dir {
+        config::set_skills_dir(d.clone());
+    }
     if let Some(n) = o.token_limit {
         cfg.token_limit = n;
     }
-    config::ensure_agents(&ws)?;
-    let agents = config::load_agents(&ws);
+    if cfg.agents_dir.is_none() {
+        config::ensure_agents(&ws)?;
+    }
+    let agents = match &cfg.agents_dir {
+        Some(d) => config::load_agents_from(d),
+        None => load_agents(&o)?,
+    };
     let sessions = cfg.sessions(&ws);
     let quiet = o.quiet || o.subagent;
     let mut resume = None;
@@ -315,7 +346,7 @@ fn run_agent(o: Opts) -> Result<i32> {
             quiet,
         )?)
     };
-    if task.is_none() && resume.is_none() {
+    if task.is_none() && (resume.is_none() || guard.is_some()) {
         let Some(g) = &guard else {
             eprintln!("[genji] no task given and no control socket to wait on");
             return Ok(2);
@@ -544,7 +575,7 @@ fn real_main() -> Result<i32> {
         return cmd_help(&o, o.positional.get(1).map(String::as_str));
     }
     if o.help {
-        print_usage(&config::load_agents(&workspace(&o)?));
+        print_usage(&load_agents(&o)?);
         return Ok(0);
     }
     let rest = o.positional.get(1..).unwrap_or_default();

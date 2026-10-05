@@ -22,8 +22,19 @@ pub fn dot(workspace: &Path, name: &str) -> PathBuf {
     workspace.join(".genji").join(name)
 }
 
+static SKILLS_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Makes [`skills_dir`] return `dir` (the config's `skills_dir`) instead of the workspace default.
+pub fn set_skills_dir(dir: PathBuf) {
+    let _ = SKILLS_DIR.set(dir);
+}
+
+/// The configured skills directory, else `<workspace>/.agents/skills`.
 pub fn skills_dir(workspace: &Path) -> PathBuf {
-    workspace.join(".agents").join("skills")
+    SKILLS_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| workspace.join(".agents").join("skills"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,8 +109,11 @@ pub struct Config {
     /// Max tokens (prompt + completion) per run; overrides the provider's when above 0.
     pub token_limit: i64,
     /// Where session files live; `--sessions-dir`, defaulting to `.genji/sessions`.
-    #[serde(skip)]
     pub sessions_dir: Option<PathBuf>,
+    /// Where agent definitions live; `--agents-dir`, defaulting to `.genji/agents`.
+    pub agents_dir: Option<PathBuf>,
+    /// Where skills live, defaulting to `.agents/skills`.
+    pub skills_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -121,21 +135,30 @@ impl Default for Config {
             control_enabled: true,
             token_limit: 0,
             sessions_dir: None,
+            agents_dir: None,
+            skills_dir: None,
         }
     }
 }
 
 impl Config {
-    /// Read `.genji/config.json`, writing the defaults first when it is missing.
-    pub fn load_or_create(workspace: &Path) -> Result<Self> {
-        let path = dot(workspace, "config.json");
-        if !path.exists() {
+    /// The config given inline by `--config-json`, nothing read or written on disk.
+    pub fn from_json(text: &str) -> Result<Self> {
+        serde_json::from_str(text).context("parsing --config-json")
+    }
+
+    /// Read `path`, or `.genji/config.json` when `path` is None, writing the defaults first
+    /// when that default file is missing.
+    pub fn load_or_create(workspace: &Path, path: Option<&Path>) -> Result<Self> {
+        let default = dot(workspace, "config.json");
+        let path = path.unwrap_or(&default);
+        if path == default && !path.exists() {
             let cfg = Config::default();
-            write_file(&path, format!("{}\n", serde_json::to_string_pretty(&cfg)?))?;
+            write_file(path, format!("{}\n", serde_json::to_string_pretty(&cfg)?))?;
             eprintln!("[config] created default config at {}", path.display());
             return Ok(cfg);
         }
-        let text = std::fs::read_to_string(&path)
+        let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         serde_json::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
     }
@@ -272,8 +295,13 @@ pub fn ensure_agents(workspace: &Path) -> Result<()> {
 /// The agents defined by `.genji/agents/<name>.md`, and nothing else. Reserved or malformed
 /// definitions are skipped with a warning.
 pub fn load_agents(workspace: &Path) -> BTreeMap<String, AgentDef> {
+    load_agents_from(&agents_dir(workspace))
+}
+
+/// The agents defined by `<dir>/<name>.md`, and nothing else.
+pub fn load_agents_from(dir: &Path) -> BTreeMap<String, AgentDef> {
     let mut agents: BTreeMap<String, AgentDef> = BTreeMap::new();
-    let files = std::fs::read_dir(agents_dir(workspace))
+    let files = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten();

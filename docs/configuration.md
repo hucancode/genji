@@ -1,11 +1,14 @@
 # Configuration
 
-`.genji/config.json` is created with defaults on first run.
+`.genji/config.json` is created with defaults on first run. `--config FILE` reads another file, which must exist; no default config is written.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `provider` | `local` | Active provider profile |
 | `providers` | `{ local }` | Named endpoint profiles, see [Providers](providers.md) |
+| `sessions_dir` | `.genji/sessions` | Where session files live (`--sessions-dir` overrides) |
+| `agents_dir` | `.genji/agents` | Where agent definitions live (`--agents-dir` overrides) |
+| `skills_dir` | `.agents/skills` | Where skills live |
 | `time_limit_secs` | `1800` | Max wall-clock time per run |
 | `compact_threshold` | `0.70` | Fraction of `context_window` that triggers compaction |
 | `compact_keep_recent` | `6` | Messages kept verbatim during compaction |
