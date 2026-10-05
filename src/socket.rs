@@ -96,6 +96,11 @@ impl Control {
         std::mem::take(&mut self.state().queue)
     }
 
+    /// Whether instructions are queued.
+    pub fn pending(&self) -> bool {
+        !self.state().queue.is_empty()
+    }
+
     /// Block until an instruction is queued (returned) or a stop is requested (`None`).
     pub fn wait_for_instruction(&self) -> Option<Vec<String>> {
         let mut st = self

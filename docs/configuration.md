@@ -10,7 +10,7 @@
 | `agents_dir` | `.genji/agents` | Where agent definitions live (`--agents-dir` overrides) |
 | `skills_dir` | `.agents/skills` | Where skills live |
 | `time_limit_secs` | `1800` | Max wall-clock time per run |
-| `compact_threshold` | `0.70` | Fraction of `context_window` that triggers compaction |
+| `preferred_context_size` | `0` | Project cap on the context window in tokens (0 = none). The effective window is the smallest of this, the provider's `context_window` and the model's size as the server reports it; compaction starts at 80% of it |
 | `compact_keep_recent` | `6` | Messages kept verbatim during compaction |
 | `prune_keep_recent` | `24` | Messages kept verbatim by the cache-aware batched prune that drops superseded reads and elides old bulky tool output, `write`/`edit` payloads and reasoning |
 | `tool_result_max_bytes` | `24000` | Inline limit for tool results; larger ones are clipped and the full text goes to `/tmp` |
@@ -39,6 +39,7 @@ Run flags:
 .genji/
   config.json          # this file
   agents/*.md          # agent definitions (`genji init` writes the defaults)
+  agents/review/*.md   # review prompts of `review: true` agents
   sessions/<id>.jsonl  # one operation log per instance
   control.sock         # control socket while running
 .agents/

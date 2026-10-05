@@ -8,13 +8,12 @@ use crate::storage::util::{split_frontmatter, tmp_file, valid_slug, write_file};
 /// Subcommand names an agent may not take.
 pub const RESERVED: [&str; 7] = ["init", "list", "stop", "instruct", "inspect", "reset", "help"];
 
-/// The agent definitions `genji init` writes; they are not read at run time.
-const DEFAULT_AGENTS: [(&str, &str); 5] = [
-    ("plan", include_str!("agents/plan.md")),
-    ("build", include_str!("agents/build.md")),
-    ("explore", include_str!("agents/explore.md")),
-    ("retro", include_str!("agents/retro.md")),
-    ("review", include_str!("agents/review.md")),
+/// The agent definitions `genji init` writes, with their review prompts; they are not read at run time.
+const DEFAULT_AGENTS: [(&str, &str, Option<&str>); 4] = [
+    ("plan", include_str!("agents/plan.md"), Some(include_str!("agents/review/plan.md"))),
+    ("build", include_str!("agents/build.md"), Some(include_str!("agents/review/build.md"))),
+    ("explore", include_str!("agents/explore.md"), None),
+    ("retro", include_str!("agents/retro.md"), None),
 ];
 
 /// `<workspace>/.genji/<name>`.
@@ -93,7 +92,9 @@ pub struct Config {
     pub provider: String,
     pub providers: BTreeMap<String, Provider>,
     pub time_limit_secs: u64,
-    pub compact_threshold: f64,
+    /// Project cap on the context size in tokens (0 = none); the effective window is the
+    /// smallest of this, the provider's `context_window` and what the server reports.
+    pub preferred_context_size: i64,
     pub compact_keep_recent: usize,
     /// Messages kept verbatim by the periodic prune of old tool output and payloads.
     pub prune_keep_recent: usize,
@@ -122,7 +123,7 @@ impl Default for Config {
             provider: "local".into(),
             providers: BTreeMap::from([("local".into(), Provider::default())]),
             time_limit_secs: 1800,
-            compact_threshold: 0.70,
+            preferred_context_size: 0,
             compact_keep_recent: 6,
             prune_keep_recent: 24,
             tool_result_max_bytes: 24_000,
@@ -201,6 +202,40 @@ pub struct AgentDef {
     pub model: Option<String>,
     /// Reached only through `hand_off`/`spawn`; front ends do not offer it for a new session.
     pub internal: bool,
+    /// With `review: true`, the prompt of the review pass, from `<agents dir>/review/<name>.md`.
+    pub review: Option<String>,
+}
+
+/// Name suffix of an agent's review pass.
+pub const REVIEW_SUFFIX: &str = ":review";
+
+impl AgentDef {
+    /// The review pass of a `review: true` agent: the review prompt, the work tools without
+    /// `hand_off`/`finish`, and `verdict` to end it.
+    pub fn reviewer(&self) -> Option<AgentDef> {
+        let prompt = self.review.clone()?;
+        let mut tools: Vec<String> = self
+            .tools
+            .iter()
+            .filter(|t| !matches!(t.as_str(), "hand_off" | "finish"))
+            .cloned()
+            .collect();
+        tools.push("verdict".into());
+        Some(AgentDef {
+            name: format!("{}{REVIEW_SUFFIX}", self.name),
+            prompt,
+            tools,
+            finish: Vec::new(),
+            internal: true,
+            review: None,
+            ..self.clone()
+        })
+    }
+
+    /// The agent whose work this pass belongs to: itself, or for a review pass its worker.
+    pub fn worker(&self) -> &str {
+        self.name.strip_suffix(REVIEW_SUFFIX).unwrap_or(&self.name)
+    }
 }
 
 fn list(meta: &BTreeMap<String, String>, key: &str) -> Option<Vec<String>> {
@@ -225,6 +260,7 @@ fn parse_agent(name: &str, text: &str) -> AgentDef {
             .unwrap_or_else(|| ["done", "handoff", "blocked"].map(String::from).into()),
         model: meta.get("model").filter(|m| !m.is_empty()).cloned(),
         internal: meta.get("internal").is_some_and(|v| v == "true"),
+        review: None,
     }
 }
 
@@ -243,12 +279,17 @@ pub struct InitReport {
 /// unless `force`; `only` limits the agents considered (all defaults when empty). When the
 /// directory does not exist yet, it appears complete or not at all.
 pub fn init_agents(workspace: &Path, force: bool, only: &[String]) -> Result<InitReport> {
-    if let Some(n) = only.iter().find(|n| !DEFAULT_AGENTS.iter().any(|(d, _)| d == n)) {
+    if let Some(n) = only.iter().find(|n| !DEFAULT_AGENTS.iter().any(|(d, ..)| d == n)) {
         anyhow::bail!("no default agent named `{n}`");
     }
-    let chosen: Vec<&(&str, &str)> = DEFAULT_AGENTS
+    // `(file stem relative to the agents dir, text)`: each agent, then its review prompt.
+    let chosen: Vec<(String, &str)> = DEFAULT_AGENTS
         .iter()
-        .filter(|(n, _)| only.is_empty() || only.iter().any(|o| o == n))
+        .filter(|(n, ..)| only.is_empty() || only.iter().any(|o| o == n))
+        .flat_map(|(n, text, review)| {
+            std::iter::once((n.to_string(), *text))
+                .chain(review.map(|r| (format!("review/{n}"), r)))
+        })
         .collect();
     let dir = agents_dir(workspace);
     let mut report = InitReport::default();
@@ -261,7 +302,7 @@ pub fn init_agents(workspace: &Path, force: bool, only: &[String]) -> Result<Ini
             write_file(&tmp.join(format!("{n}.md")), text)?;
         }
         if std::fs::rename(&tmp, &dir).is_ok() {
-            report.written = chosen.iter().map(|(n, _)| (*n).to_string()).collect();
+            report.written = chosen.into_iter().map(|(n, _)| n).collect();
             return Ok(report);
         }
         let _ = std::fs::remove_dir_all(&tmp);
@@ -269,7 +310,7 @@ pub fn init_agents(workspace: &Path, force: bool, only: &[String]) -> Result<Ini
     std::fs::create_dir_all(&dir)?;
     for (n, text) in chosen {
         let path = dir.join(format!("{n}.md"));
-        let tmp = tmp_file(&dir, n, "tmp");
+        let tmp = tmp_file(&dir, &n, "tmp");
         write_file(&tmp, text)?;
         let placed = if force {
             std::fs::rename(&tmp, &path).is_ok()
@@ -279,7 +320,7 @@ pub fn init_agents(workspace: &Path, force: bool, only: &[String]) -> Result<Ini
             linked
         };
         let list = if placed { &mut report.written } else { &mut report.skipped };
-        list.push((*n).to_string());
+        list.push(n);
     }
     Ok(report)
 }
@@ -321,7 +362,22 @@ pub fn load_agents_from(dir: &Path) -> BTreeMap<String, AgentDef> {
             );
             continue;
         }
-        let def = parse_agent(&name, &std::fs::read_to_string(&path).unwrap_or_default());
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut def = parse_agent(&name, &text);
+        if split_frontmatter(&text).0.get("review").is_some_and(|v| v == "true") {
+            let file = dir.join("review").join(format!("{name}.md"));
+            match std::fs::read_to_string(&file) {
+                Ok(prompt) => def.review = Some(prompt),
+                Err(_) => {
+                    eprintln!(
+                        "[agents] ignoring {}: `review: true` needs {}",
+                        path.display(),
+                        file.display()
+                    );
+                    continue;
+                }
+            }
+        }
         match crate::tools::check(&def) {
             Ok(()) => agents.insert(name, def),
             Err(e) => {
@@ -455,15 +511,20 @@ pub(crate) mod tests {
         let ws = temp_dir("agents-default");
         assert!(load_agents(&ws).is_empty());
         let r = init_agents(&ws, false, &[]).unwrap();
-        assert_eq!(r.written, ["plan", "build", "explore", "retro", "review"]);
+        assert_eq!(
+            r.written,
+            ["plan", "review/plan", "build", "review/build", "explore", "retro"]
+        );
         assert!(r.skipped.is_empty());
         let agents = load_agents(&ws);
         assert_eq!(
             agents.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["build", "explore", "plan", "retro", "review"]
+            ["build", "explore", "plan", "retro"]
         );
         assert_eq!(agents["plan"].finish, ["done", "blocked"]);
         assert_eq!(agents["build"].finish, ["done", "blocked"]);
+        assert!(agents["plan"].review.is_some() && agents["build"].review.is_some());
+        assert!(agents["explore"].review.is_none() && agents["retro"].review.is_none());
         assert!(agents["build"].context.is_empty());
         assert!(load_skills(&ws).is_empty());
         assert!(!skills_dir(&ws).exists());
@@ -478,10 +539,13 @@ pub(crate) mod tests {
         std::fs::remove_file(dir.join("retro.md")).unwrap();
         let r = init_agents(&ws, false, &[]).unwrap();
         assert_eq!(r.written, ["retro"]);
-        assert_eq!(r.skipped, ["plan", "build", "explore", "review"]);
+        assert_eq!(
+            r.skipped,
+            ["plan", "review/plan", "build", "review/build", "explore"]
+        );
         assert_eq!(load_agents(&ws)["build"].prompt, "mine");
         let r = init_agents(&ws, true, &["build".to_string()]).unwrap();
-        assert_eq!(r.written, ["build"]);
+        assert_eq!(r.written, ["build", "review/build"]);
         assert!(r.skipped.is_empty());
         assert_ne!(load_agents(&ws)["build"].prompt, "mine");
         assert!(init_agents(&ws, true, &["nope".to_string()]).is_err());
@@ -504,7 +568,7 @@ pub(crate) mod tests {
     fn ensure_agents_initialises_a_fresh_workspace() {
         let ws = temp_dir("agents-ensure");
         ensure_agents(&ws).unwrap();
-        assert_eq!(load_agents(&ws).len(), 5);
+        assert_eq!(load_agents(&ws).len(), 4);
     }
 
     #[test]
@@ -520,16 +584,26 @@ pub(crate) mod tests {
         std::fs::write(dir.join("list.md"), "---\ntools: read\n---\nx").unwrap();
         std::fs::write(dir.join("bad.md"), "---\ntools: nope\n---\nx").unwrap();
         std::fs::write(
-            dir.join("review.md"),
-            "---\ndescription: reviews\ntools: read\n---\ny",
+            dir.join("check.md"),
+            "---\ndescription: checks\ntools: read\nreview: true\n---\ny",
         )
         .unwrap();
+        std::fs::write(
+            dir.join("lone.md"),
+            "---\ntools: read\nreview: true\n---\nz",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("review")).unwrap();
+        std::fs::write(dir.join("review/check.md"), "judge").unwrap();
         let agents = load_agents(&ws);
         assert_eq!(agents["build"].prompt, "custom");
         assert_eq!(agents["build"].tools, ["read", "ls"]);
         assert_eq!(agents["build"].skills, ["formal"]);
-        assert_eq!(agents["review"].description, "reviews");
+        assert!(agents["build"].review.is_none());
+        assert_eq!(agents["check"].description, "checks");
+        assert_eq!(agents["check"].review.as_deref(), Some("judge"));
         assert!(!agents.contains_key("list") && !agents.contains_key("bad"));
+        assert!(!agents.contains_key("lone") && !agents.contains_key("review"));
     }
 
     /// Writes workspace agent files (`(name, file text)`).
@@ -551,12 +625,11 @@ pub(crate) mod tests {
                 ("build", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
                 ("explore", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
                 ("retro", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
-                ("review", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
                 ("alpha", "---\ntools: read, finish\nfinish: handoff, done\n---\na"),
             ],
         );
         let agents = load_agents(&ws);
-        for n in ["plan", "build", "explore", "retro", "review"] {
+        for n in ["plan", "build", "explore", "retro"] {
             assert_eq!(agents[n].prompt, "replaced");
             assert_eq!(agents[n].finish, ["blocked"]);
         }

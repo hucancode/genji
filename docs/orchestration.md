@@ -1,8 +1,9 @@
 # Orchestration
 
 Agents cooperate through `finish` handoffs. genji does not follow them; the
-caller does. The one exception is `hand_off`, which continues in a fresh
-instance of the named agent, e.g. `build` ⇄ `review` (see [Agents](agents.md#hand_off)).
+caller does. The exceptions are `hand_off`, which continues in a fresh
+instance of the named agent (see [Agents](agents.md#hand_off)), and the review pass of a
+`review: true` agent (see [Agents](agents.md#review-pass)).
 
 ## External loop
 

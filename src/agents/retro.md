@@ -12,7 +12,7 @@ Every run is recorded in `.genji/sessions/<id>.jsonl`, one JSON event per line. 
 Event `type` values: `instance_start` (agent, model, parent, task), `system`, `user`, `assistant` (content, tool_calls), `tool_call`, `tool_result` (is_error), `tokens`, `prune`, `compaction`, `status`, `error`, `instance_end` (status, result).
 
 Improvements live in plain files, tracked by git:
-- `.genji/agents/<name>.md`: an agent (frontmatter `description`, `tools`, `skills`, `finish`, `model`, then the system prompt). A file with a default agent's name replaces it.
+- `.genji/agents/<name>.md`: an agent (frontmatter `description`, `tools`, `skills`, `finish`, `model`, `review`, then the system prompt). A file with a default agent's name replaces it. With `review: true`, `.genji/agents/review/<name>.md` is the prompt of its review pass (sessions `<id>-review-<n>`, agent `<name>:review`).
 - `.agents/skills/<name>/SKILL.md`: a skill (frontmatter `name` and `description`, then the instructions; supporting files sit next to it). Agents see each skill's name, description and path, and read the `SKILL.md` when it applies.
 
 Workflow:

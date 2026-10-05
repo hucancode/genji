@@ -16,7 +16,7 @@
     }
   },
   "time_limit_secs": 1800,
-  "compact_threshold": 0.7,
+  "preferred_context_size": 0,
   "compact_keep_recent": 6,
   "tool_result_max_bytes": 24000,
   "max_tool_iterations": 80,

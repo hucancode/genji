@@ -46,7 +46,7 @@ Event types:
 | `compaction` | `summary`, `kept`, `removed`, `used` | history is summarized |
 | `status` | `status` | progress text |
 | `error` | `message` | budget, LLM, loop-limit, handoff-cap problems |
-| `instance_end` | `status` (done/failed/stopped), `reason`, `tokens_used`, `report`, `result` | the run ends; `reason` says why a `stopped` run stopped (`token_limit`, `time_limit`, `max_iterations`, `user`) and is `null` otherwise; `result` is the `finish` verdict `{status, summary, next}` or `null` |
+| `instance_end` | `status` (done/failed/stopped), `reason`, `tokens_used`, `report`, `result` | the run ends; `reason` says why a `stopped` run stopped (`token_limit`, `time_limit`, `max_iterations`, `user`) and is `null` otherwise; `result` is the `finish` or `verdict` result `{status, summary, next}` (a review's `status` is `done`, `reject`, `handoff` or `blocked`) or `null` |
 
 `tool_call.id` pairs a request with its `tool_result`.
 
@@ -57,6 +57,14 @@ except `system`. The file is an operation log of the context: `system`, `user`,
 `assistant`, `tool_result`, `prune` and `compaction` replayed in order rebuild
 exactly the messages the model last saw, which is what `--resume` does.
 `tool_call`, `tokens`, `status` and `error` are not replayed.
+
+## Review passes
+
+A `review: true` agent's process emits one `instance_start`/`instance_end` pair per
+pass. The review instance `<work id>-review-<n>` has agent `<name>:review` and
+`parent` = the work id. After a `reject`, the work instance starts again with
+`resumed: true` and appends to its own session file. The last `instance_end` of
+the process carries the final verdict (see [Agents](agents.md#review-pass)).
 
 ## Subagents
 

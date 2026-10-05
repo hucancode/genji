@@ -145,7 +145,8 @@ fn cmd_help(o: &Opts, topic: Option<&str>) -> Result<i32> {
                 .values()
                 .map(|a| {
                     json!({ "name": a.name, "description": a.description, "tools": a.tools,
-                            "skills": a.skills, "finish": a.finish, "model": a.model, "internal": a.internal })
+                            "skills": a.skills, "finish": a.finish, "model": a.model, "internal": a.internal,
+                            "review": a.review.is_some() })
                 })
                 .collect();
             println!("{}", serde_json::to_string(&arr)?);
@@ -287,17 +288,24 @@ fn run_agent(o: Opts) -> Result<i32> {
         if registry::find(&id).is_ok() {
             bail!("instance {id} is still running; stop it before resuming");
         }
-        resume = Some((id, s["agent"].as_str().unwrap_or_default().to_string()));
+        let parent = s["parent"].as_str().map(String::from);
+        resume = Some((id, s["agent"].as_str().unwrap_or_default().to_string(), parent));
     }
     let name = match (o.positional.first(), &resume) {
         (Some(n), _) => n.clone(),
-        (None, Some((_, a))) => a.clone(),
+        (None, Some((_, a, _))) => a.clone(),
         (None, None) => {
             print_usage(&agents);
             return Ok(2);
         }
     };
-    let Some(mut def) = agents.get(&name).cloned() else {
+    // A resumed review pass is rebuilt from its worker's definition.
+    let found = agents.get(&name).cloned().or_else(|| {
+        name.strip_suffix(config::REVIEW_SUFFIX)
+            .and_then(|w| agents.get(w))
+            .and_then(AgentDef::reviewer)
+    });
+    let Some(mut def) = found else {
         eprintln!("unknown agent or command `{name}`\n");
         print_usage(&agents);
         return Ok(2);
@@ -310,11 +318,11 @@ fn run_agent(o: Opts) -> Result<i32> {
     {
         cfg.provider = p;
     }
-    let provider = cfg.provider()?;
+    let mut provider = cfg.provider()?;
     let words = o.positional.get(1..).unwrap_or_default();
     let mut task = read_task(o.instructions_file.as_deref(), words)?;
     let first_id = match (&resume, &o.instance_id) {
-        (Some((id, _)), _) => id.clone(),
+        (Some((id, ..)), _) => id.clone(),
         (None, Some(id)) => id.clone(),
         (None, None) => registry::new_id(),
     };
@@ -323,6 +331,16 @@ fn run_agent(o: Opts) -> Result<i32> {
             "[genji] agent={name} provider={} base_url={} instance={first_id}",
             cfg.provider, provider.base_url
         );
+    }
+    let model = def.model.clone().unwrap_or_else(|| provider.model.clone());
+    let (window, source) = effective_window(
+        cfg.preferred_context_size,
+        provider.context_window,
+        llm::model_context_window(&provider, &model),
+    );
+    provider.context_window = window;
+    if !quiet {
+        eprintln!("[genji] context_window={window} ({source})");
     }
     // Top-level runs open a control socket and register, so list/stop/instruct/inspect find them.
     let context = Arc::new(RwLock::new(ContextComposer::new(
@@ -362,7 +380,10 @@ fn run_agent(o: Opts) -> Result<i32> {
         }
     }
     let mut id = first_id;
-    let mut parent = o.parent.clone();
+    let mut parent = o
+        .parent
+        .clone()
+        .or_else(|| resume.as_ref().and_then(|(_, _, p)| p.clone()));
     let mut resuming = resume.is_some();
     loop {
         let mut a = Agent::start(AgentParams {
@@ -382,46 +403,103 @@ fn run_agent(o: Opts) -> Result<i32> {
         })?;
         let report = a.run(task.as_deref())?;
         eprintln!("[report] {report}");
-        // A `hand_off` continues in this process as a new instance of `next.agent`:
-        // new id, new session file, fresh context.
-        let next = a
-            .verdict
-            .as_ref()
-            .filter(|_| a.handed_off && a.status == "done")
-            .and_then(|v| v.next.clone());
-        // An agent that can hand off and ran out of tool iterations continues as a fresh
-        // instance of itself; the shared run limits (time, tokens) still bound the chain.
-        let next = next.or_else(|| {
-            (a.status == "stopped"
-                && a.reason == Some("max_iterations")
-                && a.def.tools.iter().any(|t| t == "hand_off"))
-            .then(|| tools::Next {
-                agent: a.def.name.clone(),
-                task: {
-                    const NOTE: &str = "\n\nA previous instance used up its tool iterations on this task. Inspect the workspace and the task's tracking files for what is already done, then continue with what remains.";
-                    let t = task.as_deref().unwrap_or_default();
-                    if t.ends_with(NOTE) { t.to_string() } else { format!("{t}{NOTE}") }
-                },
-            })
-        });
-        let Some(next) = next else {
-            return Ok(exit_code(a.status));
-        };
-        parent = Some(id.clone());
-        id = registry::new_id();
-        def = agents[&next.agent].clone();
-        task = Some(next.task);
-        resuming = false;
+        // Two passes: a top-level work pass that submits or runs out of tool iterations is
+        // judged by a review pass with a fresh context.
+        let submitted = a.verdict.as_ref().is_some_and(|v| v.status == "done")
+            || (a.status == "stopped" && a.reason == Some("max_iterations"));
+        if let Some(reviewer) = def.reviewer().filter(|_| submitted && !o.subagent) {
+            task = Some(events::review_input(&sessions.join(format!("{id}.jsonl")))?);
+            let n = (1..)
+                .find(|n| !sessions.join(format!("{id}-review-{n}.jsonl")).exists())
+                .unwrap_or(1);
+            parent = Some(id.clone());
+            id = format!("{id}-review-{n}");
+            def = reviewer;
+            resuming = false;
+        } else if let Some(back) = back_to_work(&a, guard.as_ref().map(|g| &*g.control)) {
+            // The work instance continues in its own context: its id is the review's parent.
+            id = parent.clone().unwrap_or_default();
+            let s = events::summary(&sessions.join(format!("{id}.jsonl")))?;
+            parent = s["parent"].as_str().map(String::from);
+            def = agents[def.worker()].clone();
+            task = back;
+            resuming = true;
+        } else {
+            let Some(next) = next_instance(&a, task.as_deref()) else {
+                return Ok(exit_code(a.status));
+            };
+            parent = Some(id.clone());
+            id = registry::new_id();
+            def = agents[&next.agent].clone();
+            task = Some(next.task);
+            resuming = false;
+        }
         if let Some(g) = &mut guard {
             g.rebind(&id);
         }
         if !quiet {
-            eprintln!(
-                "[hand_off] {} -> {} (instance {id})",
-                a.def.name, def.name
-            );
+            let tag = if def.worker() != def.name || resuming {
+                "pass"
+            } else {
+                "hand_off"
+            };
+            eprintln!("[{tag}] {} -> {} (instance {id})", a.def.name, def.name);
         }
     }
+}
+
+/// After a review pass, whether its work instance continues, and with what message:
+/// the findings of a `reject`, or none for a `done` while user instructions wait (the work
+/// pass drains them itself).
+fn back_to_work(a: &Agent, control: Option<&socket::Control>) -> Option<Option<String>> {
+    if a.def.worker() == a.def.name {
+        return None;
+    }
+    match a.verdict.as_ref()? {
+        v if v.status == "reject" => Some(Some(format!("{}{}", events::REJECTED, v.summary))),
+        v if v.status == "done" && control.is_some_and(|c| c.pending()) => Some(None),
+        _ => None,
+    }
+}
+
+/// The instance that continues the chain: a `hand_off` target, or for an agent that can hand
+/// off and ran out of tool iterations a fresh instance of itself (the shared run limits, time
+/// and tokens, still bound the chain).
+fn next_instance(a: &Agent, task: Option<&str>) -> Option<tools::Next> {
+    // A `hand_off` continues in this process as a new instance of `next.agent`:
+    // new id, new session file, fresh context.
+    let next = a
+        .verdict
+        .as_ref()
+        .filter(|_| a.handed_off && a.status == "done")
+        .and_then(|v| v.next.clone());
+    next.or_else(|| {
+        (a.status == "stopped"
+            && a.reason == Some("max_iterations")
+            && a.def.tools.iter().any(|t| t == "hand_off"))
+        .then(|| tools::Next {
+            agent: a.def.name.clone(),
+            task: {
+                const NOTE: &str = "\n\nA previous instance used up its tool iterations on this task. Inspect the workspace and the task's tracking files for what is already done, then continue with what remains.";
+                let t = task.unwrap_or_default();
+                if t.ends_with(NOTE) { t.to_string() } else { format!("{t}{NOTE}") }
+            },
+        })
+    })
+}
+
+/// The smallest non-zero of the project's preferred size, the provider's window and the
+/// server-reported model window, with where it came from.
+fn effective_window(project: i64, provider: i64, model: Option<i64>) -> (i64, &'static str) {
+    [
+        (project, "preferred_context_size"),
+        (provider, "provider"),
+        (model.unwrap_or(0), "model"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .min_by_key(|(n, _)| *n)
+    .unwrap_or((provider, "provider"))
 }
 
 fn format_uptime(secs: u64) -> String {
@@ -610,6 +688,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_window_is_the_smallest_known_size() {
+        assert_eq!(effective_window(0, 32_768, None), (32_768, "provider"));
+        assert_eq!(effective_window(0, 200_000, Some(128_000)), (128_000, "model"));
+        assert_eq!(effective_window(64_000, 200_000, Some(128_000)), (64_000, "preferred_context_size"));
+        assert_eq!(effective_window(0, 0, Some(0)), (0, "provider"));
+    }
 
     fn p(args: &[&str]) -> Opts {
         parse(args.iter().map(|s| s.to_string()).collect()).unwrap()

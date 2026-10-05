@@ -21,7 +21,8 @@ for 5 minutes (so it is cold anyway) and the gain is at least 500 tokens, or the
 prompt is past half the window. Between prunes the prefix stays byte-stable. Below
 half the window a prune never elides old tool results (`bulk: false`), so the agent
 keeps what it already read. When
-the prompt reaches `compact_threshold × context_window` it prunes with
+the prompt reaches 80% of the effective context window (see
+[Configuration](configuration.md), `preferred_context_size`) it prunes with
 `prune_keep_recent`, then with `compact_keep_recent` if still over.
 Replay applies the same operation, so the rebuilt context is identical:
 
@@ -87,5 +88,5 @@ boundary (UTF-8 safe, keeps the head and appends `… [N bytes truncated]`).
 runaway command cannot exhaust memory.
 
 See [Configuration](configuration.md) for the related keys
-(`compact_threshold`, `compact_keep_recent`, `context_window`,
+(`preferred_context_size`, `compact_keep_recent`, `context_window`,
 `tool_result_max_bytes`).

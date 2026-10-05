@@ -5,12 +5,13 @@ An agent is a markdown file: frontmatter plus the system prompt.
 ```markdown
 ---
 description: Reviews a diff and reports problems     # shown in `genji --help` and in other agents' prompts
-tools: read, ls, bash, finish                        # read write edit ls bash plan_write spawn ask hand_off finish
+tools: read, ls, bash, finish                        # read write edit ls bash plan_write spawn ask hand_off finish verdict
 skills: formal                                         # optional: skills inlined into the system prompt at start
 context: docs/notes.md                                 # optional: files (or `dir/` listings) put in front of a fresh instance's task, after which come those of forced skills (`metadata.context`)
 finish: handoff, blocked                             # optional: statuses `finish` accepts (default: done, handoff, blocked)
 model: some-model                                    # optional: overrides the provider's model
 internal: true                                       # optional: reached only through `hand_off`/`spawn`; front ends do not offer it for a new session
+review: true                                         # optional: each submitted run is judged by a review pass, see below
 ---
 You review changes. ...
 ```
@@ -20,14 +21,15 @@ exactly the `<name>.md` files found there and assumes nothing about their names 
 contents. A deleted file stays deleted.
 
 `genji init [agent...] [--force] [--workspace DIR]` writes the default agents
-(`plan`, `build`, `explore`, `retro`, `review`) into that directory and prints
-`{"written":[...],"skipped":[...]}`. Existing files are kept unless `--force`;
+(`plan`, `build`, `explore`, `retro`) and the review prompts of `plan` and `build`
+(`review/plan.md`, `review/build.md`) into that directory and prints
+`{"written":[...],"skipped":[...]}` (agents as `<name>`, review prompts as `review/<name>`). Existing files are kept unless `--force`;
 naming agents limits what is written (and, with `--force`, what is reset). Running an agent
 in a workspace without `.genji/agents/` runs `init` first. With the directory present,
 nothing is added to it, and an empty directory means no agents.
 Every agent is a subcommand: `genji <name> "task"`.
 `genji help agent --json` prints the agents in `.genji/agents/` as
-`[{name, description, tools, skills, finish, model, internal}]`; `genji help tool --json`
+`[{name, description, tools, skills, finish, model, internal, review}]`; `genji help tool --json`
 prints the tools as `[{name, description, parameters}]`.
 
 Names that collide with a command (`init list stop instruct inspect help`) and
@@ -37,10 +39,9 @@ The files `genji init` writes:
 
 | agent | tools | `finish` | role |
 |---|---|---|---|
-| `plan` | read write edit ls bash plan_write spawn ask finish | done, blocked | breaks the request into requirements (or follows a requirements skill), settles decisions through `ask`, delegates fact-finding to `explore`, and writes a self-contained plan to `docs/notes/` (or tickets, under a ticket skill): steps with acceptance criteria, the tests that prove them, seed data, and a test and verification strategy; never writes code or tests, never hands off |
-| `build` | read write edit ls bash spawn hand_off finish | done, blocked | implements and verifies; delegates exploration to `explore` via `spawn`; `hand_off` to `review` when delivered, to a fresh `build` when a batch is done |
+| `plan` | read write edit ls bash plan_write spawn ask finish | done, blocked; reviewed | breaks the request into requirements (or follows a requirements skill), settles decisions through `ask`, delegates fact-finding to `explore`, and writes a self-contained plan to `docs/notes/` (or tickets, under a ticket skill): steps with acceptance criteria, the tests that prove them, seed data, and a test and verification strategy; never writes code or tests, never hands off |
+| `build` | read write edit ls bash spawn finish | done, blocked; reviewed | implements and verifies; delegates exploration to `explore` via `spawn`; `finish done` submits the work to its review pass |
 | `explore` | read ls bash spawn finish | handoff, blocked | internal; investigates read-only, hands terse `path:line` findings back to the agent that spawned it |
-| `review` | read ls bash hand_off finish | done, blocked | internal; verifies the work independently; `done` when satisfied, `hand_off` back to `build` with instructions otherwise |
 | `retro` | read write edit ls bash finish | done, blocked | improves agents and skills from recorded sessions |
 
 ## The `ask` tool
@@ -87,11 +88,41 @@ agent's prompt and tools, behind the same control socket. `genji list` shows the
 instance that is running now. `task` must stand alone. Chains are not capped;
 `stop` ends one. Subagents cannot `hand_off`.
 
-`genji build` uses it to loop `build` → `review` → `build` → … until `review`
-finishes `done`.
+A review pass's `handoff` verdict uses the same path (see [Review pass](#review-pass)).
 
 A `finish` handoff is not followed; it is data in `instance_end`. See
 [Orchestration](orchestration.md).
+
+## Review pass
+
+An agent with `review: true` runs in two passes. Its review prompt is
+`<agents dir>/review/<name>.md`; an agent with the flag and no such file is skipped
+with a warning.
+
+1. **Work pass**: the agent's own run. It edits, asks the human, and receives the
+   instructions sent with `genji instruct`.
+2. **Review pass**: when the work pass calls `finish done` or runs out of tool
+   iterations, a fresh instance `<work id>-review-<n>` (agent `<name>:review`,
+   `parent` = the work id) starts with an empty context. Its system prompt is the
+   review prompt, with the same environment, project instructions and skills. Its tools are the
+   work tools without `hand_off`/`finish`, plus `verdict`. Its task is built from the work
+   instance's session file, so compaction and resumes lose nothing: the request (the
+   first `instance_start` task), the user instructions, the `ask` questions and
+   answers, earlier review findings, and the work pass's last report.
+
+`verdict {verdict, notes}` ends the review:
+
+- `done`: the request is met; the run ends. If user instructions are queued at that
+  moment, the work pass continues instead and receives them.
+- `reject`: the work instance resumes in its own context (same id and session
+  file), with `[review rejected]` and `notes` as the next user message, and is
+  reviewed again when it submits.
+- `handoff`: a fresh work instance continues with `notes` as its task, like `hand_off`.
+- `blocked`: a human must step in; the run ends.
+
+A review pass leaves queued user instructions for the work pass. Only top-level
+runs are reviewed; a spawned subagent reports to its parent. Reject loops are
+bounded by the run limits (time, tokens), like `hand_off` chains.
 
 ## Subagents
 

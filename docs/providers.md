@@ -89,7 +89,7 @@ Anthropic Messages endpoint (for example Claude on Azure Foundry):
 | `max_tokens_field` | `max_tokens` | Or `max_completion_tokens` |
 | `send_tool_choice` | `true` | Send `tool_choice: auto` |
 | `headers` | `{}` | Extra request headers |
-| `context_window` | `32768` | Model context size, used with `compact_threshold` |
+| `context_window` | `32768` | Context size of this endpoint. At startup genji also asks the server for the model's size (`/models/<id>` `max_input_tokens` for `anthropic`; `/models` `context_length`/`max_model_len`/`meta.n_ctx_train`, else llama.cpp `/props` `n_ctx`, for `chat`) and uses the smallest of that, this and `preferred_context_size` |
 | `max_output_tokens` | `8192` | Output cap sent to the API |
 | `token_limit` | `4000000` | Max tokens (prompt + completion) per run; the top-level `token_limit` and `--token-limit` override it |
 

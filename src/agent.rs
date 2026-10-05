@@ -16,9 +16,9 @@ use crate::tools::{self, Verdict};
 const MAX_TRUNCATIONS: u32 = 3;
 const LLM_TIMEOUT_SECS: u64 = 600;
 const STOPPED_BY_USER: &str = "(stopped by user via control socket)";
-/// Sent for the last few tool-call turns so the run ends with a handoff or report, not a cut-off.
-const WRAP_UP: &str = "[note] You are about to run out of tool calls and will be cut off. Wrap up now: stop starting new work, then call hand_off or finish with a standalone report of what is done, what remains, and where the state lives.";
 const WRAP_UP_TURNS: usize = 5;
+/// Fraction of the context window at which old turns are compacted.
+const COMPACT_AT: f64 = 0.8;
 /// Messages between prune checks, so one prune clears many turns.
 /// Tools whose repeated identical output is replaced by a pointer to the earlier result.
 const DEDUPED: [&str; 3] = ["read", "ls", "bash"];
@@ -32,7 +32,6 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 const CACHE_COLD_MIN_FREE_TOKENS: i64 = 500;
 /// Past this fraction of the window, any stale content goes (before compaction is needed).
 const PRUNE_PRESSURE: f64 = 0.5;
-const NUDGE: &str = "[note] End by calling finish.";
 const CONTINUE: &str = "Continue from where you left off.";
 const TRUNCATED_HINT: &str = "[note] Your last response was cut off by the output limit. Continue with smaller steps: split large writes into several edits.";
 const INTERRUPTED: &str = "ERROR: interrupted — genji stopped while this tool was running; it may have partially run. Verify the current state before retrying.";
@@ -325,9 +324,9 @@ impl Agent {
             started: Instant::now(),
             seen: HashMap::new(),
         };
-        // `spawn`, `finish` and `hand_off` are safe to run again; any other call may have partly run.
+        // `spawn`, `finish`, `hand_off` and `verdict` are safe to run again; any other call may have partly run.
         for tc in pending {
-            if matches!(tc.name(), "spawn" | "finish" | "hand_off") {
+            if matches!(tc.name(), "spawn" | "finish" | "hand_off" | "verdict") {
                 agent.run_call(&tc);
             } else {
                 eprintln!("[resume] {} was running when genji stopped", tc.name());
@@ -511,7 +510,12 @@ impl Agent {
         let mut pruned_at = self.context.read().unwrap().len();
         let mut last_call = Instant::now();
         // One-request note after the context; never stored.
-        let mut hint: Option<&str> = None;
+        let mut hint: Option<String> = None;
+        let ends: Vec<&str> = ["hand_off", "finish", "verdict"]
+            .into_iter()
+            .filter(|t| self.def.tools.iter().any(|n| n == t))
+            .collect();
+        let ends = ends.join(" or ");
         loop {
             if let Some((reason, msg)) = self.budget_exceeded() {
                 return Ok(self.stop(reason, msg));
@@ -522,14 +526,15 @@ impl Agent {
                 return Ok(self.stopped_by_user());
             }
             self.set_status();
-            self.maybe_compact(self.cfg.compact_threshold, true)?;
+            self.maybe_compact(COMPACT_AT, true)?;
             self.maybe_prune(&mut pruned_at, last_call);
             if hint.is_none() && iterations + WRAP_UP_TURNS >= self.cfg.max_tool_iterations {
-                hint = Some(WRAP_UP);
+                // Sent for the last few tool-call turns so the run ends with a report, not a cut-off.
+                hint = Some(format!("[note] You are about to run out of tool calls and will be cut off. Wrap up now: stop starting new work, then call {ends} with a standalone report of what is done, what remains, and where the state lives."));
             }
             let result = {
                 let ctx = self.context.read().unwrap();
-                self.llm.chat(ctx.messages(), ctx.tools(), hint.take())
+                self.llm.chat(ctx.messages(), ctx.tools(), hint.take().as_deref())
             };
             last_call = Instant::now();
             let resp = match result {
@@ -561,7 +566,7 @@ impl Agent {
                 }
                 truncations += 1;
                 self.events.error(&format!("LLM response truncated (finish_reason=length); retry {truncations}/{MAX_TRUNCATIONS}"));
-                hint = Some(TRUNCATED_HINT);
+                hint = Some(TRUNCATED_HINT.into());
                 continue;
             }
             truncations = 0;
@@ -580,9 +585,9 @@ impl Agent {
                 if injected {
                     continue;
                 }
-                if !nudged && self.def.tools.iter().any(|t| t == "finish") {
+                if !nudged && !ends.is_empty() {
                     nudged = true;
-                    hint = Some(NUDGE);
+                    hint = Some(format!("[note] End by calling {ends}."));
                     continue;
                 }
                 return Ok(text);
@@ -625,17 +630,21 @@ impl Agent {
     }
 
     /// Queued user instructions enter the context. Returns (stop requested, injected).
+    /// A review pass leaves them queued: instructions belong to the work pass.
     fn poll_control(&mut self) -> (bool, bool) {
         let Some(ctrl) = self.control.clone() else {
             return (false, false);
         };
+        if self.def.worker() != self.def.name {
+            return (ctrl.stop_requested(), false);
+        }
         let queued = ctrl.drain();
         for ins in &queued {
             eprintln!(
                 "[control] injecting instruction: {}",
                 llm::truncate(ins, 160)
             );
-            self.log(ChatMessage::user(format!("[instruction from user]\n{ins}")));
+            self.log(ChatMessage::user(format!("{}{ins}", events::INSTRUCTION)));
         }
         (ctrl.stop_requested(), !queued.is_empty())
     }

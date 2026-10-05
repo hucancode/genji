@@ -281,26 +281,12 @@ impl LlmClient {
             p.base_url.trim_end_matches('/'),
             if anthropic { "messages" } else { "chat/completions" }
         );
-        let mut req = self
-            .agent
-            .post(&url)
-            .set("Content-Type", "application/json");
-        if anthropic {
-            req = req.set("anthropic-version", "2023-06-01");
-        }
-        let key = p.api_key();
-        if !key.is_empty() {
-            req = if anthropic {
-                req.set("x-api-key", &key)
-            } else if p.auth == "api-key" {
-                req.set("api-key", &key)
-            } else {
-                req.set("Authorization", &format!("Bearer {key}"))
-            };
-        }
-        for (k, v) in &p.headers {
-            req = req.set(k, v);
-        }
+        let req = authorize(
+            p,
+            self.agent
+                .post(&url)
+                .set("Content-Type", "application/json"),
+        );
         match req.send_bytes(body) {
             Ok(r) => {
                 let text = r
@@ -325,6 +311,61 @@ impl LlmClient {
             Err(e) => Err(fail(anyhow!("transport error: {e}"), true)),
         }
     }
+}
+
+/// Auth, version and custom headers every request to `p` carries.
+fn authorize(p: &Provider, mut req: ureq::Request) -> ureq::Request {
+    let anthropic = p.api == "anthropic";
+    if anthropic {
+        req = req.set("anthropic-version", "2023-06-01");
+    }
+    let key = p.api_key();
+    if !key.is_empty() {
+        req = if anthropic {
+            req.set("x-api-key", &key)
+        } else if p.auth == "api-key" {
+            req.set("api-key", &key)
+        } else {
+            req.set("Authorization", &format!("Bearer {key}"))
+        };
+    }
+    for (k, v) in &p.headers {
+        req = req.set(k, v);
+    }
+    req
+}
+
+/// The model's context size as the server reports it: the anthropic models API, the
+/// OpenAI-style `/models` list (vLLM, OpenRouter, llama.cpp), else llama.cpp's `/props`.
+/// `None` when the server does not say or cannot be reached.
+pub fn model_context_window(p: &Provider, model: &str) -> Option<i64> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .build();
+    let base = p.base_url.trim_end_matches('/');
+    let get = |url: &str| -> Option<Value> {
+        authorize(p, agent.get(url)).call().ok()?.into_json().ok()
+    };
+    if p.api == "anthropic" {
+        return get(&format!("{base}/models/{model}")).and_then(|v| v["max_input_tokens"].as_i64());
+    }
+    get(&format!("{base}/models"))
+        .and_then(|v| listed_context_window(&v, model))
+        .or_else(|| {
+            let root = base.strip_suffix("/v1").unwrap_or(base);
+            get(&format!("{root}/props"))
+                .and_then(|v| v["default_generation_settings"]["n_ctx"].as_i64())
+        })
+        .filter(|n| *n > 0)
+}
+
+/// The context size of `model` in an OpenAI-style `/models` response.
+fn listed_context_window(list: &Value, model: &str) -> Option<i64> {
+    let entry = list["data"].as_array()?.iter().find(|m| m["id"] == model)?;
+    ["context_length", "max_model_len", "context_window"]
+        .iter()
+        .find_map(|k| entry[*k].as_i64())
+        .or_else(|| entry["meta"]["n_ctx_train"].as_i64())
 }
 
 struct Failure {
@@ -613,6 +654,21 @@ mod tests {
         assert_eq!(r.message.tool_calls[0].args(), r#"{"path":"x"}"#);
         assert_eq!((r.prompt_tokens, r.cached_tokens, r.completion_tokens), (8, 3, 2));
         assert!(r.truncated);
+    }
+
+    #[test]
+    fn reads_context_window_from_model_lists() {
+        let list = serde_json::json!({"data": [
+            {"id": "a", "max_model_len": 32768},
+            {"id": "b", "context_length": 131072},
+            {"id": "c", "meta": {"n_ctx_train": 8192}},
+            {"id": "d"}
+        ]});
+        assert_eq!(super::listed_context_window(&list, "a"), Some(32768));
+        assert_eq!(super::listed_context_window(&list, "b"), Some(131072));
+        assert_eq!(super::listed_context_window(&list, "c"), Some(8192));
+        assert_eq!(super::listed_context_window(&list, "d"), None);
+        assert_eq!(super::listed_context_window(&list, "e"), None);
     }
 
     #[test]

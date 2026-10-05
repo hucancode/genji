@@ -652,6 +652,80 @@ pub mod events {
         Ok(r)
     }
 
+    /// Opens a user message carrying an instruction queued over the control socket.
+    pub const INSTRUCTION: &str = "[instruction from user]\n";
+    /// Opens a user message carrying a review pass's findings.
+    pub const REJECTED: &str = "[review rejected]\n";
+
+    /// What a review pass judges, read from the work instance's session so compaction and
+    /// resumes lose nothing: the request, the user's instructions, the `ask` decisions,
+    /// earlier review findings, and the work pass's last report.
+    pub fn review_input(path: &Path) -> Result<String> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let events: Vec<Value> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let str_of = |e: &Value, k: &str| e[k].as_str().unwrap_or_default().to_string();
+        let request = events
+            .iter()
+            .find(|e| e["type"] == "instance_start")
+            .map(|e| str_of(e, "task"))
+            .unwrap_or_default();
+        let mut instructions = Vec::new();
+        let mut findings = Vec::new();
+        let mut decisions = Vec::new();
+        for e in &events {
+            match e["type"].as_str().unwrap_or_default() {
+                "user" => {
+                    let c = str_of(e, "content");
+                    if let Some(i) = c.strip_prefix(INSTRUCTION) {
+                        instructions.push(i.to_string());
+                    } else if let Some(f) = c.strip_prefix(REJECTED) {
+                        findings.push(f.to_string());
+                    }
+                }
+                "tool_call" if e["name"] == "ask" => {
+                    let answer = events
+                        .iter()
+                        .find(|r| r["type"] == "tool_result" && r["id"] == e["id"])
+                        .map_or("(no answer)".into(), |r| str_of(r, "result"));
+                    decisions.push(format!(
+                        "Q: {}
+A: {answer}",
+                        e["arguments"]["question"].as_str().unwrap_or_default()
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let report = events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "instance_end")
+            .map(|e| match e["reason"].as_str() {
+                Some(r) => format!("(stopped: {r}) {}", str_of(e, "report")),
+                None => str_of(e, "report"),
+            })
+            .unwrap_or_default();
+        let mut out = format!("# Request\n{request}\n");
+        for (title, items) in [
+            ("User instructions given while working", &instructions),
+            ("Decisions made with the human", &decisions),
+            ("Earlier review findings", &findings),
+        ] {
+            if !items.is_empty() {
+                out.push_str(&format!("\n# {title}\n"));
+                for i in items {
+                    out.push_str(&format!("- {}\n", i.trim().replace('\n', "\n  ")));
+                }
+            }
+        }
+        out.push_str(&format!("\n# Work pass report\n{report}\n"));
+        Ok(out)
+    }
+
     /// The session file of the instance whose id equals or uniquely starts with `prefix`.
     pub fn find_session(dir: &Path, prefix: &str) -> Result<PathBuf> {
         let mut hits: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -824,6 +898,31 @@ pub mod events {
             assert_eq!(r.ctx.est_tokens(), live.est_tokens());
             assert_eq!(summary(&path).unwrap()["status"], "done");
             assert_eq!(find_session(&dir, "s").unwrap(), path);
+        }
+
+        #[test]
+        fn review_input_collects_request_instructions_decisions_and_report() {
+            let dir = util::temp_dir("review-input");
+            let path = dir.join("w.jsonl");
+            let e = EventEmitter::open("w", &path, 0).unwrap();
+            e.instance_start("/w", "build", "m", None, 0, "add a flag", false);
+            e.system("sys", &[]);
+            e.user("add a flag");
+            e.user(&format!("{INSTRUCTION}name it --fast"));
+            e.tool_call(&ToolCall::new("a1", "ask", r#"{"question":"default on?"}"#));
+            e.tool_result("a1", "ask", false, 1, "answer: no");
+            e.compaction("SUMMARY", 1, 3, 10);
+            e.instance_end("done", None, 10, "first try", None);
+            e.instance_start("/w", "build", "m", None, 0, "fix", true);
+            e.user(&format!("{REJECTED}missing test"));
+            e.instance_end("stopped", Some("max_iterations"), 20, "added test", None);
+            drop(e);
+            let out = review_input(&path).unwrap();
+            assert!(out.starts_with("# Request\nadd a flag\n"), "{out}");
+            assert!(out.contains("- name it --fast"), "{out}");
+            assert!(out.contains("- Q: default on?\n  A: answer: no"), "{out}");
+            assert!(out.contains("# Earlier review findings\n- missing test"), "{out}");
+            assert!(out.ends_with("# Work pass report\n(stopped: max_iterations) added test\n"), "{out}");
         }
 
         #[test]

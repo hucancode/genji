@@ -512,6 +512,39 @@ fn hand_off(agent: &mut Agent, args: &Value) -> Result<String> {
     Ok("ok".into())
 }
 
+#[derive(Deserialize)]
+struct VerdictArgs {
+    verdict: String,
+    notes: String,
+}
+
+/// Ends a review pass. `handoff` continues in a fresh work instance with `notes` as its task;
+/// `reject` returns `notes` to the work pass.
+fn verdict(agent: &mut Agent, args: &Value) -> Result<String> {
+    let a: VerdictArgs = parse_args(args)?;
+    if a.notes.trim().is_empty() {
+        bail!("notes must not be empty");
+    }
+    if agent.verdict.is_some() {
+        bail!("verdict was already called");
+    }
+    let next = match a.verdict.as_str() {
+        "done" | "reject" | "blocked" => None,
+        "handoff" => Some(Next {
+            agent: agent.def.worker().to_string(),
+            task: a.notes.clone(),
+        }),
+        v => bail!("verdict must be one of: done, reject, handoff, blocked (got `{v}`)"),
+    };
+    agent.handed_off = next.is_some();
+    agent.verdict = Some(Verdict {
+        status: a.verdict,
+        summary: a.notes,
+        next,
+    });
+    Ok("ok".into())
+}
+
 // --- spawn ----------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -771,6 +804,14 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["status","summary"]
             }), finish),
+            tool("verdict", "End the review. done: the request is met and verified. reject: the work pass refines its work using `notes`. handoff: a separate part remains; a fresh work instance continues with `notes` as its task (self-contained: goal, what is done, what is left, where the state lives). blocked: a human must step in.", json!({
+                "type":"object",
+                "properties":{
+                    "verdict":{"type":"string","enum":["done","reject","handoff","blocked"]},
+                    "notes":{"type":"string","description":"done: the evidence. reject: the concrete problems. handoff: the standalone task. blocked: why"}
+                },
+                "required":["verdict","notes"]
+            }), verdict),
         ]
     })
 }
@@ -904,6 +945,7 @@ mod tests {
             finish: vec!["done".into(), "handoff".into()],
             model: None,
             internal: false,
+            review: None,
         };
         let agents = std::collections::BTreeMap::from([("build".to_string(), def.clone())]);
         let args = serde_json::json!({"status":"handoff","next":{"agent":"build","task":"t"}});
@@ -926,6 +968,63 @@ mod tests {
     use super::*;
     use crate::config;
     use crate::storage::util::temp_dir;
+
+    fn reviewed_build() -> config::AgentDef {
+        config::AgentDef {
+            name: "build".into(),
+            description: String::new(),
+            prompt: "work".into(),
+            tools: ["read", "write", "hand_off", "finish"].map(String::from).into(),
+            skills: vec![],
+            context: vec![],
+            finish: vec!["done".into()],
+            model: None,
+            internal: false,
+            review: Some("judge".into()),
+        }
+    }
+
+    fn agent_for(def: config::AgentDef) -> Agent {
+        use std::sync::{Arc, RwLock};
+        Agent::start(crate::agent::AgentParams {
+            cfg: config::Config::default(),
+            workspace: temp_dir("verdict"),
+            def,
+            agents: BTreeMap::new(),
+            provider: config::Provider::default(),
+            instance_id: "v".into(),
+            parent: None,
+            parent_agent: None,
+            depth: 0,
+            resume: false,
+            task: String::new(),
+            control: None,
+            context: Arc::new(RwLock::new(
+                crate::storage::context::ContextComposer::new(String::new(), vec![], 1000),
+            )),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_review_pass_ends_with_a_verdict() {
+        let r = reviewed_build().reviewer().unwrap();
+        assert_eq!((r.name.as_str(), r.worker(), r.prompt.as_str()), ("build:review", "build", "judge"));
+        assert_eq!(r.tools, ["read", "write", "verdict"]);
+        assert!(r.reviewer().is_none());
+        let mut a = agent_for(r.clone());
+        assert!(verdict(&mut a, &json!({"verdict":"done","notes":" "})).is_err());
+        assert!(verdict(&mut a, &json!({"verdict":"maybe","notes":"x"})).is_err());
+        verdict(&mut a, &json!({"verdict":"handoff","notes":"part 2"})).unwrap();
+        let v = a.verdict.clone().unwrap();
+        let next = v.next.unwrap();
+        assert!(a.handed_off && v.status == "handoff");
+        assert_eq!((next.agent.as_str(), next.task.as_str()), ("build", "part 2"));
+        assert!(verdict(&mut a, &json!({"verdict":"done","notes":"x"})).is_err());
+        let mut a = agent_for(r);
+        verdict(&mut a, &json!({"verdict":"reject","notes":"no test"})).unwrap();
+        assert!(!a.handed_off && a.verdict.unwrap().next.is_none());
+    }
 
     fn e(old: &str, new: &str) -> (String, String) {
         (old.to_string(), new.to_string())
