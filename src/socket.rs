@@ -4,7 +4,7 @@ use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,6 +38,8 @@ struct State {
     status: String,
     /// Answers to `ask` calls, by tool call id, until taken by `wait_answer`.
     answers: HashMap<String, String>,
+    /// Ids of the `ask` calls currently blocked in `wait_answer`.
+    waiting: HashSet<String>,
 }
 
 impl Control {
@@ -70,6 +72,7 @@ impl Control {
                 stop: false,
                 status: "starting".to_string(),
                 answers: HashMap::new(),
+                waiting: HashSet::new(),
             }),
             wake: Condvar::new(),
             context,
@@ -118,16 +121,19 @@ impl Control {
     pub fn wait_answer(&self, id: &str, timeout: Duration) -> Option<String> {
         let deadline = Instant::now() + timeout;
         let mut st = self.state();
-        loop {
+        st.waiting.insert(id.to_string());
+        let answer = loop {
             if let Some(a) = st.answers.remove(id) {
-                return Some(a);
+                break Some(a);
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if st.stop || left.is_zero() {
-                return None;
+                break None;
             }
             st = self.wake.wait_timeout(st, left).unwrap().0;
-        }
+        };
+        st.waiting.remove(id);
+        answer
     }
 
     pub fn stop_requested(&self) -> bool {
@@ -167,9 +173,14 @@ fn handle(mut stream: UnixStream, c: &Control) -> Result<()> {
             });
             match parsed {
                 Some((id, v)) => {
-                    c.state().answers.insert(id, v);
-                    c.wake.notify_all();
-                    "answered".to_string()
+                    let mut st = c.state();
+                    if st.waiting.contains(&id) {
+                        st.answers.insert(id, v);
+                        c.wake.notify_all();
+                        "answered".to_string()
+                    } else {
+                        format!("error: no ask call {id} is waiting")
+                    }
                 }
                 None => "error: usage: /answer <callId> <json string>".to_string(),
             }
@@ -246,14 +257,12 @@ mod tests {
         let composer = Arc::new(RwLock::new(ContextComposer::new(String::new(), Vec::new(), 1000)));
         let ctrl = Control::start(sock.clone(), composer).expect("start control");
 
-        assert_eq!(
-            send(&sock, "/answer call_1 \"blue\"").unwrap(),
-            "answered"
-        );
-        assert_eq!(
-            ctrl.wait_answer("call_1", Duration::from_secs(2)).as_deref(),
-            Some("blue")
-        );
+        assert!(send(&sock, "/answer call_1 \"blue\"").unwrap().starts_with("error"));
+        let c = ctrl.clone();
+        let h = std::thread::spawn(move || c.wait_answer("call_1", Duration::from_secs(2)));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(send(&sock, "/answer call_1 \"blue\"").unwrap(), "answered");
+        assert_eq!(h.join().unwrap().as_deref(), Some("blue"));
         assert!(send(&sock, "/answer call_1 not-json").unwrap().starts_with("error"));
         assert!(ctrl.drain().is_empty());
         assert_eq!(ctrl.wait_answer("call_2", Duration::from_millis(50)), None);
