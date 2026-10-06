@@ -96,6 +96,9 @@ pub struct Config {
     /// smallest of this, the provider's `context_window` and what the server reports.
     pub preferred_context_size: i64,
     pub compact_keep_recent: usize,
+    /// A work pass is reviewed only when its largest prompt reached this fraction of the
+    /// effective context window (0 = always review).
+    pub review_threshold: f64,
     /// Messages kept verbatim by the periodic prune of old tool output and payloads.
     pub prune_keep_recent: usize,
     pub tool_result_max_bytes: usize,
@@ -124,6 +127,7 @@ impl Default for Config {
             time_limit_secs: 1800,
             preferred_context_size: 0,
             compact_keep_recent: 6,
+            review_threshold: 0.4,
             prune_keep_recent: 24,
             tool_result_max_bytes: 24_000,
             max_tool_iterations: 200,

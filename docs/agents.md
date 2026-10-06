@@ -101,7 +101,8 @@ with a warning.
 1. **Work pass**: the agent's own run. It edits, asks the human, and receives the
    instructions sent over the control socket.
 2. **Review pass**: when the work pass calls `finish done` or runs out of tool
-   iterations, a fresh instance `<work id>-review-<n>` (agent `<name>:review`,
+   iterations, and its largest prompt reached `review_threshold` (default 40%) of the
+   effective context window (see [Configuration](configuration.md)), a fresh instance `<work id>-review-<n>` (agent `<name>:review`,
    `parent` = the work id) starts with an empty context. Its system prompt is the
    review prompt, with the same environment, project instructions and skills. Its tools are the
    work tools without `hand_off`/`finish`, plus `verdict`. Its task is built from the work

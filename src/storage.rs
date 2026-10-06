@@ -12,6 +12,8 @@ pub mod context {
         tools: Vec<Value>,
         context_window: i64,
         last_prompt_tokens: i64,
+        /// The largest prompt measured so far; compaction and pruning do not lower it.
+        peak_prompt_tokens: i64,
         /// Message count when `last_prompt_tokens` was measured.
         prompt_len: usize,
     }
@@ -23,6 +25,7 @@ pub mod context {
                 tools,
                 context_window,
                 last_prompt_tokens: 0,
+                peak_prompt_tokens: 0,
                 prompt_len: 0,
             }
         }
@@ -46,6 +49,7 @@ pub mod context {
 
         pub fn set_last_prompt_tokens(&mut self, tokens: i64) {
             self.last_prompt_tokens = tokens;
+            self.peak_prompt_tokens = self.peak_prompt_tokens.max(tokens);
             self.prompt_len = self.messages.len();
         }
 
@@ -56,6 +60,11 @@ pub mod context {
             } else {
                 llm::estimate_messages(&self.messages)
             }
+        }
+
+        /// Whether the largest prompt so far reached `fraction` of the window.
+        pub fn peaked_over(&self, fraction: f64) -> bool {
+            self.peak_prompt_tokens >= (self.context_window as f64 * fraction) as i64
         }
 
         pub fn over(&self, fraction: f64) -> bool {
@@ -349,6 +358,15 @@ pub mod context {
             assert!(a.reasoning_content.is_none());
             assert!(a.tool_calls[0].args().len() < 100 && a.tool_calls[0].args().contains("a.rs"));
             assert!(!c.prune(2, true));
+        }
+
+        #[test]
+        fn the_peak_prompt_survives_a_smaller_later_prompt() {
+            let mut ctx = ContextComposer::new("sys".into(), vec![], 1000);
+            assert!(!ctx.peaked_over(0.4));
+            ctx.set_last_prompt_tokens(450);
+            ctx.set_last_prompt_tokens(100);
+            assert!(ctx.peaked_over(0.4) && !ctx.peaked_over(0.5));
         }
 
         #[test]

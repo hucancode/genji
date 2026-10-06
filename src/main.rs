@@ -334,6 +334,7 @@ fn run_agent(o: Opts) -> Result<i32> {
         // judged by a review pass with a fresh context.
         let submitted = a.verdict.as_ref().is_some_and(|v| v.status == "done")
             || (a.status == "stopped" && a.reason == Some("max_iterations"));
+        let submitted = submitted && context.read().unwrap().peaked_over(cfg.review_threshold);
         if let Some(reviewer) = def.reviewer().filter(|_| submitted && !o.subagent) {
             task = Some(events::review_input(&sessions.join(format!("{id}.jsonl")))?);
             let n = (1..)

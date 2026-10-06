@@ -12,6 +12,7 @@
 | `time_limit_secs` | `1800` | Max wall-clock time per run |
 | `preferred_context_size` | `0` | Project cap on the context window in tokens (0 = none). The effective window is the smallest of this, the provider's `context_window` and the model's size as the server reports it; compaction starts at 80% of it |
 | `compact_keep_recent` | `6` | Messages kept verbatim during compaction |
+| `review_threshold` | `0.4` | A work pass is judged by its review pass only when its largest prompt reached this fraction of the effective context window; smaller work finishes unreviewed (0 = always review, 1 = never review) |
 | `prune_keep_recent` | `24` | Messages kept verbatim by the cache-aware batched prune that drops superseded reads and elides old bulky tool output, `write`/`edit` payloads and reasoning |
 | `tool_result_max_bytes` | `24000` | Inline limit for tool results; larger ones are clipped and the full text goes to `/tmp` |
 | `bash_timeout_secs` | `120` | Default `bash` timeout |
