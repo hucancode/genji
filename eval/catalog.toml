@@ -1,0 +1,178 @@
+# capability and difficulty of every task in dataset.toml, plus optional genji config
+# overrides (`config = { ... }`) merged over the profile for that task.
+
+[tasks."quixbugs/python-bitcount"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-bucketsort"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-detect_cycle"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-find_first_in_sorted"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-flatten"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-gcd"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-get_factors"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-hanoi"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-is_valid_parenthesization"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-knapsack"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-kth"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-levenshtein"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-lis"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-max_sublist_sum"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-mergesort"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-next_palindrome"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-pascal"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-powerset"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-quicksort"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."quixbugs/python-sieve"]
+capability = "instruction"
+difficulty = "easy"  # fix exactly one line
+
+[tasks."ai-forever/harness-bench-fast__task_07_rename_function"]
+capability = "instruction"
+difficulty = "easy"  # precise edit
+
+[tasks."ai-forever/harness-bench-fast__task_08_bump_version"]
+capability = "instruction"
+difficulty = "easy"  # precise edit
+
+[tasks."ai-forever/harness-bench-fast__task_19_remove_old_func"]
+capability = "instruction"
+difficulty = "easy"  # precise edit
+
+[tasks."ai-forever/harness-bench-fast__task_31_rename_in_multi"]
+capability = "instruction"
+difficulty = "easy"  # precise edit
+
+[tasks."ai-forever/harness-bench-fast__task_45_inline_constant"]
+capability = "instruction"
+difficulty = "easy"  # precise edit
+
+[tasks."ai-forever/harness-bench-fast__task_50_fix_typo"]
+capability = "instruction"
+difficulty = "easy"  # precise edit
+
+[tasks."ai-forever/harness-bench-fast__task_69_remove_comments"]
+capability = "instruction"
+difficulty = "easy"  # precise edit
+
+[tasks."ai-forever/harness-bench-fast__task_79_double_to_single_quotes"]
+capability = "instruction"
+difficulty = "easy"  # precise edit
+
+[tasks."ai-forever/harness-bench-fast__task_88_sort_imports"]
+capability = "instruction"
+difficulty = "easy"  # precise edit
+
+[tasks."ai-forever/harness-bench-fast__task_95_add_default_arg"]
+capability = "instruction"
+difficulty = "easy"  # precise edit
+
+[tasks."ai-forever/harness-bench-fast__task_151_pipeline_csv_to_json"]
+capability = "multi-step"
+difficulty = "medium"  # ordered data pipeline
+
+[tasks."ai-forever/harness-bench-fast__task_152_sqlite_join_to_json"]
+capability = "multi-step"
+difficulty = "medium"  # ordered data pipeline
+
+[tasks."ai-forever/harness-bench-fast__task_156_csv_validate_split"]
+capability = "multi-step"
+difficulty = "medium"  # ordered data pipeline
+
+[tasks."ai-forever/harness-bench-fast__task_188_csv_three_way_join"]
+capability = "multi-step"
+difficulty = "medium"  # ordered data pipeline
+
+[tasks."ai-forever/harness-bench-fast__task_191_sqlite_revenue_report"]
+capability = "multi-step"
+difficulty = "medium"  # ordered data pipeline
+
+[tasks."ai-forever/harness-bench-fast__task_201_reconcile_vip_users"]
+capability = "multi-step"
+difficulty = "medium"  # ordered data pipeline
+
+[tasks."ai-forever/harness-bench-fast__task_207_inventory_anomaly_report"]
+capability = "multi-step"
+difficulty = "medium"  # ordered data pipeline
+
+[tasks."ai-forever/harness-bench-fast__task_214_customer_data_quality_report"]
+capability = "multi-step"
+difficulty = "medium"  # ordered data pipeline
+
+[tasks."ai-forever/harness-bench-fast__task_139_grep_log_errors"]
+capability = "long-output"
+difficulty = "easy"  # search a tree with noisy output
+
+[tasks."ai-forever/harness-bench-fast__task_144_grep_duplicate_funcs"]
+capability = "long-output"
+difficulty = "easy"  # search a tree with noisy output
+
+[tasks."ai-forever/harness-bench-fast__task_186_find_call_sites"]
+capability = "long-output"
+difficulty = "easy"  # search a tree with noisy output
+
+[tasks."ai-forever/harness-bench-fast__task_187_dead_functions"]
+capability = "long-output"
+difficulty = "easy"  # search a tree with noisy output
+
+[tasks."genji/needle-in-log"]
+capability = "long-output"
+difficulty = "easy"  # 50 MB log, noisy grep
+
+[tasks."genji/crash-resume"]
+capability = "handoff"
+difficulty = "easy"  # killed, then --resume

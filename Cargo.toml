@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "eval"]
+
 [package]
 name = "genji"
 version = "0.1.0"

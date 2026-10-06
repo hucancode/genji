@@ -1,0 +1,18 @@
+schema_version = "1.3"
+
+[task]
+name = "genji/needle-in-log"
+description = "Find the single ERROR line in a 50 MB log where thousands of WARN lines mention errors"
+
+[metadata]
+difficulty = "easy"
+category = "long-output"
+
+[agent]
+timeout_sec = 900.0
+
+[verifier]
+timeout_sec = 120.0
+
+[environment]
+build_timeout_sec = 900.0

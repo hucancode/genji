@@ -1,0 +1,2 @@
+[alias]
+eval = "run -q -p genji-eval --bin genji-eval --"

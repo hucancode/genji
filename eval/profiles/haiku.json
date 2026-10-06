@@ -1,0 +1,15 @@
+{
+  "provider": "haiku",
+  "providers": {
+    "haiku": {
+      "api": "anthropic",
+      "base_url": "https://AZURE_MODEL_BASE_NAME.services.ai.azure.com/anthropic/v1",
+      "api_key_env": "AZURE_MODEL_API_KEY",
+      "model": "claude-haiku-4-5",
+      "context_window": 200000,
+      "max_output_tokens": 16384,
+      "token_limit": 3000000
+    }
+  },
+  "time_limit_secs": 1800
+}

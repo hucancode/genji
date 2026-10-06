@@ -1,0 +1,19 @@
+[package]
+name = "genji-eval"
+version = "0.1.0"
+edition = "2024"
+description = "Runs the genji evaluation sets on Harbor"
+
+[[bin]]
+name = "genji-eval"
+path = "src/main.rs"
+
+[[bin]]
+name = "genji-drive"
+path = "src/drive.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+toml = "0.8"

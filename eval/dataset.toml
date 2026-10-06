@@ -1,0 +1,178 @@
+# Dataset manifest for genji/eval
+# Registry tasks reused by the easy set, pinned by digest. Add with: harbor add <org>/<name> --to eval
+# Hand-authored tasks live in eval/tasks/. eval/catalog.toml describes both.
+
+[dataset]
+name = "genji/eval"
+version = "1.0.0"
+description = "genji evaluation set: one agent quality per task"
+authors = []
+keywords = []
+
+[[tasks]]
+name = "quixbugs/python-bitcount"
+digest = "sha256:641d0ea3a9f312ca58c91d4ca70fe18ace29a78c5756199323d41428408bd481"
+
+[[tasks]]
+name = "quixbugs/python-bucketsort"
+digest = "sha256:eaa856385080a1ac9a7d541b846dabbfe52d9eacc99b89c3d7837c43b01250a8"
+
+[[tasks]]
+name = "quixbugs/python-detect_cycle"
+digest = "sha256:bd5d880e00fd1ad950595fcedf3945e566113a647442ee9d13162c96d74e7a79"
+
+[[tasks]]
+name = "quixbugs/python-find_first_in_sorted"
+digest = "sha256:f3c4780f9732e6099f995328798e1bf0c8d8cabeb001743721b6b9d9ddae9d8e"
+
+[[tasks]]
+name = "quixbugs/python-flatten"
+digest = "sha256:0320491c485a9e691526fd82a5d7ad9b5a2d86c9ab0ce5a439634944f6ae0f90"
+
+[[tasks]]
+name = "quixbugs/python-gcd"
+digest = "sha256:18e11de3a29060c975e37b9d09d9ee03188b495b00090f7707126f5e8b5b7fd5"
+
+[[tasks]]
+name = "quixbugs/python-get_factors"
+digest = "sha256:29230db5a8fdf3c61a8ca1ca30b74d034225ab2f683c0bc89f46a06c21758dc7"
+
+[[tasks]]
+name = "quixbugs/python-hanoi"
+digest = "sha256:578806df1db027b794e2b69d2b227023f60e728b7c251b116ef52c492989c3cc"
+
+[[tasks]]
+name = "quixbugs/python-is_valid_parenthesization"
+digest = "sha256:a395c1c38f2f15f4042a1eed71ab45d599bb2f9c839f24b9579f2f83b0f6af86"
+
+[[tasks]]
+name = "quixbugs/python-knapsack"
+digest = "sha256:368dbb62b8d7652b4249d1306cec6af1103d35d5d91307c533dce8336f2db5b4"
+
+[[tasks]]
+name = "quixbugs/python-kth"
+digest = "sha256:4b70d4bec79f5cc90772d901d78624ac5fd31e3ee23830908e7b0ddf3c910f31"
+
+[[tasks]]
+name = "quixbugs/python-levenshtein"
+digest = "sha256:8632fee3e2bb5afc479ade91bc847aa2e1e24f2df1d4dd69b3b687d94fedcb50"
+
+[[tasks]]
+name = "quixbugs/python-lis"
+digest = "sha256:e0dd1f6befb2fb551cd68ec51bbe6ea8554e8c0d6602d3ff8449211e03884624"
+
+[[tasks]]
+name = "quixbugs/python-max_sublist_sum"
+digest = "sha256:58670532048b8cad8632200d78a85d666bc553873cb46cab562cbb730b0fa9ae"
+
+[[tasks]]
+name = "quixbugs/python-mergesort"
+digest = "sha256:9a3624d6ac0c619e135cc25001ad69ee731d385cf7d274b2a6631cb633ff3521"
+
+[[tasks]]
+name = "quixbugs/python-next_palindrome"
+digest = "sha256:464849c5f4be1172c6875e301fb2c5eae4aae0d257b57cf7fc078e7e60ddc9ca"
+
+[[tasks]]
+name = "quixbugs/python-pascal"
+digest = "sha256:708ecfafb91c2d617678c78c75e9b8109487ce70d2bd0612c86065f03f5fd6cc"
+
+[[tasks]]
+name = "quixbugs/python-powerset"
+digest = "sha256:015739b2ba26c384fb4400296c71eddf62cb582454fee2b375a0eee23649a4e7"
+
+[[tasks]]
+name = "quixbugs/python-quicksort"
+digest = "sha256:2e53941f46b1648f3fb2f86a922cded696f02509266dbd5aa68383a3be62fd21"
+
+[[tasks]]
+name = "quixbugs/python-sieve"
+digest = "sha256:cc78610a7d4f791b04b2159615022a51bbcf08baa0df257fb87e31b95d17dc03"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_07_rename_function"
+digest = "sha256:1494fb6c2aa652437c1f33bacf05ae77f035005c60fa95cb3617b5fe08bb440f"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_08_bump_version"
+digest = "sha256:81b658477c4757b3125eaf7da86d1f3ac59ca8fd60d3fe00b13c76e4f515ee41"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_19_remove_old_func"
+digest = "sha256:e01b802163980ef7e2a36f0189731ab5cec173a22695524ac84474c6a2ca9d79"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_31_rename_in_multi"
+digest = "sha256:98a72999209e9f978b7a8d61371c713bf68d15fd44062ca27c3af59619260722"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_45_inline_constant"
+digest = "sha256:53be2f6e55d1802b24a9bd55186acfacf334bcff03cf6186be6b2a54e4fc05e4"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_50_fix_typo"
+digest = "sha256:0f054b97d6f781962955d94906819eb3676eba9b6750e867d5f09a5aa5ed699d"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_69_remove_comments"
+digest = "sha256:f3f22cc9e452a31f7664d69a0f4b17f0806c81d68ad4eb331aae55ba84e42314"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_79_double_to_single_quotes"
+digest = "sha256:43d49b79cafbfc096c9072b100375d2849aca462d901bd38c0b19e63787a04e1"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_88_sort_imports"
+digest = "sha256:468b146aef84c3b975ddf435bbf63c67dc0933334afc17e3b6abfee58ee42ea0"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_95_add_default_arg"
+digest = "sha256:a206f40fc7e6be773a16b324b73b60a211f6daf50b9f4baa34eb8eadb9c561ea"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_151_pipeline_csv_to_json"
+digest = "sha256:95639c0e0a011c594b1ae1777da0cd60dc62430a16ac7a2a3a36f5e9e4f76ce2"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_152_sqlite_join_to_json"
+digest = "sha256:f41995a551836594210f18b3c30be84e07c9ef087ac5c62496cc3583f0dc19b8"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_156_csv_validate_split"
+digest = "sha256:c4f1583f2301d03c79f77ebcc4016884eeaf51721c2f63f64e55d8ba983b2d6e"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_188_csv_three_way_join"
+digest = "sha256:28660559119e61a99f540a70b5915e9b24ddf4cac74077a145264aabbc805560"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_191_sqlite_revenue_report"
+digest = "sha256:930c4d880a02d32b0b351cf1a61268a2a1e564aa06a9500cf7ed3cb197528291"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_201_reconcile_vip_users"
+digest = "sha256:ce3e52f12ce2e5bba8b90ae45ea2a581dbfac8fc7bebca841786cb6b016d651c"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_207_inventory_anomaly_report"
+digest = "sha256:c5ae3abde399a52069cdb0c2cb8205f5a045ba01a289890faa589582c44edb5f"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_214_customer_data_quality_report"
+digest = "sha256:a3fb1875cb955cdee25a9e19574fcc4d20926b0c56be1045d17fa637b0357acc"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_139_grep_log_errors"
+digest = "sha256:85ad4c62bdc20ae850a97f9142ed20483a505a68e9672b1d029d1ac15c064234"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_144_grep_duplicate_funcs"
+digest = "sha256:4ef762c3243d89e5899b2b528c93dc7b41893e19e021ea3fb9727c66b122e546"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_186_find_call_sites"
+digest = "sha256:76ff913a476696f65136f84e952145868f1c74eefa3f52fa225fdc4d9c5a0db4"
+
+[[tasks]]
+name = "ai-forever/harness-bench-fast__task_187_dead_functions"
+digest = "sha256:ac42b599bc68e47249f06ed96632e93c49278b354566de8bceb44a7a01ad0b13"
