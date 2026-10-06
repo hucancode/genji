@@ -84,27 +84,34 @@ pub mod context {
         /// Drops what the model no longer needs, deterministically from the messages alone
         /// (replay applies the same call); see `prune_messages`.
         pub fn prune(&mut self, keep: usize, bulk: bool) -> bool {
-            let changed = prune_messages(&mut self.messages, keep, bulk);
+            let (changed, _) = prune_messages(&mut self.messages, keep, bulk, None);
             if changed {
                 self.last_prompt_tokens = 0;
             }
             changed
         }
 
-        /// Like `prune`, but applied only when `worth(freed_tokens, self)` agrees; the prune is
-        /// computed once, on a copy that replaces the messages if it is worth it.
-        pub fn prune_if(&mut self, keep: usize, bulk: bool, worth: impl FnOnce(i64, &Self) -> bool) -> bool {
-            let mut pruned = self.messages.clone();
-            if !prune_messages(&mut pruned, keep, bulk) {
-                return false;
+        /// Like `prune`, but its edits are rolled back unless `worth(freed_tokens, est_tokens,
+        /// context_window)` agrees, so the cached prefix is only rewritten when it pays.
+        pub fn prune_if(
+            &mut self,
+            keep: usize,
+            bulk: bool,
+            worth: impl FnOnce(i64, i64, i64) -> bool,
+        ) -> bool {
+            let est = self.est_tokens();
+            let window = self.context_window;
+            let mut undo = Vec::new();
+            let (changed, freed) = prune_messages(&mut self.messages, keep, bulk, Some(&mut undo));
+            if changed && worth(freed, est, window) {
+                self.last_prompt_tokens = 0;
+                true
+            } else {
+                for (i, m) in undo {
+                    self.messages[i] = m;
+                }
+                false
             }
-            let freed = llm::estimate_messages(&self.messages) - llm::estimate_messages(&pruned);
-            if !worth(freed, self) {
-                return false;
-            }
-            self.messages = pruned;
-            self.last_prompt_tokens = 0;
-            true
         }
 
         /// The content of the tool result answering call `id`, if it is still in context.
@@ -114,10 +121,6 @@ pub mod context {
                 .rev()
                 .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some(id))
                 .map(|m| m.content.as_str())
-        }
-
-        pub fn context_window(&self) -> i64 {
-            self.context_window
         }
 
         pub fn len(&self) -> usize {
@@ -154,7 +157,12 @@ pub mod context {
     /// - with `bulk`, tool results older than the last `keep` messages; without it, old results
     ///   stay verbatim so the agent does not re-read what it already saw;
     /// - old `write`/`edit` payloads and reasoning, since the file on disk is the truth.
-    fn prune_messages(messages: &mut [ChatMessage], keep: usize, bulk: bool) -> bool {
+    fn prune_messages(
+        messages: &mut [ChatMessage],
+        keep: usize,
+        bulk: bool,
+        mut undo: Option<&mut Vec<(usize, ChatMessage)>>,
+    ) -> (bool, i64) {
         const MAX: usize = 1000;
         const STUB: &str =
             "[superseded: the file changed or was read again later; read it again if needed]";
@@ -180,6 +188,7 @@ pub mod context {
                 calls.insert(c.id.clone(), (i, c.name().to_string(), path, sig));
             }
         }
+        let mut freed = 0i64;
         let mut changed = false;
         for (i, m) in messages.iter_mut().enumerate() {
             if m.role == Role::Tool {
@@ -193,24 +202,43 @@ pub mod context {
                                 || last_read.get(sig).is_some_and(|l| l > at))
                     });
                 if stale && m.content.len() > STUB.len() {
+                    let before = m.est_tokens();
+                    if let Some(u) = undo.as_deref_mut() {
+                        u.push((i, m.clone()));
+                    }
                     m.content = STUB.to_string();
+                    freed += before - m.est_tokens();
                     changed = true;
                 } else if bulk && i < old && m.content.len() > MAX {
+                    let before = m.est_tokens();
+                    if let Some(u) = undo.as_deref_mut() {
+                        u.push((i, m.clone()));
+                    }
                     m.content = format!(
                         "{}\n[older output elided: {} bytes; re-run the tool if needed]",
                         llm::truncate(&m.content, MAX / 2),
                         m.content.len()
                     );
+                    freed += before - m.est_tokens();
                     changed = true;
                 }
             } else if i < old && m.role == Role::Assistant {
-                if m.reasoning_content
+                let will_change = m
+                    .reasoning_content
                     .as_deref()
                     .is_some_and(|r| !r.is_empty())
-                {
-                    m.reasoning_content = None;
-                    changed = true;
+                    || m.tool_calls.iter().any(|c| {
+                        matches!(c.function.name.as_str(), "write" | "edit")
+                            && c.function.arguments.len() > 500
+                    });
+                if !will_change {
+                    continue;
                 }
+                let before = m.est_tokens();
+                if let Some(u) = undo.as_deref_mut() {
+                    u.push((i, m.clone()));
+                }
+                m.reasoning_content = None;
                 for c in &mut m.tool_calls {
                     if matches!(c.function.name.as_str(), "write" | "edit")
                         && c.function.arguments.len() > 500
@@ -222,12 +250,13 @@ pub mod context {
                             "elided_bytes": c.function.arguments.len(),
                         })
                         .to_string();
-                        changed = true;
                     }
                 }
+                freed += before - m.est_tokens();
+                changed = true;
             }
         }
-        changed
+        (changed, freed)
     }
 
     fn render(msgs: &[ChatMessage]) -> String {
@@ -281,14 +310,14 @@ pub mod context {
             c.push(ChatMessage::user("mid"));
             c.push(ChatMessage::tool_result("2", "y".repeat(5000)));
             let before = c.messages()[1].content.len();
-            assert!(!c.prune_if(2, true, |freed, _| {
+            assert!(!c.prune_if(2, true, |freed, _, _| {
                 assert!(freed > 1000);
                 false
             }));
             assert_eq!(c.messages()[1].content.len(), before);
-            assert!(c.prune_if(2, true, |_, _| true));
+            assert!(c.prune_if(2, true, |_, _, _| true));
             assert!(c.messages()[1].content.len() < before);
-            assert!(!c.prune_if(2, true, |_, _| panic!("nothing left to free")));
+            assert!(!c.prune_if(2, true, |_, _, _| panic!("nothing left to free")));
         }
 
         #[test]
@@ -590,7 +619,12 @@ pub mod events {
         let s = |k: &str| e[k].as_str().unwrap_or_default();
         let clip = |t: &str, n: usize| crate::llm::truncate(t.trim(), n).replace('\n', " ");
         Some(match e["type"].as_str()? {
-            "instance_start" => format!("== {} started ({}): {}", s("agent"), s("model"), clip(s("task"), 200)),
+            "instance_start" => format!(
+                "== {} started ({}): {}",
+                s("agent"),
+                s("model"),
+                clip(s("task"), 200)
+            ),
             "instance_end" => match e["reason"].as_str() {
                 Some(r) => format!("== ended: {} ({r})", s("status")),
                 None => format!("== ended: {}", s("status")),
@@ -686,19 +720,13 @@ pub mod events {
     /// Unparseable lines (a write cut off by a crash) are dropped.
     pub fn replay(path: &Path, context_window: i64) -> Result<Replayed> {
         let mut ctx: Option<ContextComposer> = None;
-        let mut r = Replayed {
-            model: String::new(),
-            ctx: ContextComposer::new(String::new(), vec![], context_window),
-            seq: 0,
-            tokens_used: 0,
-            pending: Vec::new(),
-        };
+        let (mut model, mut seq, mut tokens_used): (String, u64, i64) = (String::new(), 0, 0);
         let text_of = |e: &Value, k: &str| e[k].as_str().unwrap_or_default().to_string();
         for e in read(path)? {
-            r.seq = r.seq.max(e["seq"].as_u64().unwrap_or(0));
+            seq = seq.max(e["seq"].as_u64().unwrap_or(0));
             match (e["type"].as_str().unwrap_or_default(), ctx.as_mut()) {
                 ("instance_start", _) => {
-                    r.model = text_of(&e, "model");
+                    model = text_of(&e, "model");
                 }
                 ("system", c) => {
                     let tools = e["tools"].as_array().cloned().unwrap_or_default();
@@ -736,10 +764,10 @@ pub mod events {
                         &text_of(&e, "summary"),
                         e["kept"].as_u64().unwrap_or(0) as usize,
                     );
-                    r.tokens_used = r.tokens_used.max(e["used"].as_i64().unwrap_or(0));
+                    tokens_used = tokens_used.max(e["used"].as_i64().unwrap_or(0));
                 }
                 ("tokens", Some(c)) => {
-                    r.tokens_used = r.tokens_used.max(e["used"].as_i64().unwrap_or(0));
+                    tokens_used = tokens_used.max(e["used"].as_i64().unwrap_or(0));
                     c.set_last_prompt_tokens(e["prompt"].as_i64().unwrap_or(0));
                 }
                 _ => {}
@@ -748,9 +776,14 @@ pub mod events {
         let Some(ctx) = ctx else {
             bail!("{} has no recorded context", path.display());
         };
-        r.pending = unanswered(&ctx.messages()[1..]);
-        r.ctx = ctx;
-        Ok(r)
+        let pending = unanswered(&ctx.messages()[1..]);
+        Ok(Replayed {
+            model,
+            ctx,
+            seq,
+            tokens_used,
+            pending,
+        })
     }
 
     /// Opens a user message carrying an instruction queued over the control socket.
@@ -1014,30 +1047,54 @@ A: {answer}",
             assert!(out.contains("# Follow-up requests\n- fix\n"), "{out}");
             assert!(out.contains("- name it --fast"), "{out}");
             assert!(out.contains("- Q: default on?\n  A: answer: no"), "{out}");
-            assert!(out.contains("# Earlier review findings\n- missing test"), "{out}");
-            assert!(out.ends_with("# Work pass report\n(stopped: max_iterations) added test\n"), "{out}");
+            assert!(
+                out.contains("# Earlier review findings\n- missing test"),
+                "{out}"
+            );
+            assert!(
+                out.ends_with("# Work pass report\n(stopped: max_iterations) added test\n"),
+                "{out}"
+            );
         }
 
         #[cfg(feature = "socket")]
         #[test]
         fn render_is_readable_and_skips_noise() {
             let r = |e: Value| render(&e);
-            assert_eq!(r(json!({"type":"user","content":" hi "})).as_deref(), Some("> hi"));
+            assert_eq!(
+                r(json!({"type":"user","content":" hi "})).as_deref(),
+                Some("> hi")
+            );
             assert_eq!(r(json!({"type":"assistant","content":" "})), None);
             assert_eq!(r(json!({"type":"tokens","used":1})), None);
             assert_eq!(r(json!({"type":"status","status":"x"})), None);
             assert_eq!(
-                r(json!({"type":"tool_call","id":"a","name":"read","arguments":{"path":"x"}})).as_deref(),
+                r(json!({"type":"tool_call","id":"a","name":"read","arguments":{"path":"x"}}))
+                    .as_deref(),
                 Some(r#"-> read({"path":"x"})"#)
             );
             let ok = r(json!({"type":"tool_result","name":"bash","is_error":false,"duration_ms":12,"result":"abc"})).unwrap();
             assert_eq!(ok, "<- bash ok 12ms (3 bytes)");
-            let err = r(json!({"type":"tool_result","name":"bash","is_error":true,"result":"boom\nmore"})).unwrap();
+            let err = r(
+                json!({"type":"tool_result","name":"bash","is_error":true,"result":"boom\nmore"}),
+            )
+            .unwrap();
             assert_eq!(err, "<- bash ERROR: boom more");
-            let ask = r(json!({"type":"tool_call","id":"c7","name":"ask","arguments":
-                {"question":"db?","options":["pg","sqlite"],"recommended":"pg"}})).unwrap();
-            assert!(ask.contains("? db?") && ask.contains("pg | sqlite") && ask.contains("/answer c7 <text>"), "{ask}");
-            assert_eq!(r(json!({"type":"instance_end","status":"stopped","reason":"user"})).as_deref(), Some("== ended: stopped (user)"));
+            let ask = r(
+                json!({"type":"tool_call","id":"c7","name":"ask","arguments":
+                {"question":"db?","options":["pg","sqlite"],"recommended":"pg"}}),
+            )
+            .unwrap();
+            assert!(
+                ask.contains("? db?")
+                    && ask.contains("pg | sqlite")
+                    && ask.contains("/answer c7 <text>"),
+                "{ask}"
+            );
+            assert_eq!(
+                r(json!({"type":"instance_end","status":"stopped","reason":"user"})).as_deref(),
+                Some("== ended: stopped (user)")
+            );
         }
 
         #[test]
@@ -1099,12 +1156,16 @@ pub mod proc {
             let _ = f.seek(SeekFrom::Start(len - half));
             let _ = f.read_to_end(&mut tail);
         }
-        let mut out = String::from_utf8_lossy(&head).into_owned();
-        if !tail.is_empty() {
-            out.push_str(&format!("\n… [{} bytes omitted] …\n", len - 2 * half));
-            out.push_str(&String::from_utf8_lossy(&tail));
+        let head = String::from_utf8_lossy(&head);
+        if tail.is_empty() {
+            head.into_owned()
+        } else {
+            crate::llm::join_head_tail(
+                &head,
+                &String::from_utf8_lossy(&tail),
+                (len - 2 * half) as usize,
+            )
         }
-        out
     }
 
     /// Whether a process with this pid exists.

@@ -189,10 +189,12 @@ impl Control {
     /// Send a line to every watcher. A watcher that is not keeping up misses lines;
     /// one that has gone is forgotten. Never blocks.
     pub fn publish(&self, line: &str) {
-        self.watchers
-            .lock()
-            .unwrap()
-            .retain(|tx| !matches!(tx.try_send(line.to_string()), Err(TrySendError::Disconnected(_))));
+        self.watchers.lock().unwrap().retain(|tx| {
+            !matches!(
+                tx.try_send(line.to_string()),
+                Err(TrySendError::Disconnected(_))
+            )
+        });
     }
 
     #[cfg(feature = "socket")]
@@ -268,7 +270,10 @@ impl Control {
                 if !line.is_empty()
                     && let Err(e) = c.apply(line)
                 {
-                    eprintln!("error: stdin command `{}`: {e:#}", crate::llm::truncate(line, 80));
+                    eprintln!(
+                        "error: stdin command `{}`: {e:#}",
+                        crate::llm::truncate(line, 80)
+                    );
                 }
             }
         });
@@ -344,7 +349,14 @@ mod tests {
 
     #[test]
     fn stdin_commands_queue_answer_and_stop() {
-        let ctrl = Control::new(None, Arc::new(RwLock::new(ContextComposer::new(String::new(), Vec::new(), 1000))));
+        let ctrl = Control::new(
+            None,
+            Arc::new(RwLock::new(ContextComposer::new(
+                String::new(),
+                Vec::new(),
+                1000,
+            ))),
+        );
         let c = ctrl.clone();
         let h = std::thread::spawn(move || c.wait_answer("c1", Duration::from_secs(5)));
         std::thread::sleep(Duration::from_millis(100));
@@ -391,15 +403,25 @@ mod socket_tests {
 
     fn start(tag: &str, system: &str) -> (Arc<Control>, std::path::PathBuf) {
         let sock = temp_dir(tag).join("control.sock");
-        let composer = Arc::new(RwLock::new(ContextComposer::new(system.into(), Vec::new(), 1000)));
-        (Control::open(Some(sock.clone()), composer).expect("start control"), sock)
+        let composer = Arc::new(RwLock::new(ContextComposer::new(
+            system.into(),
+            Vec::new(),
+            1000,
+        )));
+        (
+            Control::open(Some(sock.clone()), composer).expect("start control"),
+            sock,
+        )
     }
 
     #[test]
     fn context_command_measures_the_shared_composer() {
         let (ctrl, sock) = start("control-ctx", "system");
         let snapshot = send(&sock, "/context").expect("send /context");
-        assert!(snapshot.contains("\"context_window\":1000"), "got: {snapshot}");
+        assert!(
+            snapshot.contains("\"context_window\":1000"),
+            "got: {snapshot}"
+        );
         assert!(snapshot.contains("\"messages\""), "got: {snapshot}");
         assert!(snapshot.contains("\"system\""), "got: {snapshot}");
         ctrl.shutdown();
@@ -408,7 +430,11 @@ mod socket_tests {
     #[test]
     fn answer_command_wakes_wait_answer() {
         let (ctrl, sock) = start("control-answer", "");
-        assert!(send(&sock, "/answer call_1 \"blue\"").unwrap().starts_with("error"));
+        assert!(
+            send(&sock, "/answer call_1 \"blue\"")
+                .unwrap()
+                .starts_with("error")
+        );
         let c = ctrl.clone();
         let h = std::thread::spawn(move || c.wait_answer("call_1", Duration::from_secs(2)));
         std::thread::sleep(Duration::from_millis(100));

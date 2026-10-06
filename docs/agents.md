@@ -9,7 +9,7 @@ tools: read, ls, bash, finish                        # read write edit ls bash p
 skills: formal                                         # optional: skills inlined into the system prompt at start
 context: docs/notes.md                                 # optional: files (or `dir/` listings) put in front of a fresh instance's task, after which come those of forced skills (`metadata.context`)
 finish: handoff, blocked                             # optional: statuses `finish` accepts (default: done, handoff, blocked)
-spawns: explore                                      # optional: agents `spawn` may start, listed in the prompt (default: all)
+spawns: explore                                      # optional: agents `spawn` and a top-level handoff may target (default: all)
 model: some-model                                    # optional: overrides the provider's model
 internal: true                                       # optional: reached only through `hand_off`/`spawn`; front ends do not offer it for a new session
 review: true                                         # optional: each submitted run is judged by a review pass, see below
@@ -72,7 +72,8 @@ An agent ends a run by calling `finish`:
 - `blocked`: a human must step in.
 
 `finish` rejects statuses outside the agent's `finish:` list, unknown agents and
-an empty summary. Every agent with `finish` sees the list of agents in its system
+an empty summary. A top-level `handoff` target must also be allowed by `spawns:`;
+a subagent may only hand off to the agent that spawned it. Every agent with `finish` sees the list of agents in its system
 prompt. The verdict is recorded in `instance_end.result`; it is `null` when the
 model stops without calling `finish`.
 

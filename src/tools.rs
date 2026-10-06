@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::agent::Agent;
-use crate::config::AgentDef;
+use crate::config::{AgentDef, DEFAULT_FINISH};
 use crate::storage::events;
 use crate::storage::proc;
 use crate::storage::util::{TempPath, relative_path, sanitize, slugify, tmp_file, write_file};
@@ -49,7 +49,11 @@ fn read(agent: &mut Agent, args: &Value) -> Result<String> {
         writeln!(out, "{:>6}\t{line}", i + 1)?;
     }
     if end < total {
-        writeln!(out, "\n[showing lines {}-{end} of {total}; pass offset/limit for the rest]", start + 1)?;
+        writeln!(
+            out,
+            "\n[showing lines {}-{end} of {total}; pass offset/limit for the rest]",
+            start + 1
+        )?;
     }
     Ok(out)
 }
@@ -91,7 +95,10 @@ fn find_fuzzy(hay: &str, needle: &str) -> Option<(usize, usize)> {
     }
 }
 
-fn find_unique(hay: &str, needle: &str) -> Result<(usize, usize)> {
+/// The byte range of `needle` in `hay`. An exact match is preferred; when there is none and
+/// `all` is false, a whitespace-insensitive line window is tried. With `all`, a non-unique
+/// match is allowed (the caller replaces every occurrence).
+fn find_match(hay: &str, needle: &str, all: bool) -> Result<(usize, usize)> {
     if needle.is_empty() {
         bail!("oldText must not be empty");
     }
@@ -99,10 +106,12 @@ fn find_unique(hay: &str, needle: &str) -> Result<(usize, usize)> {
     let shown = || needle.chars().take(60).collect::<String>();
     match (it.next(), it.next()) {
         (Some((i, _)), None) => Ok((i, i + needle.len())),
+        (Some((i, _)), Some(_)) if all => Ok((i, i + needle.len())),
+        (Some(_), Some(_)) => bail!("oldText is not unique: {:?}", shown()),
+        (None, _) if all => bail!("oldText not found: {:?}", shown()),
         (None, _) => {
             find_fuzzy(hay, needle).ok_or_else(|| anyhow!("oldText not found: {:?}", shown()))
         }
-        (Some(_), Some(_)) => bail!("oldText is not unique: {:?}", shown()),
     }
 }
 
@@ -110,14 +119,12 @@ fn apply_edits(content: &str, edits: &[(String, String)], replace_all: bool) -> 
     if let [(old, new)] = edits
         && replace_all
     {
-        if old.is_empty() || !content.contains(old.as_str()) {
-            bail!("oldText is empty or not found");
-        }
+        find_match(content, old, true)?;
         return Ok(content.replace(old.as_str(), new));
     }
     let mut ranges = Vec::new();
     for (old, new) in edits {
-        let (start, end) = find_unique(content, old)?;
+        let (start, end) = find_match(content, old, false)?;
         ranges.push((start, end, new));
     }
     ranges.sort_by_key(|r| r.0);
@@ -370,11 +377,20 @@ fn string_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D:
     match Value::deserialize(d)? {
         Value::Array(items) => items
             .into_iter()
-            .map(|v| v.as_str().map(str::to_string).ok_or_else(|| D::Error::custom("options must be an array of strings")))
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| D::Error::custom("options must be an array of strings"))
+            })
             .collect(),
-        Value::String(s) => serde_json::from_str::<Vec<String>>(&s)
-            .map_err(|_| D::Error::custom("options must be a JSON array of 2-6 strings, e.g. [\"A\", \"B\"], not a string")),
-        _ => Err(D::Error::custom("options must be a JSON array of 2-6 strings")),
+        Value::String(s) => serde_json::from_str::<Vec<String>>(&s).map_err(|_| {
+            D::Error::custom(
+                "options must be a JSON array of 2-6 strings, e.g. [\"A\", \"B\"], not a string",
+            )
+        }),
+        _ => Err(D::Error::custom(
+            "options must be a JSON array of 2-6 strings",
+        )),
     }
 }
 
@@ -449,24 +465,45 @@ fn validate_finish(
     match (&v.next, v.status == "handoff") {
         (None, true) => bail!("status handoff needs `next` {{agent, task}}"),
         (Some(_), false) => bail!("`next` is only for status handoff"),
-        (Some(n), true) => {
-            if !agents.contains_key(&n.agent) {
-                bail!(
-                    "unknown agent `{}`; available: {}",
-                    n.agent,
-                    agents.keys().cloned().collect::<Vec<_>>().join(", ")
-                );
-            }
-            if n.task.trim().is_empty() {
-                bail!("next.task must not be empty");
-            }
-            if let Some(p) = parent.filter(|p| *p != n.agent) {
-                bail!("a subagent hands off to its parent agent `{p}`");
-            }
-        }
+        (Some(n), true) => validate_handoff(def, agents, parent, n)?,
         (None, false) => {}
     }
     Ok(v)
+}
+
+/// The target a handoff continues with: the agent exists, the task stands alone, and a
+/// top-level handoff respects the `spawns:` gate. A subagent may only report to its parent.
+fn validate_handoff(
+    def: &AgentDef,
+    agents: &BTreeMap<String, AgentDef>,
+    parent: Option<&str>,
+    next: &Next,
+) -> Result<()> {
+    if !agents.contains_key(&next.agent) {
+        bail!(
+            "unknown agent `{}`; available: {}",
+            next.agent,
+            agents.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    if next.task.trim().is_empty() {
+        bail!("next.task must not be empty");
+    }
+    match parent {
+        Some(p) if p != next.agent => bail!("a subagent hands off to its parent agent `{p}`"),
+        Some(_) => Ok(()),
+        None => check_may_spawn(def, agents, &next.agent),
+    }
+}
+
+/// Record what the run declares when it stops; only one may be recorded.
+fn claim_verdict(agent: &mut Agent, v: Verdict, handed_off: bool) -> Result<String> {
+    if agent.verdict.is_some() {
+        bail!("a verdict was already recorded");
+    }
+    agent.handed_off = handed_off;
+    agent.verdict = Some(v);
+    Ok("ok".into())
 }
 
 fn finish(agent: &mut Agent, args: &Value) -> Result<String> {
@@ -476,11 +513,7 @@ fn finish(agent: &mut Agent, args: &Value) -> Result<String> {
         agent.parent_agent.as_deref(),
         args,
     )?;
-    if agent.verdict.is_some() {
-        bail!("finish was already called");
-    }
-    agent.verdict = Some(v);
-    Ok("ok".into())
+    claim_verdict(agent, v, false)
 }
 
 #[derive(Deserialize)]
@@ -490,11 +523,14 @@ struct HandOffArgs {
 }
 
 /// Fails unless this agent's definition allows starting `target` (`spawns:`; default: every agent).
-fn check_may_spawn(agent: &Agent, target: &str) -> Result<()> {
-    let allowed: Vec<_> = agent
-        .agents
+fn check_may_spawn(
+    def: &AgentDef,
+    agents: &BTreeMap<String, AgentDef>,
+    target: &str,
+) -> Result<()> {
+    let allowed: Vec<_> = agents
         .keys()
-        .filter(|n| agent.def.may_spawn(n))
+        .filter(|n| def.may_spawn(n))
         .cloned()
         .collect();
     if !allowed.iter().any(|n| n == target) {
@@ -509,23 +545,20 @@ fn hand_off(agent: &mut Agent, args: &Value) -> Result<String> {
     if agent.parent_agent.is_some() {
         bail!("a subagent reports with `finish`, not `hand_off`");
     }
-    check_may_spawn(agent, &a.agent)?;
-    if a.task.trim().is_empty() {
-        bail!("task must not be empty");
-    }
-    if agent.verdict.is_some() {
-        bail!("finish or hand_off was already called");
-    }
-    agent.verdict = Some(Verdict {
-        status: "handoff".into(),
-        summary: format!("handed off to {}", a.agent),
-        next: Some(Next {
-            agent: a.agent,
-            task: a.task,
-        }),
-    });
-    agent.handed_off = true;
-    Ok("ok".into())
+    let next = Next {
+        agent: a.agent,
+        task: a.task,
+    };
+    validate_handoff(&agent.def, &agent.agents, None, &next)?;
+    claim_verdict(
+        agent,
+        Verdict {
+            status: "handoff".into(),
+            summary: format!("handed off to {}", next.agent),
+            next: Some(next),
+        },
+        true,
+    )
 }
 
 #[derive(Deserialize)]
@@ -541,9 +574,6 @@ fn verdict(agent: &mut Agent, args: &Value) -> Result<String> {
     if a.notes.trim().is_empty() {
         bail!("notes must not be empty");
     }
-    if agent.verdict.is_some() {
-        bail!("verdict was already called");
-    }
     let next = match a.verdict.as_str() {
         "done" | "reject" | "blocked" => None,
         "handoff" => Some(Next {
@@ -552,13 +582,16 @@ fn verdict(agent: &mut Agent, args: &Value) -> Result<String> {
         }),
         v => bail!("verdict must be one of: done, reject, handoff, blocked (got `{v}`)"),
     };
-    agent.handed_off = next.is_some();
-    agent.verdict = Some(Verdict {
-        status: a.verdict,
-        summary: a.notes,
-        next,
-    });
-    Ok("ok".into())
+    let handed_off = next.is_some();
+    claim_verdict(
+        agent,
+        Verdict {
+            status: a.verdict,
+            summary: a.notes,
+            next,
+        },
+        handed_off,
+    )
 }
 
 // --- spawn ----------------------------------------------------------------
@@ -616,7 +649,7 @@ fn child_report(child: &str, agent: &str, events: &[Value], timed_out: bool, cap
 /// delivered as is, an unfinished one is stopped and resumed.
 fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
     let a: SpawnArgs = parse_args(args)?;
-    check_may_spawn(agent, &a.agent)?;
+    check_may_spawn(&agent.def, &agent.agents, &a.agent)?;
     if agent.depth >= agent.cfg.max_subagent_depth {
         bail!(
             "subagent depth limit reached ({} >= {})",
@@ -802,7 +835,7 @@ fn registry() -> &'static [Tool] {
             tool("finish", "End your run. done: the goal is achieved and verified. handoff: your part is done and `next.agent` continues with `next.task` (self-contained: goal, what is done, what is left, where the state lives). blocked: a human must step in.", json!({
                 "type":"object",
                 "properties":{
-                    "status":{"type":"string","enum":["done","handoff","blocked"]},
+                    "status":{"type":"string","enum":DEFAULT_FINISH},
                     "summary":{"type":"string","description":"What was done, the evidence, where the state lives"},
                     "next":{"type":"object","description":"Required for handoff only","properties":{
                         "agent":{"type":"string"},"task":{"type":"string"}
@@ -834,7 +867,7 @@ pub fn check(def: &AgentDef) -> Result<()> {
     if let Some(s) = def
         .finish
         .iter()
-        .find(|s| !["done", "handoff", "blocked"].contains(&s.as_str()))
+        .find(|s| !DEFAULT_FINISH.contains(&s.as_str()))
     {
         bail!("unknown finish status `{s}`");
     }
@@ -890,19 +923,6 @@ pub fn dispatch(agent: &mut Agent, name: &str, args: &Value) -> (String, bool) {
     )
 }
 
-/// The first two thirds and the last third of `max` bytes, cut on char boundaries.
-fn head_and_tail(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
-    let (mut head, mut tail) = (max * 2 / 3, max / 3);
-    while head > 0 && !s.is_char_boundary(head) {
-        head -= 1;
-    }
-    tail = s.len().saturating_sub(tail);
-    while tail < s.len() && !s.is_char_boundary(tail) {
-        tail += 1;
-    }
-    format!("{}\n[... {} bytes omitted ...]\n{}", &s[..head], tail - head, &s[tail..]).into()
-}
-
 /// Results over `max` bytes are clipped; the full text is spilled to a tmp file.
 fn bounded_result(workspace: &Path, max: usize, name: &str, text: String) -> String {
     if text.len() <= max {
@@ -910,11 +930,15 @@ fn bounded_result(workspace: &Path, max: usize, name: &str, text: String) -> Str
     }
     // Failures and summaries come last in command output, so keep the tail as well.
     let clipped = if name == "bash" {
-        head_and_tail(&text, max)
+        crate::llm::head_and_tail(&text, max)
     } else {
         crate::llm::truncate(&text, max)
     };
-    let path: PathBuf = tmp_file(&std::env::temp_dir(), &format!("tool-{}", sanitize(name)), "log");
+    let path: PathBuf = tmp_file(
+        &std::env::temp_dir(),
+        &format!("tool-{}", sanitize(name)),
+        "log",
+    );
     match write_file(&path, &text) {
         Ok(()) => format!(
             "{clipped}\n[result ({} bytes) written to {}; read it with the read tool]",
@@ -928,11 +952,12 @@ fn bounded_result(workspace: &Path, max: usize, name: &str, text: String) -> Str
 #[cfg(test)]
 mod tests {
     #[test]
-    fn head_and_tail_keeps_both_ends() {
+    fn results_over_the_cap_keep_both_ends() {
         let s = format!("{}MID{}", "a".repeat(100), "z".repeat(100));
-        let out = super::head_and_tail(&s, 30);
+        let out = crate::llm::head_and_tail(&s, 30);
         assert!(out.starts_with("aaaa") && out.ends_with("zzzz") && out.contains("omitted"));
         assert!(!out.contains("MID") && out.len() < 100);
+        assert_eq!(crate::llm::head_and_tail("short", 30), "short");
     }
 
     #[test]
@@ -962,9 +987,22 @@ mod tests {
     fn ask_options_accept_array_or_encoded_array_and_explain_otherwise() {
         let ok = |v: serde_json::Value| super::parse_args::<super::AskArgs>(&v);
         let base = |o: serde_json::Value| serde_json::json!({"question":"q","recommended":"a","options":o});
-        assert_eq!(ok(base(serde_json::json!(["a","b"]))).unwrap().options, ["a", "b"]);
-        assert_eq!(ok(base(serde_json::json!("[\"a\",\"b\"]"))).unwrap().options, ["a", "b"]);
-        let err = format!("{:#}", ok(base(serde_json::json!("\n<parameter name=\"option\">x"))).err().unwrap());
+        assert_eq!(
+            ok(base(serde_json::json!(["a", "b"]))).unwrap().options,
+            ["a", "b"]
+        );
+        assert_eq!(
+            ok(base(serde_json::json!("[\"a\",\"b\"]")))
+                .unwrap()
+                .options,
+            ["a", "b"]
+        );
+        let err = format!(
+            "{:#}",
+            ok(base(serde_json::json!("\n<parameter name=\"option\">x")))
+                .err()
+                .unwrap()
+        );
         assert!(err.contains("JSON array of 2-6 strings"), "{err}");
     }
 
@@ -977,7 +1015,9 @@ mod tests {
             name: "build".into(),
             description: String::new(),
             prompt: "work".into(),
-            tools: ["read", "write", "hand_off", "finish"].map(String::from).into(),
+            tools: ["read", "write", "hand_off", "finish"]
+                .map(String::from)
+                .into(),
             skills: vec![],
             context: vec![],
             finish: vec!["done".into()],
@@ -990,9 +1030,11 @@ mod tests {
 
     fn agent_for(def: config::AgentDef) -> Agent {
         use std::sync::{Arc, RwLock};
-        let context = Arc::new(RwLock::new(
-            crate::storage::context::ContextComposer::new(String::new(), vec![], 1000),
-        ));
+        let context = Arc::new(RwLock::new(crate::storage::context::ContextComposer::new(
+            String::new(),
+            vec![],
+            1000,
+        )));
         Agent::start(crate::agent::AgentParams {
             cfg: config::Config::default(),
             workspace: temp_dir("verdict"),
@@ -1014,7 +1056,10 @@ mod tests {
     #[test]
     fn a_review_pass_ends_with_a_verdict() {
         let r = reviewed_build().reviewer().unwrap();
-        assert_eq!((r.name.as_str(), r.worker(), r.prompt.as_str()), ("build:review", "build", "judge"));
+        assert_eq!(
+            (r.name.as_str(), r.worker(), r.prompt.as_str()),
+            ("build:review", "build", "judge")
+        );
         assert_eq!(r.tools, ["read", "write", "verdict"]);
         assert!(r.reviewer().is_none());
         let mut a = agent_for(r.clone());
@@ -1024,7 +1069,10 @@ mod tests {
         let v = a.verdict.clone().unwrap();
         let next = v.next.unwrap();
         assert!(a.handed_off && v.status == "handoff");
-        assert_eq!((next.agent.as_str(), next.task.as_str()), ("build", "part 2"));
+        assert_eq!(
+            (next.agent.as_str(), next.task.as_str()),
+            ("build", "part 2")
+        );
         assert!(verdict(&mut a, &json!({"verdict":"done","notes":"x"})).is_err());
         let mut a = agent_for(r);
         verdict(&mut a, &json!({"verdict":"reject","notes":"no test"})).unwrap();
@@ -1032,18 +1080,42 @@ mod tests {
     }
 
     #[test]
-    fn spawn_and_hand_off_honour_the_spawns_gate() {
+    fn handoffs_honour_the_spawns_gate() {
         let mut def = reviewed_build();
+        def.finish = vec!["done".into(), "handoff".into()];
         def.spawns = Some(vec!["explore".into()]);
         let mut a = agent_for(def.clone());
         for n in ["explore", "plan"] {
-            a.agents.insert(n.into(), config::AgentDef { name: n.into(), ..def.clone() });
+            a.agents.insert(
+                n.into(),
+                config::AgentDef {
+                    name: n.into(),
+                    ..def.clone()
+                },
+            );
         }
         let err = |r: Result<String>| format!("{:#}", r.unwrap_err());
         let e = err(spawn(&mut a, &json!({"agent":"plan","instructions":"x"})));
-        assert!(e.contains("cannot spawn `plan`") && e.contains("explore"), "{e}");
+        assert!(
+            e.contains("cannot spawn `plan`") && e.contains("explore"),
+            "{e}"
+        );
         let e = err(hand_off(&mut a, &json!({"agent":"plan","task":"x"})));
         assert!(e.contains("cannot spawn `plan`"), "{e}");
+        // A `finish` handoff uses the same gate, for both a top-level target and a parent.
+        let fail = |parent: Option<&str>, to: &str| {
+            let v = json!({"status":"handoff","summary":"s","next":{"agent":to,"task":"x"}});
+            format!(
+                "{:#}",
+                validate_finish(&a.def, &a.agents, parent, &v).unwrap_err()
+            )
+        };
+        let ok = |parent: Option<&str>, to: &str| {
+            let v = json!({"status":"handoff","summary":"s","next":{"agent":to,"task":"x"}});
+            validate_finish(&a.def, &a.agents, parent, &v).is_ok()
+        };
+        assert!(fail(None, "plan").contains("cannot spawn `plan`"));
+        assert!(ok(None, "explore") && ok(Some("plan"), "plan"));
     }
 
     fn e(old: &str, new: &str) -> (String, String) {
@@ -1080,11 +1152,18 @@ mod tests {
         for f in ["keep.txt", "skip.txt", "sub/inner.txt"] {
             std::fs::write(ws.join(f), "x").unwrap();
         }
-        let git = std::process::Command::new("git").arg("init").arg("-q").current_dir(&ws).status();
+        let git = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(&ws)
+            .status();
         let (mut lines, mut counts) = (Vec::new(), (0, 0));
         walk(&ws, 1, false, &mut lines, &mut counts, &ws);
         let text = lines.join("\n");
-        assert!(text.contains("keep.txt") && text.contains("sub/inner.txt"), "{text}");
+        assert!(
+            text.contains("keep.txt") && text.contains("sub/inner.txt"),
+            "{text}"
+        );
         assert!(!text.contains(".gitignore"), "{text}");
         if git.is_ok_and(|s| s.success()) {
             assert!(!text.contains("skip.txt"), "{text}");
@@ -1097,13 +1176,14 @@ mod tests {
         assert_eq!(bounded_result(&ws, 100, "bash", "short".into()), "short");
         let out = bounded_result(&ws, 100, "bash", "x".repeat(500));
         assert!(out.contains("written to /tmp/tool-bash-"), "{out}");
-        let log = out.split("written to ").nth(1).unwrap().split(';').next().unwrap();
-        assert_eq!(
-            std::fs::read_to_string(log)
-                .unwrap()
-                .len(),
-            500
-        );
+        let log = out
+            .split("written to ")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(log).unwrap().len(), 500);
     }
 
     #[test]
@@ -1112,8 +1192,14 @@ mod tests {
         config::tests::write_agents(
             &ws,
             &[
-                ("lead", "---\ntools: read, plan_write, finish\nfinish: done, handoff, blocked\n---\nl"),
-                ("worker", "---\ntools: read, finish\nfinish: handoff, blocked\n---\nw"),
+                (
+                    "lead",
+                    "---\ntools: read, plan_write, finish\nfinish: done, handoff, blocked\n---\nl",
+                ),
+                (
+                    "worker",
+                    "---\ntools: read, finish\nfinish: handoff, blocked\n---\nw",
+                ),
             ],
         );
         let agents = config::load_agents(&ws);
@@ -1150,9 +1236,18 @@ mod tests {
         config::tests::write_agents(
             &ws,
             &[
-                ("lead", "---\ntools: read, finish\nfinish: done, handoff, blocked\n---\nl"),
-                ("worker", "---\ntools: read, finish\nfinish: handoff, blocked\n---\nw"),
-                ("scout", "---\ntools: read, finish\nfinish: handoff, blocked\n---\ns"),
+                (
+                    "lead",
+                    "---\ntools: read, finish\nfinish: done, handoff, blocked\n---\nl",
+                ),
+                (
+                    "worker",
+                    "---\ntools: read, finish\nfinish: handoff, blocked\n---\nw",
+                ),
+                (
+                    "scout",
+                    "---\ntools: read, finish\nfinish: handoff, blocked\n---\ns",
+                ),
             ],
         );
         let agents = config::load_agents(&ws);
@@ -1201,8 +1296,14 @@ mod tests {
         let ok = end(
             json!({"status": "handoff", "summary": "s", "next": {"agent": "plan", "task": "findings"}}),
         );
-        let v: Value =
-            serde_json::from_str(&child_report("c", "explore", &events::parse_lines(&ok), false, 1000)).unwrap();
+        let v: Value = serde_json::from_str(&child_report(
+            "c",
+            "explore",
+            &events::parse_lines(&ok),
+            false,
+            1000,
+        ))
+        .unwrap();
         assert_eq!(
             (
                 v["status"].as_str(),
@@ -1216,11 +1317,18 @@ mod tests {
             json!({"type": "assistant", "content": "I looked"}),
             end(Value::Null)
         );
-        let v: Value =
-            serde_json::from_str(&child_report("c", "explore", &events::parse_lines(&no_verdict), false, 1000)).unwrap();
+        let v: Value = serde_json::from_str(&child_report(
+            "c",
+            "explore",
+            &events::parse_lines(&no_verdict),
+            false,
+            1000,
+        ))
+        .unwrap();
         assert_eq!(v["status"], "blocked");
         assert!(v["report"].as_str().unwrap().contains("I looked"));
-        let v: Value = serde_json::from_str(&child_report("c", "explore", &[], true, 1000)).unwrap();
+        let v: Value =
+            serde_json::from_str(&child_report("c", "explore", &[], true, 1000)).unwrap();
         assert_eq!(
             (v["status"].as_str(), v["run"].as_str()),
             (Some("blocked"), Some("timed_out"))

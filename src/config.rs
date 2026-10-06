@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -8,10 +9,21 @@ use crate::storage::util::{split_frontmatter, tmp_file, valid_slug, write_file};
 /// Subcommand names an agent may not take.
 pub const RESERVED: [&str; 2] = ["init", "help"];
 
+/// Statuses `finish` accepts when an agent's `finish:` line does not narrow them.
+pub const DEFAULT_FINISH: [&str; 3] = ["done", "handoff", "blocked"];
+
 /// The agent definitions `genji init` writes, with their review prompts; they are not read at run time.
 const DEFAULT_AGENTS: [(&str, &str, Option<&str>); 4] = [
-    ("plan", include_str!("agents/plan.md"), Some(include_str!("agents/review/plan.md"))),
-    ("build", include_str!("agents/build.md"), Some(include_str!("agents/review/build.md"))),
+    (
+        "plan",
+        include_str!("agents/plan.md"),
+        Some(include_str!("agents/review/plan.md")),
+    ),
+    (
+        "build",
+        include_str!("agents/build.md"),
+        Some(include_str!("agents/review/build.md")),
+    ),
     ("explore", include_str!("agents/explore.md"), None),
     ("retro", include_str!("agents/retro.md"), None),
 ];
@@ -19,21 +31,6 @@ const DEFAULT_AGENTS: [(&str, &str, Option<&str>); 4] = [
 /// `<workspace>/.genji/<name>`.
 pub fn dot(workspace: &Path, name: &str) -> PathBuf {
     workspace.join(".genji").join(name)
-}
-
-static SKILLS_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
-/// Makes [`skills_dir`] return `dir` (the config's `skills_dir`) instead of the workspace default.
-pub fn set_skills_dir(dir: PathBuf) {
-    let _ = SKILLS_DIR.set(dir);
-}
-
-/// The configured skills directory, else `<workspace>/.agents/skills`.
-pub fn skills_dir(workspace: &Path) -> PathBuf {
-    SKILLS_DIR
-        .get()
-        .cloned()
-        .unwrap_or_else(|| workspace.join(".agents").join("skills"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,8 +147,24 @@ impl Config {
         serde_json::from_str(text).context("parsing --config-json")
     }
 
-    /// Read `path`, or `.genji/config.json` when `path` is None, writing the defaults first
-    /// when that default file is missing.
+    /// Read `path`, or `.genji/config.json` when `path` is None. A missing default file
+    /// yields the built-in defaults; a missing explicit file is an error.
+    pub fn load(workspace: &Path, path: Option<&Path>) -> Result<Self> {
+        let default = dot(workspace, "config.json");
+        let path = path.unwrap_or(&default);
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if path == default && e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Config::default());
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading config {}", path.display()));
+            }
+        };
+        serde_json::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+    }
+
+    /// Like [`Config::load`], but writes the defaults first when the default file is missing.
     pub fn load_or_create(workspace: &Path, path: Option<&Path>) -> Result<Self> {
         let default = dot(workspace, "config.json");
         let path = path.unwrap_or(&default);
@@ -160,9 +173,7 @@ impl Config {
             write_file(path, format!("{}\n", serde_json::to_string_pretty(&cfg)?))?;
             return Ok(cfg);
         }
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config {}", path.display()))?;
-        serde_json::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+        Self::load(workspace, Some(path))
     }
 
     pub fn sessions(&self, workspace: &Path) -> PathBuf {
@@ -176,6 +187,13 @@ impl Config {
         self.agents_dir
             .clone()
             .unwrap_or_else(|| agents_dir(workspace))
+    }
+
+    /// Where skills live: `skills_dir`, else `<workspace>/.agents/skills`.
+    pub fn skills(&self, workspace: &Path) -> PathBuf {
+        self.skills_dir
+            .clone()
+            .unwrap_or_else(|| workspace.join(".agents").join("skills"))
     }
 
     /// The per-run token budget: the top-level `token_limit` when set, else the provider's.
@@ -244,12 +262,23 @@ impl AgentDef {
 
     /// Whether `spawn` may start `agent`.
     pub fn may_spawn(&self, agent: &str) -> bool {
-        self.spawns.as_ref().is_none_or(|l| l.iter().any(|n| n == agent))
+        self.spawns
+            .as_ref()
+            .is_none_or(|l| l.iter().any(|n| n == agent))
     }
 
     /// The agent whose work this pass belongs to: itself, or for a review pass its worker.
     pub fn worker(&self) -> &str {
         self.name.strip_suffix(REVIEW_SUFFIX).unwrap_or(&self.name)
+    }
+
+    /// The summary `genji help agent --json` prints.
+    pub fn info(&self) -> Value {
+        json!({
+            "name": self.name, "description": self.description, "tools": self.tools,
+            "skills": self.skills, "finish": self.finish, "model": self.model,
+            "internal": self.internal, "review": self.review.is_some()
+        })
     }
 }
 
@@ -262,22 +291,24 @@ fn list(meta: &BTreeMap<String, String>, key: &str) -> Option<Vec<String>> {
     })
 }
 
-fn parse_agent(name: &str, text: &str) -> AgentDef {
+/// Parses `<name>.md`; the flag is whether its frontmatter asks for a review pass.
+fn parse_agent(name: &str, text: &str) -> (AgentDef, bool) {
     let (meta, prompt) = split_frontmatter(text);
-    AgentDef {
+    let review = meta.get("review").is_some_and(|v| v == "true");
+    let def = AgentDef {
         name: name.to_string(),
         description: meta.get("description").cloned().unwrap_or_default(),
         prompt,
         tools: list(&meta, "tools").unwrap_or_default(),
         skills: list(&meta, "skills").unwrap_or_default(),
         context: list(&meta, "context").unwrap_or_default(),
-        finish: list(&meta, "finish")
-            .unwrap_or_else(|| ["done", "handoff", "blocked"].map(String::from).into()),
+        finish: list(&meta, "finish").unwrap_or_else(|| DEFAULT_FINISH.map(String::from).into()),
         spawns: list(&meta, "spawns"),
         model: meta.get("model").filter(|m| !m.is_empty()).cloned(),
         internal: meta.get("internal").is_some_and(|v| v == "true"),
         review: None,
-    }
+    };
+    (def, review)
 }
 
 pub fn agents_dir(workspace: &Path) -> PathBuf {
@@ -292,10 +323,12 @@ pub struct InitReport {
 }
 
 /// Writes the default agent definitions to `.genji/agents/<name>.md`. Existing files are kept
-/// unless `force`; `only` limits the agents considered (all defaults when empty). When the
-/// directory does not exist yet, it appears complete or not at all.
+/// unless `force`; `only` limits the agents considered (all defaults when empty).
 pub fn init_agents(workspace: &Path, force: bool, only: &[String]) -> Result<InitReport> {
-    if let Some(n) = only.iter().find(|n| !DEFAULT_AGENTS.iter().any(|(d, ..)| d == n)) {
+    if let Some(n) = only
+        .iter()
+        .find(|n| !DEFAULT_AGENTS.iter().any(|(d, ..)| d == n))
+    {
         anyhow::bail!("no default agent named `{n}`");
     }
     // `(file stem relative to the agents dir, text)`: each agent, then its review prompt.
@@ -308,35 +341,19 @@ pub fn init_agents(workspace: &Path, force: bool, only: &[String]) -> Result<Ini
         })
         .collect();
     let dir = agents_dir(workspace);
-    let mut report = InitReport::default();
-    if !dir.exists() {
-        let parent = dir.parent().unwrap_or(workspace);
-        std::fs::create_dir_all(parent)?;
-        let tmp = tmp_file(parent, "agents", "d");
-        std::fs::create_dir_all(&tmp)?;
-        for (n, text) in &chosen {
-            write_file(&tmp.join(format!("{n}.md")), text)?;
-        }
-        if std::fs::rename(&tmp, &dir).is_ok() {
-            report.written = chosen.into_iter().map(|(n, _)| n).collect();
-            return Ok(report);
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
     std::fs::create_dir_all(&dir)?;
+    let mut report = InitReport::default();
     for (n, text) in chosen {
         let path = dir.join(format!("{n}.md"));
+        if path.exists() && !force {
+            report.skipped.push(n);
+            continue;
+        }
+        // Write to a scratch file and rename, so a crash never leaves a half-written definition.
         let tmp = tmp_file(&dir, &n, "tmp");
         write_file(&tmp, text)?;
-        let placed = if force {
-            std::fs::rename(&tmp, &path).is_ok()
-        } else {
-            let linked = std::fs::hard_link(&tmp, &path).is_ok();
-            let _ = std::fs::remove_file(&tmp);
-            linked
-        };
-        let list = if placed { &mut report.written } else { &mut report.skipped };
-        list.push(n);
+        std::fs::rename(&tmp, &path)?;
+        report.written.push(n);
     }
     Ok(report)
 }
@@ -351,6 +368,7 @@ pub fn ensure_agents(workspace: &Path) -> Result<()> {
 
 /// The agents defined by `.genji/agents/<name>.md`, and nothing else. Reserved or malformed
 /// definitions are skipped with a warning.
+#[cfg(test)]
 pub fn load_agents(workspace: &Path) -> BTreeMap<String, AgentDef> {
     load_agents_from(&agents_dir(workspace))
 }
@@ -358,10 +376,7 @@ pub fn load_agents(workspace: &Path) -> BTreeMap<String, AgentDef> {
 /// The agents defined by `<dir>/<name>.md`, and nothing else.
 pub fn load_agents_from(dir: &Path) -> BTreeMap<String, AgentDef> {
     let mut agents: BTreeMap<String, AgentDef> = BTreeMap::new();
-    let files = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten();
+    let files = std::fs::read_dir(dir).into_iter().flatten().flatten();
     for path in files
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "md"))
@@ -379,8 +394,8 @@ pub fn load_agents_from(dir: &Path) -> BTreeMap<String, AgentDef> {
             continue;
         }
         let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut def = parse_agent(&name, &text);
-        if split_frontmatter(&text).0.get("review").is_some_and(|v| v == "true") {
+        let (mut def, review) = parse_agent(&name, &text);
+        if review {
             let file = dir.join("review").join(format!("{name}.md"));
             match std::fs::read_to_string(&file) {
                 Ok(prompt) => def.review = Some(prompt),
@@ -481,12 +496,12 @@ fn find_skill_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Skills from `.agents/skills/` (found recursively; the first of a name wins).
+/// Skills from `dir` (found recursively; the first of a name wins).
 /// Malformed skills are skipped with a warning.
-pub fn load_skills(workspace: &Path) -> BTreeMap<String, Skill> {
+pub fn load_skills(dir: &Path) -> BTreeMap<String, Skill> {
     let mut skills = BTreeMap::new();
     let mut files = Vec::new();
-    find_skill_files(&skills_dir(workspace), &mut files);
+    find_skill_files(dir, &mut files);
     for path in files {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         let text = std::fs::read_to_string(&path).unwrap_or_default();
@@ -529,7 +544,14 @@ pub(crate) mod tests {
         let r = init_agents(&ws, false, &[]).unwrap();
         assert_eq!(
             r.written,
-            ["plan", "review/plan", "build", "review/build", "explore", "retro"]
+            [
+                "plan",
+                "review/plan",
+                "build",
+                "review/build",
+                "explore",
+                "retro"
+            ]
         );
         assert!(r.skipped.is_empty());
         let agents = load_agents(&ws);
@@ -542,8 +564,8 @@ pub(crate) mod tests {
         assert!(agents["plan"].review.is_some() && agents["build"].review.is_some());
         assert!(agents["explore"].review.is_none() && agents["retro"].review.is_none());
         assert!(agents["build"].context.is_empty());
-        assert!(load_skills(&ws).is_empty());
-        assert!(!skills_dir(&ws).exists());
+        assert!(load_skills(&Config::default().skills(&ws)).is_empty());
+        assert!(!Config::default().skills(&ws).exists());
     }
 
     #[test]
@@ -639,9 +661,15 @@ pub(crate) mod tests {
             &[
                 ("plan", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
                 ("build", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
-                ("explore", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
+                (
+                    "explore",
+                    "---\ntools: read\nfinish: blocked\n---\nreplaced",
+                ),
                 ("retro", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
-                ("alpha", "---\ntools: read, finish\nfinish: handoff, done\n---\na"),
+                (
+                    "alpha",
+                    "---\ntools: read, finish\nfinish: handoff, done\n---\na",
+                ),
             ],
         );
         let agents = load_agents(&ws);
@@ -653,7 +681,7 @@ pub(crate) mod tests {
     }
 
     fn skill(ws: &Path, rel: &str, text: &str) {
-        let path = skills_dir(ws).join(rel).join("SKILL.md");
+        let path = Config::default().skills(ws).join(rel).join("SKILL.md");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
     }
@@ -661,22 +689,34 @@ pub(crate) mod tests {
     #[test]
     fn workspace_skills_are_found_recursively() {
         let ws = temp_dir("skills");
-        skill(&ws, "formal", "---\nname: formal\ndescription: mine\n---\nbody\n");
+        skill(
+            &ws,
+            "formal",
+            "---\nname: formal\ndescription: mine\n---\nbody\n",
+        );
         skill(
             &ws,
             "group/pdf-tools",
             "---\nname: pdf-tools\ndescription: pdfs\nmetadata:\n  context: docs/a.md, docs/adr/\n---\nx\n",
         );
-        skill(&ws, "hidden", "---\ndescription: manual only\ndisable-model-invocation: true\n---\nx\n");
+        skill(
+            &ws,
+            "hidden",
+            "---\ndescription: manual only\ndisable-model-invocation: true\n---\nx\n",
+        );
         skill(&ws, "Bad_Name", "---\ndescription: d\n---\nx\n");
         skill(&ws, "nodesc", "---\nname: nodesc\n---\nx\n");
-        let skills = load_skills(&ws);
+        let skills = load_skills(&Config::default().skills(&ws));
         assert_eq!(
             skills.keys().map(String::as_str).collect::<Vec<_>>(),
             ["formal", "hidden", "pdf-tools"]
         );
         assert_eq!(skills["formal"].description, "mine");
-        assert!(skills["formal"].path.ends_with(".agents/skills/formal/SKILL.md"));
+        assert!(
+            skills["formal"]
+                .path
+                .ends_with(".agents/skills/formal/SKILL.md")
+        );
         assert!(skills["hidden"].disable_model_invocation);
         assert_eq!(skills["pdf-tools"].context, ["docs/a.md", "docs/adr/"]);
         assert!(skills["formal"].context.is_empty());

@@ -237,12 +237,12 @@ impl LlmClient {
             ))?
         } else {
             serde_json::to_vec(&Request {
-            model: &self.model,
-            messages: Messages(messages, hint),
-            stream: false,
-            tools,
-            tool_choice: (p.send_tool_choice && !tools.is_empty()).then_some("auto"),
-            max_tokens: BTreeMap::from([(p.max_tokens_field.as_str(), p.max_output_tokens)]),
+                model: &self.model,
+                messages: Messages(messages, hint),
+                stream: false,
+                tools,
+                tool_choice: (p.send_tool_choice && !tools.is_empty()).then_some("auto"),
+                max_tokens: BTreeMap::from([(p.max_tokens_field.as_str(), p.max_output_tokens)]),
             })?
         };
         if let Some(dir) = std::env::var_os("GENJI_DUMP_REQUESTS") {
@@ -279,7 +279,11 @@ impl LlmClient {
         let url = format!(
             "{}/{}",
             p.base_url.trim_end_matches('/'),
-            if anthropic { "messages" } else { "chat/completions" }
+            if anthropic {
+                "messages"
+            } else {
+                "chat/completions"
+            }
         );
         let req = authorize(
             p,
@@ -293,8 +297,12 @@ impl LlmClient {
                     .into_string()
                     .map_err(|e| fail(anyhow!("reading llm response: {e}"), true))?;
                 // A garbled 200 (truncated JSON, a proxy's HTML page) is transient.
-                (if anthropic { parse_anthropic(&text) } else { parse_response(&text) })
-                    .map_err(|e| fail(e, true))
+                (if anthropic {
+                    parse_anthropic(&text)
+                } else {
+                    parse_response(&text)
+                })
+                .map_err(|e| fail(e, true))
             }
             Err(ureq::Error::Status(code, r)) => {
                 let retry_after = r
@@ -343,9 +351,8 @@ pub fn model_context_window(p: &Provider, model: &str) -> Option<i64> {
         .timeout(Duration::from_secs(5))
         .build();
     let base = p.base_url.trim_end_matches('/');
-    let get = |url: &str| -> Option<Value> {
-        authorize(p, agent.get(url)).call().ok()?.into_json().ok()
-    };
+    let get =
+        |url: &str| -> Option<Value> { authorize(p, agent.get(url)).call().ok()?.into_json().ok() };
     if p.api == "anthropic" {
         return get(&format!("{base}/models/{model}")).and_then(|v| v["max_input_tokens"].as_i64());
     }
@@ -444,7 +451,10 @@ fn anthropic_request(
             Role::System => system.push(m.content.as_str()),
             Role::User => {
                 if !m.content.is_empty() {
-                    push("user", serde_json::json!({"type": "text", "text": m.content}));
+                    push(
+                        "user",
+                        serde_json::json!({"type": "text", "text": m.content}),
+                    );
                 }
             }
             Role::Tool => push(
@@ -459,7 +469,10 @@ fn anthropic_request(
                 let mut any = false;
                 if !m.content.is_empty() {
                     any = true;
-                    push("assistant", serde_json::json!({"type": "text", "text": m.content}));
+                    push(
+                        "assistant",
+                        serde_json::json!({"type": "text", "text": m.content}),
+                    );
                 }
                 for c in &m.tool_calls {
                     any = true;
@@ -473,7 +486,10 @@ fn anthropic_request(
                     );
                 }
                 if !any {
-                    push("assistant", serde_json::json!({"type": "text", "text": "(no output)"}));
+                    push(
+                        "assistant",
+                        serde_json::json!({"type": "text", "text": "(no output)"}),
+                    );
                 }
             }
         }
@@ -577,6 +593,28 @@ pub fn truncate(s: &str, max: usize) -> Cow<'_, str> {
     ))
 }
 
+/// Join the kept head and tail of a text, noting how many bytes were dropped between them.
+pub fn join_head_tail(head: &str, tail: &str, omitted: usize) -> String {
+    format!("{head}\n[... {omitted} bytes omitted ...]\n{tail}")
+}
+
+/// Keep the first two thirds and the last third of `s`, cut on char boundaries; command
+/// output often puts the failure or summary at the end.
+pub fn head_and_tail(s: &str, max: usize) -> Cow<'_, str> {
+    if s.len() <= max {
+        return Cow::Borrowed(s);
+    }
+    let (mut head, mut tail) = (max * 2 / 3, max / 3);
+    while head > 0 && !s.is_char_boundary(head) {
+        head -= 1;
+    }
+    tail = s.len().saturating_sub(tail);
+    while tail < s.len() && !s.is_char_boundary(tail) {
+        tail += 1;
+    }
+    Cow::Owned(join_head_tail(&s[..head], &s[tail..], tail - head))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ChatMessage, Request, ToolCall, truncate};
@@ -588,6 +626,15 @@ mod tests {
         assert!(out.contains("truncated"));
         assert!(out.len() < 50 * 2 + 40);
         assert_eq!(truncate("hi", 10), "hi");
+    }
+
+    #[test]
+    fn head_and_tail_keeps_both_ends() {
+        let s = format!("{}MID{}", "a".repeat(100), "z".repeat(100));
+        let out = super::head_and_tail(&s, 30);
+        assert!(out.starts_with("aaaa") && out.ends_with("zzzz") && out.contains("omitted"));
+        assert!(!out.contains("MID") && out.len() < 100);
+        assert_eq!(super::head_and_tail("short", 30), "short");
     }
 
     #[test]
@@ -618,21 +665,28 @@ mod tests {
 
     fn m_last_cache(r: &serde_json::Value) -> String {
         let m = r["messages"].as_array().unwrap().last().unwrap();
-        m["content"].as_array().unwrap().last().unwrap()["cache_control"]["type"].as_str().unwrap().to_string()
+        m["content"].as_array().unwrap().last().unwrap()["cache_control"]["type"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     #[test]
     fn anthropic_request_merges_turns_and_maps_tools() {
         let mut a = ChatMessage::default();
-        a.tool_calls.push(ToolCall::new("t1", "read", r#"{"path":"x"}"#));
+        a.tool_calls
+            .push(ToolCall::new("t1", "read", r#"{"path":"x"}"#));
         let msgs = [
             ChatMessage::system("sys"),
             ChatMessage::user("go"),
             a,
             ChatMessage::tool_result("t1", "ok"),
         ];
-        let tools = [serde_json::json!({"type":"function","function":{"name":"read","description":"d","parameters":{"type":"object"}}})];
-        let r = super::anthropic_request("m", &msgs, Some(ChatMessage::user("[note] h")), &tools, 9);
+        let tools = [
+            serde_json::json!({"type":"function","function":{"name":"read","description":"d","parameters":{"type":"object"}}}),
+        ];
+        let r =
+            super::anthropic_request("m", &msgs, Some(ChatMessage::user("[note] h")), &tools, 9);
         assert_eq!(r["system"][0]["text"], "sys");
         assert_eq!(r["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(r["tools"][0]["cache_control"]["type"], "ephemeral");
@@ -652,7 +706,10 @@ mod tests {
         let r = super::parse_anthropic(body).unwrap();
         assert_eq!(r.message.content, "hi");
         assert_eq!(r.message.tool_calls[0].args(), r#"{"path":"x"}"#);
-        assert_eq!((r.prompt_tokens, r.cached_tokens, r.completion_tokens), (8, 3, 2));
+        assert_eq!(
+            (r.prompt_tokens, r.cached_tokens, r.completion_tokens),
+            (8, 3, 2)
+        );
         assert!(r.truncated);
     }
 

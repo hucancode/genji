@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -36,6 +36,44 @@ const CONTINUE: &str = "Continue from where you left off.";
 const TRUNCATED_HINT: &str = "Your last response was cut off by the output limit. Continue with smaller steps: split large writes into several edits.";
 const INTERRUPTED: &str = "ERROR: interrupted — genji stopped while this tool was running; it may have partially run. Verify the current state before retrying.";
 
+/// How a run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Done,
+    Failed,
+    Stopped,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Done => "done",
+            Status::Failed => "failed",
+            Status::Stopped => "stopped",
+        }
+    }
+}
+
+/// Why a stopped run stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    TokenLimit,
+    TimeLimit,
+    MaxIterations,
+    User,
+}
+
+impl StopReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StopReason::TokenLimit => "token_limit",
+            StopReason::TimeLimit => "time_limit",
+            StopReason::MaxIterations => "max_iterations",
+            StopReason::User => "user",
+        }
+    }
+}
+
 pub struct Agent {
     pub cfg: Config,
     pub workspace: PathBuf,
@@ -50,10 +88,8 @@ pub struct Agent {
     pub verdict: Option<Verdict>,
     /// Set by `hand_off`: genji continues with `verdict.next` instead of exiting.
     pub handed_off: bool,
-    /// How the run ended: done | failed | stopped.
-    pub status: &'static str,
-    /// Why a stopped run stopped: token_limit | time_limit | max_iterations | user.
-    pub reason: Option<&'static str>,
+    pub status: Status,
+    pub reason: Option<StopReason>,
     pub llm: LlmClient,
     skills: BTreeMap<String, Skill>,
     context: Arc<RwLock<ContextComposer>>,
@@ -246,17 +282,74 @@ fn should_prune(freed: i64, est_tokens: i64, window: i64, idle: Duration) -> boo
     worth_rewrite || cache_cold || pressure
 }
 
+const CONTEXT_OVERFLOW_HINTS: [&str; 5] = [
+    "context_length",
+    "context length",
+    "maximum context",
+    "too many tokens",
+    "exceeds the context",
+];
+
 fn is_context_overflow(err: &str) -> bool {
     let e = err.to_lowercase();
-    [
-        "context_length",
-        "context length",
-        "maximum context",
-        "too many tokens",
-        "exceeds the context",
-    ]
-    .iter()
-    .any(|k| e.contains(k))
+    CONTEXT_OVERFLOW_HINTS.iter().any(|k| e.contains(k))
+}
+
+/// The state `Agent::start` begins from: a fresh run, or one replayed from its session.
+struct StartState {
+    model: String,
+    seq: u64,
+    tokens_used: i64,
+    pending: Vec<ToolCall>,
+    recorded: Option<ContextComposer>,
+}
+
+impl StartState {
+    fn fresh(def: &AgentDef, provider: &Provider) -> Self {
+        Self {
+            model: def.model.clone().unwrap_or_else(|| provider.model.clone()),
+            seq: 0,
+            tokens_used: 0,
+            pending: Vec::new(),
+            recorded: None,
+        }
+    }
+
+    fn replayed(session: &Path, window: i64) -> Result<Self> {
+        let r = events::replay(session, window)?;
+        Ok(Self {
+            model: r.model,
+            seq: r.seq,
+            tokens_used: r.tokens_used,
+            pending: r.pending,
+            recorded: Some(r.ctx),
+        })
+    }
+}
+
+/// Bookkeeping for one `run_loop`: progress counters and the one-request hint.
+struct RunState {
+    iterations: usize,
+    truncations: u32,
+    overflow_retried: bool,
+    nudged: bool,
+    pruned_at: usize,
+    last_call: Instant,
+    hint: Option<String>,
+}
+
+impl RunState {
+    fn new(context_len: usize) -> Self {
+        Self {
+            iterations: 0,
+            truncations: 0,
+            overflow_retried: false,
+            nudged: false,
+            pruned_at: context_len,
+            last_call: Instant::now(),
+            hint: None,
+        }
+    }
 }
 
 impl Agent {
@@ -270,39 +363,30 @@ impl Agent {
             .join(format!("{}.jsonl", p.instance_id));
         let window = p.provider.context_window;
         let token_limit = p.cfg.token_limit(&p.provider);
-        let (model, seq, tokens_used, pending, recorded) = if p.resume {
-            let r = events::replay(&session, window)?;
-            (r.model, r.seq, r.tokens_used, r.pending, Some(r.ctx))
+        let start = if p.resume {
+            StartState::replayed(&session, window)?
         } else {
-            (
-                p.def
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| p.provider.model.clone()),
-                0,
-                0,
-                Vec::new(),
-                None,
-            )
+            StartState::fresh(&p.def, &p.provider)
         };
         let llm = LlmClient::new(
             p.provider,
-            model.clone(),
+            start.model.clone(),
             p.cfg.llm_max_retries,
             LLM_TIMEOUT_SECS,
         );
-        let events = EventEmitter::open(&p.instance_id, &session, seq)?.with_tap(p.control.clone());
+        let events =
+            EventEmitter::open(&p.instance_id, &session, start.seq)?.with_tap(p.control.clone());
         events.instance_start(
             &p.workspace.display().to_string(),
             &p.def.name,
-            &model,
+            &start.model,
             p.parent.as_deref(),
             p.depth,
             &p.task,
             p.resume,
         );
-        let skills = config::load_skills(&p.workspace);
-        let ctx = match recorded {
+        let skills = config::load_skills(&p.cfg.skills(&p.workspace));
+        let ctx = match start.recorded {
             Some(ctx) => ctx,
             None => {
                 let system = build_system(
@@ -329,20 +413,20 @@ impl Agent {
             call_id: String::new(),
             verdict: None,
             handed_off: false,
-            status: "done",
+            status: Status::Done,
             reason: None,
             llm,
             skills,
             context: p.context,
             control: p.control,
             events,
-            tokens_used,
+            tokens_used: start.tokens_used,
             token_limit,
             started: Instant::now(),
             seen: HashMap::new(),
         };
         // `spawn`, `finish`, `hand_off` and `verdict` are safe to run again; any other call may have partly run.
-        for tc in pending {
+        for tc in start.pending {
             if matches!(tc.name(), "spawn" | "finish" | "hand_off" | "verdict") {
                 agent.run_call(&tc);
             } else {
@@ -418,28 +502,26 @@ impl Agent {
 
     /// The agent's `context:` files, then those of the skills it forces, without repeats.
     fn context_paths(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
+        let mut seen = BTreeSet::new();
         let forced = self.def.skills.iter().filter_map(|n| self.skills.get(n));
-        for p in self.def.context.iter().chain(forced.flat_map(|k| &k.context)) {
-            if !out.contains(p) {
-                out.push(p.clone());
-            }
-        }
-        out
+        self.def
+            .context
+            .iter()
+            .chain(forced.flat_map(|k| &k.context))
+            .filter(|p| seen.insert((*p).clone()))
+            .cloned()
+            .collect()
     }
 
     /// Run until the agent finishes or stops, then record `instance_end`.
     /// `task` is appended as a user message; a finished session resumed without
     /// one is told to continue.
     pub fn run(&mut self, task: Option<&str>) -> Result<String> {
-        let last = self
-            .context
-            .read()
-            .unwrap()
-            .messages()
-            .last()
-            .map(|m| m.role);
-        let paths = if self.context.read().unwrap().len() == 1 {
+        let (last, first_turn) = {
+            let ctx = self.context.read().unwrap();
+            (ctx.messages().last().map(|m| m.role), ctx.len() == 1)
+        };
+        let paths = if first_turn {
             self.context_paths()
         } else {
             Vec::new()
@@ -458,8 +540,8 @@ impl Agent {
             .unwrap_or_else(|e| self.fail(format!("{e:#}")));
         let result = self.verdict.as_ref().map(|v| json!(v));
         self.events.instance_end(
-            self.status,
-            self.reason,
+            self.status.as_str(),
+            self.reason.map(StopReason::as_str),
             self.tokens_used,
             &report,
             result.as_ref(),
@@ -470,28 +552,28 @@ impl Agent {
     fn fail(&mut self, msg: String) -> String {
         eprintln!("[llm] {msg}");
         self.events.error(&msg);
-        self.status = "failed";
+        self.status = Status::Failed;
         msg
     }
 
-    fn stop(&mut self, reason: &'static str, msg: String) -> String {
+    fn stop(&mut self, reason: StopReason, msg: String) -> String {
         self.events.error(&msg);
-        self.status = "stopped";
+        self.status = Status::Stopped;
         self.reason = Some(reason);
         format!("({msg})")
     }
 
     fn stopped_by_user(&mut self) -> String {
         self.events.status(STOPPED_BY_USER);
-        self.status = "stopped";
-        self.reason = Some("user");
+        self.status = Status::Stopped;
+        self.reason = Some(StopReason::User);
         STOPPED_BY_USER.to_string()
     }
 
-    fn budget_exceeded(&self) -> Option<(&'static str, String)> {
+    fn budget_exceeded(&self) -> Option<(StopReason, String)> {
         if self.tokens_used >= self.token_limit {
             return Some((
-                "token_limit",
+                StopReason::TokenLimit,
                 format!(
                     "token limit reached ({} >= {})",
                     self.tokens_used, self.token_limit
@@ -500,7 +582,7 @@ impl Agent {
         }
         if self.started.elapsed().as_secs() >= self.cfg.time_limit_secs.max(1) {
             return Some((
-                "time_limit",
+                StopReason::TimeLimit,
                 format!("time limit reached ({}s)", self.cfg.time_limit_secs),
             ));
         }
@@ -508,14 +590,7 @@ impl Agent {
     }
 
     fn run_loop(&mut self) -> Result<String> {
-        let mut iterations = 0usize;
-        let mut truncations = 0u32;
-        let mut overflow_retried = false;
-        let mut nudged = false;
-        let mut pruned_at = self.context.read().unwrap().len();
-        let mut last_call = Instant::now();
-        // One-request note after the context; never stored.
-        let mut hint: Option<String> = None;
+        let mut state = RunState::new(self.context.read().unwrap().len());
         let ends: Vec<&str> = ["hand_off", "finish", "verdict"]
             .into_iter()
             .filter(|t| self.def.tools.iter().any(|n| n == t))
@@ -531,21 +606,28 @@ impl Agent {
             }
             self.set_status();
             self.maybe_compact(COMPACT_AT, true)?;
-            self.maybe_prune(&mut pruned_at, last_call);
-            if hint.is_none() && iterations + WRAP_UP_TURNS >= self.cfg.max_tool_iterations {
+            self.maybe_prune(&mut state);
+            if state.hint.is_none()
+                && !ends.is_empty()
+                && state.iterations + WRAP_UP_TURNS >= self.cfg.max_tool_iterations
+            {
                 // Sent for the last few tool-call turns so the run ends with a report, not a cut-off.
-                hint = Some(format!("You are about to run out of tool calls and will be cut off. Wrap up now: stop starting new work, then call {ends} with a standalone report of what is done, what remains, and where the state lives."));
+                state.hint = Some(format!(
+                    "You are about to run out of tool calls and will be cut off. Wrap up now: stop starting new work, then call {ends} with a standalone report of what is done, what remains, and where the state lives."
+                ));
             }
             let result = {
                 let ctx = self.context.read().unwrap();
-                self.llm.chat(ctx.messages(), ctx.tools(), hint.take().as_deref())
+                self.llm
+                    .chat(ctx.messages(), ctx.tools(), state.hint.take().as_deref())
             };
-            last_call = Instant::now();
+            state.last_call = Instant::now();
             let resp = match result {
                 Ok(r) => r,
-                Err(e) if !overflow_retried && is_context_overflow(&format!("{e:#}")) => {
-                    overflow_retried = true;
-                    self.events.error("context overflow; compacting and retrying");
+                Err(e) if !state.overflow_retried && is_context_overflow(&format!("{e:#}")) => {
+                    state.overflow_retried = true;
+                    self.events
+                        .error("context overflow; compacting and retrying");
                     self.maybe_compact(0.0, false)?;
                     continue;
                 }
@@ -563,17 +645,20 @@ impl Agent {
                 resp.cached_tokens,
             );
             if resp.truncated {
-                if truncations >= MAX_TRUNCATIONS {
+                if state.truncations >= MAX_TRUNCATIONS {
                     return Ok(self.fail(format!(
                         "LLM request failed: response truncated {MAX_TRUNCATIONS} times"
                     )));
                 }
-                truncations += 1;
-                self.events.error(&format!("LLM response truncated (finish_reason=length); retry {truncations}/{MAX_TRUNCATIONS}"));
-                hint = Some(TRUNCATED_HINT.into());
+                state.truncations += 1;
+                self.events.error(&format!(
+                    "LLM response truncated (finish_reason=length); retry {}/{MAX_TRUNCATIONS}",
+                    state.truncations
+                ));
+                state.hint = Some(TRUNCATED_HINT.into());
                 continue;
             }
-            truncations = 0;
+            state.truncations = 0;
             let assistant = resp.message;
             if assistant.tool_calls.is_empty() {
                 let text = if assistant.content.trim().is_empty() {
@@ -589,14 +674,14 @@ impl Agent {
                 if injected {
                     continue;
                 }
-                if !nudged && !ends.is_empty() {
-                    nudged = true;
-                    hint = Some(format!("End by calling {ends}."));
+                if !state.nudged && !ends.is_empty() {
+                    state.nudged = true;
+                    state.hint = Some(format!("End by calling {ends}."));
                     continue;
                 }
                 return Ok(text);
             }
-            nudged = false;
+            state.nudged = false;
             let mut calls = assistant.tool_calls.clone();
             self.log(assistant);
             // `finish` and `hand_off` run after the other calls of its turn.
@@ -607,10 +692,10 @@ impl Agent {
             if let Some(v) = &self.verdict {
                 return Ok(v.summary.clone());
             }
-            iterations += 1;
-            if iterations >= self.cfg.max_tool_iterations {
+            state.iterations += 1;
+            if state.iterations >= self.cfg.max_tool_iterations {
                 return Ok(self.stop(
-                    "max_iterations",
+                    StopReason::MaxIterations,
                     format!(
                         "reached max tool iterations {}",
                         self.cfg.max_tool_iterations
@@ -647,22 +732,26 @@ impl Agent {
 
     /// Drops what the model no longer needs, but only when it pays for rewriting the provider's
     /// cached prefix (see `should_prune`); checked every `PRUNE_MIN_GAP` new messages.
-    fn maybe_prune(&mut self, pruned_at: &mut usize, last_call: Instant) {
+    fn maybe_prune(&mut self, state: &mut RunState) {
         let len = self.context.read().unwrap().len();
-        if len < *pruned_at {
-            *pruned_at = len;
+        if len < state.pruned_at {
+            state.pruned_at = len;
         }
-        if len - *pruned_at < PRUNE_MIN_GAP {
+        if len - state.pruned_at < PRUNE_MIN_GAP {
             return;
         }
-        *pruned_at = len;
+        state.pruned_at = len;
         let keep = self.cfg.prune_keep_recent;
-        let idle = last_call.elapsed();
+        let idle = state.last_call.elapsed();
         // Old results stay verbatim (cache and facts intact) until the window fills.
         let bulk = self.context.read().unwrap().over(PRUNE_PRESSURE);
-        let pruned = self.context.write().unwrap().prune_if(keep, bulk, |freed, ctx| {
-            should_prune(freed, ctx.est_tokens(), ctx.context_window(), idle)
-        });
+        let pruned = self
+            .context
+            .write()
+            .unwrap()
+            .prune_if(keep, bulk, |freed, est, window| {
+                should_prune(freed, est, window, idle)
+            });
         if pruned {
             self.events.prune(keep, bulk);
         }
@@ -731,17 +820,30 @@ mod tests {
         std::fs::write(ws.join("docs/adr/orm.md"), "x").unwrap();
         let out = project_docs(
             &ws,
-            &["docs/architecture.md".into(), "docs/domain-model.md".into(), "docs/adr/".into()],
+            &[
+                "docs/architecture.md".into(),
+                "docs/domain-model.md".into(),
+                "docs/adr/".into(),
+            ],
         );
-        assert!(out.contains("## docs/architecture.md\n- src/a.rs — a\n"), "{out}");
-        assert!(out.contains("(docs/domain-model.md does not exist yet)"), "{out}");
+        assert!(
+            out.contains("## docs/architecture.md\n- src/a.rs — a\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("(docs/domain-model.md does not exist yet)"),
+            "{out}"
+        );
         assert!(out.contains("## docs/adr/\norm.md"), "{out}");
     }
 
     #[test]
     fn pinned_files_drop_timestamp_frontmatter() {
         let t = "---\nid: R1\ncreated: 2026-01-01\nstatus: open\nupdated: 2026-02-02\n---\nbody created: x\n";
-        assert_eq!(strip_timestamps(t), "---\nid: R1\nstatus: open\n---\nbody created: x\n");
+        assert_eq!(
+            strip_timestamps(t),
+            "---\nid: R1\nstatus: open\n---\nbody created: x\n"
+        );
         assert_eq!(strip_timestamps("no front\n"), "no front\n");
     }
 
@@ -825,7 +927,7 @@ mod tests {
             ],
         );
         let agents = config::load_agents(&ws);
-        let skills = config::load_skills(&ws);
+        let skills = config::load_skills(&Config::default().skills(&ws));
         let plan = build_system(&ws, &agents["lead"], &agents, &skills, None).unwrap();
         assert!(
             plan.contains("## Environment")
@@ -834,7 +936,10 @@ mod tests {
                 && !plan.contains("- worker — works")
         );
         let worker = build_system(&ws, &agents["worker"], &agents, &skills, None).unwrap();
-        assert!(!worker.contains("## Agents"), "no spawn tool, no agent list");
+        assert!(
+            !worker.contains("## Agents"),
+            "no spawn tool, no agent list"
+        );
         assert!(
             plan.contains("## Skills")
                 && plan.contains("- formal — ")
