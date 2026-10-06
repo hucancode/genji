@@ -1,15 +1,16 @@
 //! genji-drive STEP_JSON...: runs genji through a sequence of steps, in a Harbor task
-//! container or in a long-running remote run (`cargo eval lp`).
+//! container or in a long-running remote run (`lp/run.py`).
 //!
-//! It holds genji's stdin and stdout: it injects instructions after N tool calls, kills
-//! genji to simulate a crash, follows `finish` handoffs and blocked reports, resumes the
-//! previous step's instance, and leaves the trace and metrics (in genji's own terms) in the
-//! step's output directory. Translations to other harnesses' formats live in the Python
-//! adapter.
+//! It holds genji's stdin and stdout: it injects instructions after N tool calls, sends lines
+//! to the control socket, kills genji to simulate a crash, follows `finish` handoffs and
+//! blocked reports, resumes the previous step's instance, and leaves the trace and metrics
+//! (in genji's own terms) in the step's output directory. Translations to other harnesses'
+//! formats live in the Python adapter.
 //!
 //! Layout under `$GENJI_DRIVE_HOME` (default /genji): config.json, sessions/, agents/,
 //! state.json (the instance a later step resumes), phase (the running step's name, then
-//! `done`) and trace/all.jsonl (every step's events, for verifiers). `$GENJI_BIN` is the
+//! `done`), and for verifiers trace/all.jsonl (every step's events), trace/metrics.json (the
+//! last step's metrics) and trace/socket.log (control socket exchanges). `$GENJI_BIN` is the
 //! genji binary (default `genji` on PATH).
 
 use anyhow::{Context, Result};
@@ -18,9 +19,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Deserialize)]
 struct Step {
@@ -41,6 +43,11 @@ struct Step {
     #[serde(default)]
     instructions: Vec<Instruction>,
     kill_after_tool_calls: Option<u64>,
+    /// Keep genji's control socket on; `socket_send` needs it.
+    #[serde(default)]
+    socket: bool,
+    #[serde(default)]
+    socket_send: Vec<SocketLine>,
     out: String,
     /// Copy config.json, sessions/ and agents/ into `out` after the step.
     #[serde(default = "yes")]
@@ -51,6 +58,13 @@ struct Step {
 struct Instruction {
     after_tool_calls: u64,
     text: String,
+}
+
+/// A line sent to the control socket once the step has made `after_tool_calls` tool calls.
+#[derive(Deserialize)]
+struct SocketLine {
+    after_tool_calls: u64,
+    line: String,
 }
 
 fn default_agent() -> String {
@@ -186,6 +200,8 @@ fn run(path: &str) -> Result<i32> {
 
     let mut trace = append(&file(".jsonl", "genji.jsonl"))?;
     let mut all = append(&home.join("trace/all.jsonl"))?;
+    let mut socket_log = append(&home.join("trace/socket.log"))?;
+    let mut socket_pending: Vec<&SocketLine> = step.socket_send.iter().collect();
     for hop in 0..=step.follow_handoffs {
         let mut cmd = Command::new(&genji);
         cmd.arg(&agent).arg(&task);
@@ -198,10 +214,11 @@ fn run(path: &str) -> Result<i32> {
         if let Some(n) = step.token_limit {
             cmd.arg("--token-limit").arg(n.to_string());
         }
-        cmd.arg("--config")
-            .arg(&config)
-            .arg("--socket-disabled")
-            .current_dir(&step.workdir)
+        cmd.arg("--config").arg(&config);
+        if !step.socket {
+            cmd.arg("--socket-disabled");
+        }
+        cmd.current_dir(&step.workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(append(&file(".err", "genji.stderr.log"))?);
@@ -210,6 +227,7 @@ fn run(path: &str) -> Result<i32> {
         let stdout = BufReader::new(child.stdout.take().context("genji stdout")?);
         let mut pending: Vec<&Instruction> = step.instructions.iter().collect();
         let mut end = None;
+        let mut control: Option<String> = None;
         for line in stdout.lines() {
             let line = line?;
             writeln!(trace, "{line}")?;
@@ -223,6 +241,9 @@ fn run(path: &str) -> Result<i32> {
                 "instance_start"
                     if !e["agent"].as_str().unwrap_or_default().ends_with(":review") =>
                 {
+                    if let Some(sock) = e["control_socket"].as_str() {
+                        control = Some(sock.to_string());
+                    }
                     current = Some((
                         e["instance"].as_str().unwrap_or_default().to_string(),
                         e["agent"].as_str().unwrap_or_default().to_string(),
@@ -239,6 +260,17 @@ fn run(path: &str) -> Result<i32> {
                         }
                     }
                     pending.retain(|i| i.after_tool_calls > calls);
+                    if let Some(sock) = &control {
+                        for s in socket_pending
+                            .iter()
+                            .filter(|s| s.after_tool_calls <= calls)
+                        {
+                            let reply = socket_ask(Path::new(sock), &s.line, &step.workdir)
+                                .unwrap_or_else(|e| format!("genji-drive: {e:#}"));
+                            writeln!(socket_log, "> {}\n< {reply}", s.line)?;
+                        }
+                        socket_pending.retain(|s| s.after_tool_calls > calls);
+                    }
                     if step.kill_after_tool_calls.is_some_and(|n| calls >= n) {
                         child.kill()?;
                         metrics.killed = true;
@@ -304,16 +336,27 @@ fn run(path: &str) -> Result<i32> {
         "instances": metrics.instances,
         "duration_secs": started.elapsed().as_secs_f64(),
     });
-    fs::write(
-        file(".metrics.json", "metrics.json"),
-        serde_json::to_string_pretty(&summary)?,
-    )?;
+    let summary = serde_json::to_string_pretty(&summary)?;
+    fs::write(file(".metrics.json", "metrics.json"), &summary)?;
+    fs::write(home.join("trace/metrics.json"), &summary)?;
     if step.snapshot {
         let _ = fs::copy(&config, out.join("config.json"));
         copy_dir_if_exists(&home.join("sessions"), &out.join("sessions"))?;
         copy_dir_if_exists(&home.join("agents"), &out.join("agents"))?;
     }
     Ok(code)
+}
+
+/// Sends one line to genji's control socket (relative to `workdir`) and returns the reply line.
+fn socket_ask(sock: &Path, line: &str, workdir: &str) -> Result<String> {
+    let path = Path::new(workdir).join(sock);
+    let mut stream =
+        UnixStream::connect(&path).with_context(|| format!("connect {}", path.display()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    writeln!(stream, "{line}")?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply)?;
+    Ok(reply.trim_end().to_string())
 }
 
 fn append(path: &Path) -> Result<File> {

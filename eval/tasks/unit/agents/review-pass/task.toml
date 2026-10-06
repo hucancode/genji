@@ -1,0 +1,18 @@
+schema_version = "1.3"
+
+[task]
+name = "genji/review-pass"
+description = "review_threshold = 0 sends every submitted build to a review pass"
+
+[metadata]
+difficulty = "easy"
+category = "agents"
+
+[agent]
+timeout_sec = 120.0
+
+[verifier]
+timeout_sec = 30.0
+
+[environment]
+build_timeout_sec = 600.0

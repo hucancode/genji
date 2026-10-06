@@ -722,6 +722,90 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn defaults_match_the_documentation() {
+        let c = Config::default();
+        assert_eq!(
+            (
+                c.time_limit_secs,
+                c.max_tool_iterations,
+                c.tool_result_max_bytes
+            ),
+            (1800, 200, 24_000)
+        );
+        assert_eq!(
+            (
+                c.bash_timeout_secs,
+                c.spawn_timeout_secs,
+                c.ask_timeout_secs
+            ),
+            (120, 900, 600)
+        );
+        assert_eq!((c.max_subagent_depth, c.review_threshold), (2, 0.4));
+    }
+
+    #[test]
+    fn a_missing_explicit_config_is_an_error_and_writes_nothing() {
+        let ws = temp_dir("config-missing");
+        let missing = ws.join("nope.json");
+        assert!(Config::load_or_create(&ws, Some(&missing)).is_err());
+        assert!(Config::load(&ws, Some(&missing)).is_err());
+        assert!(!missing.exists() && !dot(&ws, "config.json").exists());
+        Config::load_or_create(&ws, None).unwrap();
+        assert!(
+            dot(&ws, "config.json").exists(),
+            "the default file is created"
+        );
+    }
+
+    #[test]
+    fn front_matter_sets_every_agent_field() {
+        let text = "---\ndescription: d\ntools: read, spawn\nskills: a, b\ncontext: docs/x.md, docs/\n\
+                    finish: handoff\nspawns: explore\nmodel: m\ninternal: true\nreview: true\n---\np";
+        let (def, review) = parse_agent("x", text);
+        assert!(review);
+        assert_eq!((def.name.as_str(), def.description.as_str()), ("x", "d"));
+        assert_eq!(def.prompt, "p");
+        assert_eq!(def.tools, ["read", "spawn"]);
+        assert_eq!(def.skills, ["a", "b"]);
+        assert_eq!(def.context, ["docs/x.md", "docs/"]);
+        assert_eq!(def.finish, ["handoff"]);
+        assert_eq!(def.spawns, Some(vec!["explore".to_string()]));
+        assert_eq!(def.model.as_deref(), Some("m"));
+        assert!(def.internal);
+        let (bare, review) = parse_agent("y", "plain");
+        assert!(!review && !bare.internal && bare.spawns.is_none() && bare.model.is_none());
+        assert_eq!(bare.finish, DEFAULT_FINISH);
+    }
+
+    #[test]
+    fn invalid_and_reserved_names_are_not_agents() {
+        let ws = temp_dir("agents-names");
+        write_agents(
+            &ws,
+            &[
+                ("init", "---\ntools: read\n---\nx"),
+                ("two words", "---\ntools: read\n---\nx"),
+                ("ok", "---\ntools: read\n---\nx"),
+            ],
+        );
+        assert_eq!(load_agents(&ws).keys().collect::<Vec<_>>(), ["ok"]);
+    }
+
+    #[test]
+    fn the_first_skill_of_a_name_wins() {
+        let ws = temp_dir("skills-dup");
+        skill(&ws, "a/dup", "---\nname: dup\ndescription: first\n---\nx\n");
+        skill(
+            &ws,
+            "b/dup",
+            "---\nname: dup\ndescription: second\n---\nx\n",
+        );
+        let skills = load_skills(&Config::default().skills(&ws));
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills["dup"].description, "first");
+    }
+
+    #[test]
     fn top_level_token_limit_overrides_the_provider() {
         let mut cfg = Config::default();
         let p = Provider::default();

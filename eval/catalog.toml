@@ -1,178 +1,392 @@
-# capability and difficulty of every task in dataset.toml, plus optional genji config
-# overrides (`config = { ... }`) merged over the profile for that task.
+# Every task in eval/tasks/ and dataset.toml: its level (smoke, unit, benchmark), the suite of a
+# benchmark-level task, capability and difficulty, plus optional genji config overrides
+# (`config = { ... }`) merged over the runner's config for that task.
+#
+#   smoke      does genji work at all
+#   unit       one promised feature per task; trivial for a bare-minimum model and quick
+#   benchmark  grouped in the [benchmarks] suites below
+
+[tasks."hello-world/hello-world"]
+level = "smoke"
+capability = "basic"
+difficulty = "easy"  # write one file
 
 [tasks."quixbugs/python-bitcount"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-bucketsort"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-detect_cycle"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-find_first_in_sorted"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-flatten"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-gcd"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-get_factors"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-hanoi"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-is_valid_parenthesization"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-knapsack"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-kth"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-levenshtein"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-lis"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-max_sublist_sum"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-mergesort"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-next_palindrome"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-pascal"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-powerset"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-quicksort"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."quixbugs/python-sieve"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # fix exactly one line
 
 [tasks."ai-forever/harness-bench-fast__task_07_rename_function"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # precise edit
 
 [tasks."ai-forever/harness-bench-fast__task_08_bump_version"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # precise edit
 
 [tasks."ai-forever/harness-bench-fast__task_19_remove_old_func"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # precise edit
 
 [tasks."ai-forever/harness-bench-fast__task_31_rename_in_multi"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # precise edit
 
 [tasks."ai-forever/harness-bench-fast__task_45_inline_constant"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # precise edit
 
 [tasks."ai-forever/harness-bench-fast__task_50_fix_typo"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # precise edit
 
 [tasks."ai-forever/harness-bench-fast__task_69_remove_comments"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # precise edit
 
 [tasks."ai-forever/harness-bench-fast__task_79_double_to_single_quotes"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # precise edit
 
 [tasks."ai-forever/harness-bench-fast__task_88_sort_imports"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # precise edit
 
 [tasks."ai-forever/harness-bench-fast__task_95_add_default_arg"]
+level = "benchmark"
+suite = "capabilities"
 capability = "instruction"
 difficulty = "easy"  # precise edit
 
 [tasks."ai-forever/harness-bench-fast__task_151_pipeline_csv_to_json"]
+level = "benchmark"
+suite = "capabilities"
 capability = "multi-step"
 difficulty = "medium"  # ordered data pipeline
 
 [tasks."ai-forever/harness-bench-fast__task_152_sqlite_join_to_json"]
+level = "benchmark"
+suite = "capabilities"
 capability = "multi-step"
 difficulty = "medium"  # ordered data pipeline
 
 [tasks."ai-forever/harness-bench-fast__task_156_csv_validate_split"]
+level = "benchmark"
+suite = "capabilities"
 capability = "multi-step"
 difficulty = "medium"  # ordered data pipeline
 
 [tasks."ai-forever/harness-bench-fast__task_188_csv_three_way_join"]
+level = "benchmark"
+suite = "capabilities"
 capability = "multi-step"
 difficulty = "medium"  # ordered data pipeline
 
 [tasks."ai-forever/harness-bench-fast__task_191_sqlite_revenue_report"]
+level = "benchmark"
+suite = "capabilities"
 capability = "multi-step"
 difficulty = "medium"  # ordered data pipeline
 
 [tasks."ai-forever/harness-bench-fast__task_201_reconcile_vip_users"]
+level = "benchmark"
+suite = "capabilities"
 capability = "multi-step"
 difficulty = "medium"  # ordered data pipeline
 
 [tasks."ai-forever/harness-bench-fast__task_207_inventory_anomaly_report"]
+level = "benchmark"
+suite = "capabilities"
 capability = "multi-step"
 difficulty = "medium"  # ordered data pipeline
 
 [tasks."ai-forever/harness-bench-fast__task_214_customer_data_quality_report"]
+level = "benchmark"
+suite = "capabilities"
 capability = "multi-step"
 difficulty = "medium"  # ordered data pipeline
 
 [tasks."ai-forever/harness-bench-fast__task_139_grep_log_errors"]
+level = "benchmark"
+suite = "capabilities"
 capability = "long-output"
 difficulty = "easy"  # search a tree with noisy output
 
 [tasks."ai-forever/harness-bench-fast__task_144_grep_duplicate_funcs"]
+level = "benchmark"
+suite = "capabilities"
 capability = "long-output"
 difficulty = "easy"  # search a tree with noisy output
 
 [tasks."ai-forever/harness-bench-fast__task_186_find_call_sites"]
+level = "benchmark"
+suite = "capabilities"
 capability = "long-output"
 difficulty = "easy"  # search a tree with noisy output
 
 [tasks."ai-forever/harness-bench-fast__task_187_dead_functions"]
+level = "benchmark"
+suite = "capabilities"
 capability = "long-output"
 difficulty = "easy"  # search a tree with noisy output
 
 [tasks."genji/needle-in-log"]
+level = "benchmark"
+suite = "capabilities"
 capability = "long-output"
 difficulty = "easy"  # 50 MB log, noisy grep
 
 [tasks."genji/crash-resume"]
+level = "unit"
 capability = "handoff"
 difficulty = "easy"  # killed, then --resume
+
+[tasks."genji/token-limit"]
+level = "unit"
+capability = "config"
+difficulty = "easy"  # token budget stops the run
+
+[tasks."genji/max-iterations"]
+level = "unit"
+capability = "config"
+difficulty = "easy"  # tool-turn cap stops the run
+
+[tasks."genji/tool-output-cap"]
+level = "unit"
+capability = "config"
+difficulty = "easy"  # long bash output clipped and spilled
+
+[tasks."genji/bash-timeout"]
+level = "unit"
+capability = "config"
+difficulty = "easy"  # bash command killed on timeout
+
+[tasks."genji/tool-allowlist"]
+level = "unit"
+capability = "guardrail"
+difficulty = "easy"  # agent gets only its listed tools
+
+[tasks."genji/finish-allowlist"]
+level = "unit"
+capability = "guardrail"
+difficulty = "easy"  # finish limited to blocked
+
+[tasks."genji/spawn-depth"]
+level = "unit"
+capability = "guardrail"
+difficulty = "easy"  # spawn refused past max depth
+
+[tasks."genji/skill-on-demand"]
+level = "unit"
+capability = "skills"
+difficulty = "easy"  # listed skill read when it applies
+
+[tasks."genji/skill-forced"]
+level = "unit"
+capability = "skills"
+difficulty = "easy"  # agent's skill inlined in its prompt
+
+[tasks."genji/custom-agent"]
+level = "unit"
+capability = "agents"
+difficulty = "easy"  # custom agent file runs
+
+[tasks."genji/review-pass"]
+level = "unit"
+capability = "agents"
+difficulty = "easy"  # build judged by a review pass
+
+[tasks."genji/finish-handoff"]
+level = "unit"
+capability = "handoff"
+difficulty = "easy"  # finish handoff followed, parent linked
+
+[tasks."genji/hand-off-tool"]
+level = "unit"
+capability = "handoff"
+difficulty = "easy"  # hand_off continues in-process
+
+[tasks."genji/spawn-explore"]
+level = "unit"
+capability = "spawn"
+difficulty = "easy"  # explore subagent finds a definition
+
+[tasks."genji/socket-instruction"]
+level = "unit"
+capability = "socket"
+difficulty = "easy"  # /ping and a queued instruction
+
+[tasks."genji/socket-stop"]
+level = "unit"
+capability = "socket"
+difficulty = "easy"  # /stop ends the run
+
+[tasks."genji/greeting-followup"]
+level = "unit"
+capability = "follow-up"
+difficulty = "easy"  # resumed session takes a follow-up
+
+# -- benchmark suites (cargo eval bench SUITE) ------------------------------- #
+# `dataset` is a registry dataset pinned to a revision, filtered by `[metadata].category` and
+# sampled to a fixed set of `sample` tasks. A suite without `dataset` is the catalog tasks with
+# `suite = NAME`.
+
+[benchmarks.capabilities]
+description = "cheap capability score: quixbugs, harness-bench-fast, needle-in-log"
+
+[benchmarks.tb-light]
+description = "Terminal-Bench 2.1, 3 software-engineering tasks"
+dataset = "terminal-bench/terminal-bench-2-1@6"
+category = ["software-engineering", "debugging"]
+sample = 3
+
+[benchmarks.tb]
+description = "Terminal-Bench 2.1, software-engineering and debugging tasks"
+dataset = "terminal-bench/terminal-bench-2-1@6"
+category = ["software-engineering", "debugging"]
+
+[benchmarks.tb-full]
+description = "Terminal-Bench 2.1, all 89 tasks"
+dataset = "terminal-bench/terminal-bench-2-1@6"
+
+[benchmarks.swebench]
+description = "SWE-bench Verified, 25-task sample"
+dataset = "swe-bench/swe-bench-verified@2"
+sample = 25
+
+[benchmarks.swebench-full]
+description = "SWE-bench Verified, all 500 tasks"
+dataset = "swe-bench/swe-bench-verified@2"

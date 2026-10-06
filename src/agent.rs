@@ -922,4 +922,31 @@ mod tests {
         forced.skills = vec!["nope".into()];
         assert!(build_system(&ws, &forced, &agents, &skills, None).is_err());
     }
+
+    #[test]
+    fn skills_are_listed_for_readers_except_manual_ones() {
+        let ws = temp_dir("system-skills");
+        for (dir, text) in [
+            ("shown", "---\ndescription: listed\n---\nx\n"),
+            (
+                "manual",
+                "---\ndescription: hidden\ndisable-model-invocation: true\n---\nx\n",
+            ),
+        ] {
+            let d = ws.join(".agents/skills").join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("SKILL.md"), text).unwrap();
+        }
+        let skills = config::load_skills(&Config::default().skills(&ws));
+        let agents = BTreeMap::new();
+        let def = |tools: &str| AgentDef {
+            name: "a".into(),
+            tools: tools.split(',').map(String::from).collect(),
+            ..Default::default()
+        };
+        let reader = build_system(&ws, &def("read"), &agents, &skills, None).unwrap();
+        assert!(reader.contains("- shown — listed") && !reader.contains("- manual"));
+        let blind = build_system(&ws, &def("bash"), &agents, &skills, None).unwrap();
+        assert!(!blind.contains("## Skills"), "{blind}");
+    }
 }

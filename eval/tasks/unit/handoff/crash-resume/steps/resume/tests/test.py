@@ -1,0 +1,30 @@
+"""The resumed session finishes the tool the killed one started."""
+import json
+import subprocess
+from pathlib import Path
+
+
+def check():
+    events = [json.loads(l) for l in Path("/genji/trace/all.jsonl").read_text().splitlines()]
+    for name in ("textstats.py", "test_textstats.py"):
+        assert Path("/app", name).is_file(), f"{name} is missing"
+    Path("/tmp/sample.txt").write_text("The cat, the DOG.\nthe end!\n\nCat dog cat\n")
+    out = subprocess.run(["python3", "textstats.py", "/tmp/sample.txt"], cwd="/app", capture_output=True, text=True, timeout=30)
+    got = json.loads(out.stdout)
+    want = {"lines": 4, "words": 9, "chars": 40, "top_word": "the"}
+    for key, value in want.items():
+        assert got.get(key) == value, f"{key}: got {got.get(key)!r}, want {value!r}"
+    unit = subprocess.run(["python3", "-m", "unittest", "test_textstats"], cwd="/app", capture_output=True, timeout=30)
+    assert unit.returncode == 0, "the agent's unit tests fail"
+    assert any(e["type"] == "instance_start" and e["resumed"] for e in events), "the session was not resumed"
+
+
+try:
+    check()
+    reward, note = 1, "PASS"
+except Exception as e:  # a failed assert, a missing file or trace, bad JSON: all fail the task
+    reward, note = 0, f"FAIL: {e!r}"
+print(note)
+out = Path("/logs/verifier")
+out.mkdir(parents=True, exist_ok=True)
+(out / "reward.txt").write_text(f"{reward}\n")

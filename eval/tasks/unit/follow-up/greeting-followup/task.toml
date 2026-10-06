@@ -1,0 +1,25 @@
+schema_version = "1.3"
+multi_step_reward_strategy = "final"
+
+[task]
+name = "genji/greeting-followup"
+description = "A resumed session takes a follow-up request on the app it built"
+
+[metadata]
+difficulty = "easy"
+category = "follow-up"
+
+[agent]
+timeout_sec = 120.0
+
+[verifier]
+timeout_sec = 30.0
+
+[environment]
+build_timeout_sec = 600.0
+
+[[steps]]
+name = "build"
+
+[[steps]]
+name = "followup"

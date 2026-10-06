@@ -1,0 +1,14 @@
+{
+  "provider": "eval",
+  "providers": {
+    "eval": {
+      "base_url": "https://<YOUR_ENDPOINT>/v1",
+      "api_key_env": "GENJI_API_KEY",
+      "model": "<MODEL_ID>",
+      "context_window": 200000,
+      "max_output_tokens": 16384,
+      "token_limit": 3000000
+    }
+  },
+  "time_limit_secs": 1800
+}

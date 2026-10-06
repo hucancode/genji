@@ -1,0 +1,1 @@
+Next, read /app/chain/k4.txt

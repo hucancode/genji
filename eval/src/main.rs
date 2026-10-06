@@ -1,9 +1,11 @@
-//! `cargo eval`: runs genji's evaluation sets on Harbor and summarizes them like `cargo test`.
+//! `cargo eval`: runs genji's evaluation levels on Harbor and summarizes them like `cargo test`.
 //!
-//! The easy set is `eval/dataset.toml` (pinned registry tasks plus `eval/tasks/`), described by
-//! `eval/catalog.toml` (capability, difficulty, genji config overrides). The hard set is
-//! Terminal-Bench in `benchmark/`. Harbor runs locally; `eval/remote.py` runs these commands on
-//! another host.
+//! `eval/catalog.toml` describes every task: hand-authored ones in `eval/tasks/` and registry
+//! ones pinned in `eval/dataset.toml`, each with a level (smoke, unit, benchmark), capability,
+//! difficulty and genji config overrides. Its `[benchmarks.*]` suites are whole registry
+//! datasets (filtered by category and sampled) or catalog tasks of level benchmark. Every run
+//! uses the runner's genji config (`--config`, default `eval/config.json`). Harbor runs
+//! locally; `eval/remote.py` runs these commands on another host.
 
 use anyhow::{Context, Result, bail};
 use genji_eval::copy_dir;
@@ -15,29 +17,32 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const USAGE: &str = "usage:
-  cargo eval list    [filter...] [--capability C] [--difficulty D]
-  cargo eval run     [filter...] [-k 3] [-j 1] [--profile haiku] [--model PROVIDER/MODEL]
-                     [--agents DIR] [--capability C] [--difficulty D] [--name JOB]
-  cargo eval check   [filter...]                   hand-authored tasks: nop scores 0, oracle scores 1
+  cargo eval smoke   [filter...]                 does genji work at all
+  cargo eval unit    [filter...]                 every promised feature, one small task each
+  cargo eval bench   SUITE [filter...]           a standard benchmark suite
+  cargo eval run     [filter...] [--level L | --suite S]
+  cargo eval list    [filter...] [--level L | --suite S]
+  cargo eval check   [filter...] [--level L]     hand-authored tasks: nop scores 0, oracle scores 1
   cargo eval report  [JOB|latest]
   cargo eval compare JOB_A JOB_B
-  cargo eval tb      [hello|light|full]            the hard set (Terminal-Bench 2.1)
 
-A filter matches a task name or capability by substring. Profiles are eval/profiles/NAME.json; the easy set
-runs on a weak model (haiku) unless --profile or --model says otherwise.";
+options: --config FILE (default eval/config.json, see eval/config.example.json), -k ATTEMPTS
+(1; `run`: 3), -j CONCURRENCY, --agents DIR, --capability C, --difficulty D, --name JOB.
+A filter matches a task name or capability by substring. Levels: smoke, unit, benchmark.
+`cargo eval list` without a level or suite also lists the benchmark suites.";
 
-/// Weak models expose agent weaknesses that strong ones paper over.
-const DEFAULT_PROFILE: &str = "haiku";
+const LEVELS: [&str; 3] = ["smoke", "unit", "benchmark"];
 
 #[derive(Default)]
 struct Opts {
     cmd: String,
     positional: Vec<String>,
-    attempts: u32,
+    attempts: Option<u32>,
     concurrency: u32,
-    profile: Option<String>,
-    model: Option<String>,
+    config: Option<String>,
     agents: Option<String>,
+    level: Option<String>,
+    suite: Option<String>,
     capability: Option<String>,
     difficulty: Option<String>,
     name: Option<String>,
@@ -45,7 +50,6 @@ struct Opts {
 
 fn parse(args: Vec<String>) -> Result<Opts> {
     let mut o = Opts {
-        attempts: 3,
         concurrency: 1,
         ..Default::default()
     };
@@ -62,13 +66,16 @@ fn parse(args: Vec<String>) -> Result<Opts> {
                 .with_context(|| format!("{flag} needs a value"))
         };
         match flag.as_str() {
-            "-k" | "--attempts" => o.attempts = value()?.parse().context("-k needs a number")?,
+            "-k" | "--attempts" => {
+                o.attempts = Some(value()?.parse().context("-k needs a number")?)
+            }
             "-j" | "--concurrency" => {
                 o.concurrency = value()?.parse().context("-j needs a number")?
             }
-            "--profile" => o.profile = Some(value()?),
-            "-m" | "--model" => o.model = Some(value()?),
+            "--config" => o.config = Some(value()?),
             "--agents" => o.agents = Some(value()?),
+            "--level" => o.level = Some(value()?),
+            "--suite" => o.suite = Some(value()?),
             "--capability" => o.capability = Some(value()?),
             "--difficulty" => o.difficulty = Some(value()?),
             "--name" => o.name = Some(value()?),
@@ -78,9 +85,35 @@ fn parse(args: Vec<String>) -> Result<Opts> {
             _ => o.positional.push(arg),
         }
     }
-    if o.cmd == "run" && o.profile.is_none() && o.model.is_none() {
-        o.profile = Some(DEFAULT_PROFILE.into());
+    // The level commands are `run` with the level set; `bench` takes the suite first.
+    match o.cmd.as_str() {
+        "smoke" | "unit" => {
+            o.level = Some(std::mem::replace(&mut o.cmd, "run".into()));
+        }
+        "bench" => {
+            anyhow::ensure!(
+                !o.positional.is_empty(),
+                "usage: cargo eval bench SUITE [filter...]"
+            );
+            o.suite = Some(o.positional.remove(0));
+            o.cmd = "run".into();
+        }
+        "run" => {
+            o.attempts.get_or_insert(3);
+        }
+        _ => {}
     }
+    o.attempts.get_or_insert(1);
+    if let Some(l) = &o.level {
+        anyhow::ensure!(
+            LEVELS.contains(&l.as_str()),
+            "unknown level `{l}`; levels: {LEVELS:?}"
+        );
+    }
+    anyhow::ensure!(
+        o.level.is_none() || o.suite.is_none(),
+        "--level and --suite are exclusive"
+    );
     Ok(o)
 }
 
@@ -91,7 +124,6 @@ fn main() {
         "check" => cmd_check(&o),
         "report" => cmd_report(&o),
         "compare" => cmd_compare(&o),
-        "tb" => cmd_tb(&o),
         _ => {
             println!("{USAGE}");
             Ok(if o.cmd == "help" { 0 } else { 2 })
@@ -122,18 +154,43 @@ fn eval_dir() -> PathBuf {
 #[derive(Clone, Debug, Default)]
 struct Task {
     name: String,
+    level: String,
+    /// The benchmark suite of a level-benchmark task.
+    suite: String,
     capability: String,
     difficulty: String,
-    /// Hand-authored: the task directory, relative to `eval/`.
+    /// The task directory relative to `eval/`: hand-authored (`tasks/...`) or from a
+    /// downloaded benchmark dataset (`.store/...`).
     path: Option<String>,
     /// From the registry: the digest `dataset.toml` pins.
     digest: Option<String>,
 }
 
 impl Task {
+    /// Hand-authored in `eval/tasks/`.
     fn local(&self) -> bool {
-        self.path.is_some()
+        self.path.as_ref().is_some_and(|p| p.starts_with("tasks/"))
     }
+
+    /// Ships an oracle solution. A task whose verifier reads what genji did has none, since
+    /// nothing short of a genji run satisfies it.
+    fn has_oracle(&self) -> bool {
+        self.path
+            .as_ref()
+            .is_some_and(|p| !find(&eval_dir().join(p), "solve.sh").is_empty())
+    }
+}
+
+/// A `[benchmarks.NAME]` suite: a registry dataset, optionally filtered by
+/// `[metadata].category` and sampled, or else the catalog tasks with `suite = NAME`.
+#[derive(Clone, Debug, Default)]
+struct Suite {
+    name: String,
+    description: String,
+    /// `org/name@revision`.
+    dataset: Option<String>,
+    category: Vec<String>,
+    sample: Option<usize>,
 }
 
 fn load_toml(path: &Path) -> Result<toml::Table> {
@@ -182,6 +239,8 @@ fn catalog(dir: &Path) -> Result<Vec<Task>> {
         };
         out.push(Task {
             name: name.clone(),
+            level: field("level"),
+            suite: field("suite"),
             capability: field("capability"),
             difficulty: field("difficulty"),
             path: local.get(name).map(|p| {
@@ -194,6 +253,137 @@ fn catalog(dir: &Path) -> Result<Vec<Task>> {
         });
     }
     Ok(out)
+}
+
+/// The catalog's `[benchmarks]` suites.
+fn suites(dir: &Path) -> Result<Vec<Suite>> {
+    let cat = load_toml(&dir.join("catalog.toml"))?;
+    let mut out = Vec::new();
+    for (name, s) in cat
+        .get("benchmarks")
+        .and_then(|t| t.as_table())
+        .into_iter()
+        .flatten()
+    {
+        let text = |k: &str| s.get(k).and_then(|v| v.as_str()).map(String::from);
+        out.push(Suite {
+            name: name.clone(),
+            description: text("description").unwrap_or_default(),
+            dataset: text("dataset"),
+            category: s
+                .get("category")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
+            sample: s
+                .get("sample")
+                .and_then(|v| v.as_integer())
+                .map(|n| n as usize),
+        });
+    }
+    Ok(out)
+}
+
+/// The tasks of a suite. A dataset is downloaded once into `eval/.store/`.
+fn suite_tasks(dir: &Path, suite: &Suite) -> Result<Vec<Task>> {
+    let Some(dataset) = &suite.dataset else {
+        return Ok(catalog(dir)?
+            .into_iter()
+            .filter(|t| t.level == "benchmark" && t.suite == suite.name)
+            .collect());
+    };
+    let rel = format!(".store/{}", dataset.replace('/', "__"));
+    let store = dir.join(&rel);
+    if !store.is_dir() {
+        let tmp = dir.join(format!("{rel}.part"));
+        let _ = fs::remove_dir_all(&tmp);
+        sh(Command::new("harbor")
+            .args(["download", dataset, "-o"])
+            .arg(&tmp))?;
+        fs::rename(&tmp, &store)?;
+    }
+    dataset_tasks(dir, &rel, suite)
+}
+
+/// Task directories under `eval/<rel>`, filtered by the suite's categories and sampled.
+fn dataset_tasks(dir: &Path, rel: &str, suite: &Suite) -> Result<Vec<Task>> {
+    let mut tasks = Vec::new();
+    for task_toml in find(&dir.join(rel), "task.toml") {
+        let t = load_toml(&task_toml)?;
+        let meta = |k: &str| {
+            t.get("metadata")
+                .and_then(|m| m.get(k))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let category = meta("category");
+        if !suite.category.is_empty() && !suite.category.contains(&category) {
+            continue;
+        }
+        let task_dir = task_toml.parent().unwrap();
+        let name = t
+            .get("task")
+            .and_then(|t| t.get("name"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| task_dir.file_name().unwrap().to_string_lossy().into_owned());
+        tasks.push(Task {
+            name,
+            level: "benchmark".into(),
+            suite: suite.name.clone(),
+            capability: if category.is_empty() {
+                suite.name.clone()
+            } else {
+                category
+            },
+            difficulty: meta("difficulty"),
+            path: Some(
+                task_dir
+                    .strip_prefix(dir)
+                    .unwrap_or(task_dir)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            digest: None,
+        });
+    }
+    if let Some(n) = suite.sample {
+        // A fixed pseudo-random sample: the same names across runs and hosts.
+        tasks.sort_by_key(|t| fnv1a(&t.name));
+        tasks.truncate(n);
+    }
+    tasks.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(tasks)
+}
+
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf29ce484222325, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// The tasks a command works on: a suite's, a level's, or every catalog task.
+fn tasks(o: &Opts) -> Result<Vec<Task>> {
+    let dir = eval_dir();
+    let all = match (&o.suite, &o.level) {
+        (Some(name), _) => {
+            let all = suites(&dir)?;
+            let suite = all.iter().find(|s| &s.name == name).with_context(|| {
+                let names: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
+                format!("unknown suite `{name}`; suites: {names:?}")
+            })?;
+            suite_tasks(&dir, suite)?
+        }
+        (None, Some(level)) => catalog(&dir)?
+            .into_iter()
+            .filter(|t| &t.level == level)
+            .collect(),
+        (None, None) => catalog(&dir)?,
+    };
+    Ok(select(o, all))
 }
 
 /// Hand-authored task names mapped to their directories.
@@ -233,15 +423,30 @@ fn select(o: &Opts, tasks: Vec<Task>) -> Vec<Task> {
 }
 
 fn cmd_list(o: &Opts) -> Result<i32> {
-    let tasks = select(o, catalog(&eval_dir())?);
+    let tasks = tasks(o)?;
     for t in &tasks {
-        let src = if t.local() { "local" } else { "registry" };
+        let src = match (&t.path, t.local()) {
+            (_, true) => "local",
+            (Some(_), false) => "dataset",
+            (None, _) => "registry",
+        };
+        let level = if t.suite.is_empty() {
+            t.level.clone()
+        } else {
+            format!("{}/{}", t.level, t.suite)
+        };
         println!(
-            "{:<60} {:<13} {:<7} {src}",
-            t.name, t.capability, t.difficulty
+            "{:<60} {:<22} {:<22} {:<7} {src}",
+            t.name, level, t.capability, t.difficulty
         );
     }
     println!("{} task(s)", tasks.len());
+    if o.level.is_none() && o.suite.is_none() {
+        println!("\nbenchmark suites (cargo eval bench SUITE):");
+        for s in suites(&eval_dir())? {
+            println!("  {:<16} {}", s.name, s.description);
+        }
+    }
     Ok(0)
 }
 
@@ -268,7 +473,7 @@ fn in_repo(script: &str) -> Result<()> {
     sh(Command::new("bash")
         .args(["-c", script])
         .current_dir(root())
-        .env("PYTHONPATH", root().join("benchmark")))
+        .env("PYTHONPATH", eval_dir().join("harbor")))
 }
 
 /// Builds static genji and genji-drive, which Harbor uploads into task containers.
@@ -322,12 +527,11 @@ fn harbor_run(o: &Opts, job: &str, agent: &str, tasks: &[Task], attempts: u32) -
     ];
     if agent.starts_with("genji_agent") {
         args.push("--artifact /app --ak catalog=eval/catalog.toml".into());
-        if let Some(p) = &o.profile {
-            args.push(format!("--ak profile=eval/profiles/{p}.json"));
-        }
-        if let Some(m) = &o.model {
-            args.push(format!("-m {}", quote(m)));
-        }
+        let config = config_path(o)?;
+        args.push(format!(
+            "--ak genji_config={}",
+            quote(&config.to_string_lossy())
+        ));
         if let Some(a) = &o.agents {
             // Kept with the job.
             copy_dir(
@@ -340,7 +544,36 @@ fn harbor_run(o: &Opts, job: &str, agent: &str, tasks: &[Task], attempts: u32) -
     in_repo(&args.join(" "))
 }
 
-fn provenance(o: &Opts, job: &str) -> Result<()> {
+/// The runner's genji config: `--config`, else `eval/config.json`.
+fn config_path(o: &Opts) -> Result<PathBuf> {
+    let path = match &o.config {
+        Some(c) => fs::canonicalize(c).with_context(|| format!("--config {c}"))?,
+        None => eval_dir().join("config.json"),
+    };
+    anyhow::ensure!(
+        path.is_file(),
+        "no genji config at {}; copy eval/config.example.json to eval/config.json and fill it in, or pass --config FILE",
+        path.display()
+    );
+    Ok(path)
+}
+
+/// The config with its secrets removed, for the job's provenance.
+fn redacted(mut cfg: Value) -> Value {
+    if let Some(providers) = cfg["providers"].as_object_mut() {
+        for p in providers.values_mut() {
+            if let Some(p) = p.as_object_mut() {
+                if p.contains_key("api_key") {
+                    p.insert("api_key".into(), json!("<redacted>"));
+                }
+                p.remove("headers");
+            }
+        }
+    }
+    cfg
+}
+
+fn provenance(o: &Opts, job: &str, tasks: &[Task]) -> Result<()> {
     let dir = eval_dir().join("jobs").join(job);
     fs::create_dir_all(&dir)?;
     let git = |args: &[&str]| capture(Command::new("git").args(args).current_dir(root()));
@@ -348,20 +581,17 @@ fn provenance(o: &Opts, job: &str) -> Result<()> {
     if dirty {
         fs::write(dir.join("genji.diff"), git(&["diff", "HEAD"]))?;
     }
-    let profile = o
-        .profile
-        .as_ref()
-        .and_then(|p| {
-            fs::read_to_string(eval_dir().join("profiles").join(format!("{p}.json"))).ok()
-        })
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let config = fs::read_to_string(config_path(o)?)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .map(redacted);
     let info = json!({
         "commit": git(&["rev-parse", "HEAD"]),
         "dirty": dirty,
         "host": capture(&mut Command::new("hostname")),
-        "profile": o.profile,
-        "profile_config": profile,
-        "model": o.model,
+        "config": config,
+        "level": o.level,
+        "suite": o.suite,
         "agents": o.agents,
         "attempts": o.attempts,
         "filters": o.positional,
@@ -369,31 +599,56 @@ fn provenance(o: &Opts, job: &str) -> Result<()> {
         "difficulty": o.difficulty,
     });
     fs::write(dir.join("genji.json"), serde_json::to_string_pretty(&info)?)?;
+    write_tasks(&dir, tasks)
+}
+
+/// What `report` needs to know about the job's tasks, kept with the job.
+fn write_tasks(job: &Path, tasks: &[Task]) -> Result<()> {
+    let json: Vec<Value> = tasks
+        .iter()
+        .map(|t| {
+            json!({"name": t.name, "level": t.level, "suite": t.suite,
+                        "capability": t.capability, "difficulty": t.difficulty})
+        })
+        .collect();
+    fs::write(job.join("tasks.json"), serde_json::to_string_pretty(&json)?)?;
     Ok(())
 }
 
 fn cmd_run(o: &Opts) -> Result<i32> {
-    let tasks = select(o, catalog(&eval_dir())?);
+    let tasks = tasks(o)?;
     anyhow::ensure!(!tasks.is_empty(), "no task matches");
+    let prefix = o.suite.as_deref().or(o.level.as_deref()).unwrap_or("eval");
     let job = o
         .name
         .clone()
-        .unwrap_or_else(|| format!("eval-{}", timestamp()));
-    provenance(o, &job)?;
+        .unwrap_or_else(|| format!("{prefix}-{}", timestamp()));
+    provenance(o, &job, &tasks)?;
     build()?;
-    harbor_run(o, &job, "genji_agent:Genji", &tasks, o.attempts)?;
+    harbor_run(
+        o,
+        &job,
+        "genji_agent:Genji",
+        &tasks,
+        o.attempts.unwrap_or(1),
+    )?;
     report(&eval_dir().join("jobs").join(&job))
 }
 
 fn cmd_check(o: &Opts) -> Result<i32> {
-    let tasks: Vec<Task> = select(o, catalog(&eval_dir())?)
-        .into_iter()
-        .filter(Task::local)
-        .collect();
+    let tasks: Vec<Task> = tasks(o)?.into_iter().filter(Task::local).collect();
     anyhow::ensure!(!tasks.is_empty(), "no hand-authored task matches");
     let stamp = timestamp();
     let mut bad = 0;
     for (agent, want) in [("nop", 0.0), ("oracle", 1.0)] {
+        let tasks: Vec<Task> = tasks
+            .iter()
+            .filter(|t| agent == "nop" || t.has_oracle())
+            .cloned()
+            .collect();
+        if tasks.is_empty() {
+            continue;
+        }
         let job = format!("check-{agent}-{stamp}");
         harbor_run(o, &job, agent, &tasks, 1)?;
         for (task, trials) in trials_by_task(&eval_dir().join("jobs").join(&job))? {
@@ -410,12 +665,6 @@ fn cmd_check(o: &Opts) -> Result<i32> {
     }
     println!("check: {} task(s), {bad} problem(s)", tasks.len());
     Ok(if bad == 0 { 0 } else { 1 })
-}
-
-fn cmd_tb(o: &Opts) -> Result<i32> {
-    let target = o.positional.first().map(String::as_str).unwrap_or("light");
-    in_repo(&format!("make -C benchmark {}", quote(target)))?;
-    Ok(0)
 }
 
 // -- results -------------------------------------------------------------- //
@@ -507,12 +756,36 @@ impl Row {
     }
 }
 
-fn rows(job: &Path) -> Result<Vec<Row>> {
-    let cat: BTreeMap<String, Task> = catalog(&eval_dir())
+/// The job's tasks (from its tasks.json, else the catalog) by name.
+fn job_tasks(job: &Path) -> BTreeMap<String, Task> {
+    let mut out: BTreeMap<String, Task> = catalog(&eval_dir())
         .unwrap_or_default()
         .into_iter()
         .map(|t| (t.name.clone(), t))
         .collect();
+    let saved: Vec<Value> = fs::read_to_string(job.join("tasks.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    for t in saved {
+        let f = |k: &str| t[k].as_str().unwrap_or_default().to_string();
+        out.insert(
+            f("name"),
+            Task {
+                name: f("name"),
+                level: f("level"),
+                suite: f("suite"),
+                capability: f("capability"),
+                difficulty: f("difficulty"),
+                ..Default::default()
+            },
+        );
+    }
+    out
+}
+
+fn rows(job: &Path) -> Result<Vec<Row>> {
+    let cat = job_tasks(job);
     Ok(trials_by_task(job)?
         .into_iter()
         .map(|(task, trials)| {
@@ -740,8 +1013,23 @@ mod tests {
 
     #[test]
     fn catalog_entries_are_complete() {
+        let suites = suites(&eval_dir()).unwrap();
         for t in catalog(&eval_dir()).unwrap() {
             assert!(!t.capability.is_empty(), "{}: no capability", t.name);
+            assert!(
+                LEVELS.contains(&t.level.as_str()),
+                "{}: level {:?}",
+                t.name,
+                t.level
+            );
+            assert_eq!(
+                t.level == "benchmark",
+                suites
+                    .iter()
+                    .any(|s| s.dataset.is_none() && s.name == t.suite),
+                "{}: a benchmark-level task, and only one, names a catalog suite",
+                t.name
+            );
             assert!(
                 ["easy", "medium"].contains(&t.difficulty.as_str()),
                 "{}: difficulty {:?}",
@@ -751,8 +1039,8 @@ mod tests {
         }
     }
 
-    /// Every step of a hand-authored task has a prompt, a verifier and an oracle solution,
-    /// and its front matter parses.
+    /// Every step of a hand-authored task has a prompt and a verifier, and its front matter
+    /// parses.
     #[test]
     fn local_tasks_are_well_formed() {
         for (name, dir) in local_tasks(&eval_dir()).unwrap() {
@@ -765,7 +1053,7 @@ mod tests {
                 None => vec![dir.clone()],
             };
             for s in steps {
-                for f in ["instruction.md", "tests/test.sh", "solution/solve.sh"] {
+                for f in ["instruction.md", "tests/test.sh", "tests/test.py"] {
                     assert!(
                         s.join(f).is_file(),
                         "{name}: missing {}",
@@ -784,16 +1072,140 @@ mod tests {
         }
     }
 
+    /// Unit tasks stay quick: a slow one is a capability benchmark, not a feature check.
     #[test]
-    fn verifier_helpers_are_current() {
-        let lib = fs::read_to_string(eval_dir().join("lib/verify.sh")).unwrap();
-        for copy in find(&eval_dir().join("tasks"), "lib.sh") {
-            assert_eq!(
-                fs::read_to_string(&copy).unwrap(),
-                lib,
-                "{} differs from eval/lib/verify.sh",
-                copy.display()
+    fn unit_tasks_are_quick() {
+        let local = local_tasks(&eval_dir()).unwrap();
+        for t in catalog(&eval_dir())
+            .unwrap()
+            .iter()
+            .filter(|t| t.level == "unit")
+        {
+            let dir = local
+                .get(&t.name)
+                .unwrap_or_else(|| panic!("{}: not hand-authored", t.name));
+            let toml = load_toml(&dir.join("task.toml")).unwrap();
+            let secs = |k: &str| toml[k]["timeout_sec"].as_float().unwrap_or(f64::MAX);
+            assert!(
+                secs("agent") <= 120.0,
+                "{}: agent timeout over 120s",
+                t.name
             );
+            assert!(
+                secs("verifier") <= 30.0,
+                "{}: verifier timeout over 30s",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn suites_are_well_formed() {
+        for s in suites(&eval_dir()).unwrap() {
+            assert!(!s.description.is_empty(), "{}: no description", s.name);
+            if let Some(d) = &s.dataset {
+                assert!(
+                    d.contains('/') && d.contains('@'),
+                    "{}: pin `org/name@revision`",
+                    s.name
+                );
+            } else {
+                assert!(
+                    !suite_tasks(&eval_dir(), &s).unwrap().is_empty(),
+                    "{}: no task",
+                    s.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dataset_suites_filter_by_category_and_sample_stably() {
+        let dir = std::env::temp_dir().join(format!("genji-eval-ds-{}", std::process::id()));
+        for (n, cat) in [
+            ("a", "debugging"),
+            ("b", "games"),
+            ("c", "debugging"),
+            ("d", "debugging"),
+        ] {
+            let t = dir.join(".store/ds/x").join(n);
+            fs::create_dir_all(&t).unwrap();
+            let toml = format!(
+                "[task]\nname = \"org/{n}\"\n[metadata]\ncategory = \"{cat}\"\ndifficulty = \"hard\"\n"
+            );
+            fs::write(t.join("task.toml"), toml).unwrap();
+        }
+        let suite = |category: &[&str], sample| Suite {
+            name: "s".into(),
+            category: category.iter().map(|c| c.to_string()).collect(),
+            sample,
+            ..Default::default()
+        };
+        let names = |s: &Suite| -> Vec<String> {
+            dataset_tasks(&dir, ".store/ds", s)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.name)
+                .collect()
+        };
+        assert_eq!(names(&suite(&[], None)).len(), 4);
+        assert_eq!(
+            names(&suite(&["debugging"], None)),
+            ["org/a", "org/c", "org/d"]
+        );
+        let sampled = names(&suite(&["debugging"], Some(2)));
+        assert_eq!(sampled.len(), 2);
+        assert_eq!(sampled, names(&suite(&["debugging"], Some(2))));
+        let t = &dataset_tasks(&dir, ".store/ds", &suite(&["games"], None)).unwrap()[0];
+        assert_eq!(
+            (t.capability.as_str(), t.difficulty.as_str()),
+            ("games", "hard")
+        );
+        assert_eq!(t.path.as_deref(), Some(".store/ds/x/b"));
+        assert!(!t.local());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn level_commands_set_the_level_or_suite() {
+        let p = |args: &[&str]| parse(args.iter().map(|s| s.to_string()).collect()).unwrap();
+        let o = p(&["unit", "socket"]);
+        assert_eq!(
+            (o.cmd.as_str(), o.level.as_deref(), o.attempts),
+            ("run", Some("unit"), Some(1))
+        );
+        assert_eq!(o.positional, ["socket"]);
+        let o = p(&["bench", "tb-light", "-k", "2"]);
+        assert_eq!(
+            (o.suite.as_deref(), o.attempts),
+            (Some("tb-light"), Some(2))
+        );
+        assert_eq!(p(&["run"]).attempts, Some(3));
+        assert!(parse(vec!["run".into(), "--level".into(), "nope".into()]).is_err());
+        assert!(parse(vec!["bench".into()]).is_err());
+    }
+
+    #[test]
+    fn provenance_redacts_keys() {
+        let cfg = json!({"providers": {"p": {"api_key": "sk-secret", "headers": {"x": "y"}, "model": "m"}}});
+        let r = redacted(cfg).to_string();
+        assert!(!r.contains("sk-secret") && !r.contains("headers") && r.contains("\"m\""));
+    }
+
+    /// Every task's tests/verify.py and solution/oracle.py are copies of the ones in eval/lib.
+    /// A verifier that does not parse would only show up inside a task container.
+    #[test]
+    fn verifiers_are_valid_python() {
+        for (name, dir) in local_tasks(&eval_dir()).unwrap() {
+            for test in find(&dir, "test.py") {
+                let ok = Command::new("python3")
+                    .args(["-c", "import ast, sys; ast.parse(open(sys.argv[1]).read())"])
+                    .arg(&test)
+                    .status()
+                    .unwrap()
+                    .success();
+                assert!(ok, "{name}: {} does not parse", test.display());
+            }
         }
     }
 

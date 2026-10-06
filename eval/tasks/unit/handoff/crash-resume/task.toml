@@ -1,0 +1,25 @@
+schema_version = "1.3"
+multi_step_reward_strategy = "final"
+
+[task]
+name = "genji/crash-resume"
+description = "genji is killed mid-task; the resumed session must finish the work"
+
+[metadata]
+difficulty = "easy"
+category = "handoff"
+
+[agent]
+timeout_sec = 120.0
+
+[verifier]
+timeout_sec = 30.0
+
+[environment]
+build_timeout_sec = 600.0
+
+[[steps]]
+name = "work"
+
+[[steps]]
+name = "resume"

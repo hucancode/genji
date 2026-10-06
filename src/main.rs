@@ -124,6 +124,11 @@ fn resolve_config(o: &Opts, ws: &Path, create: bool) -> Result<Config> {
     Ok(cfg)
 }
 
+/// The provider profile `--provider` or else `$GENJI_PROVIDER` names; `None` keeps `config.provider`.
+fn chosen_provider(flag: Option<&str>, env: Option<String>) -> Option<String> {
+    flag.map(str::to_string).or(env).filter(|p| !p.is_empty())
+}
+
 fn workspace(o: &Opts) -> Result<PathBuf> {
     let w = match &o.workspace {
         Some(w) => PathBuf::from(w),
@@ -251,12 +256,7 @@ fn run_agent(o: Opts) -> Result<i32> {
         eprintln!("unknown agent or command `{name}`\n\n{}", usage(&agents));
         return Ok(2);
     };
-    if let Some(p) = o
-        .provider
-        .clone()
-        .or_else(|| std::env::var("GENJI_PROVIDER").ok())
-        .filter(|p| !p.is_empty())
-    {
+    if let Some(p) = chosen_provider(o.provider.as_deref(), std::env::var("GENJI_PROVIDER").ok()) {
         cfg.provider = p;
     }
     let mut provider = cfg.provider()?;
@@ -571,6 +571,51 @@ mod tests {
             ),
             (Some("/s.sock"), Some("/sess"), Some(500), true)
         );
+    }
+
+    #[test]
+    fn config_json_beats_config_beats_the_workspace_file() {
+        let ws = storage::util::temp_dir("config-precedence");
+        let limit = |n: u64| format!("{{\"time_limit_secs\": {n}}}");
+        storage::util::write_file(&dot(&ws, "config.json"), limit(1)).unwrap();
+        let file = ws.join("other.json");
+        std::fs::write(&file, limit(2)).unwrap();
+        let file = file.to_str().unwrap();
+        let secs = |args: &[&str]| {
+            resolve_config(&p(args), &ws, false)
+                .unwrap()
+                .time_limit_secs
+        };
+        assert_eq!(secs(&[]), 1);
+        assert_eq!(secs(&["--config", file]), 2);
+        assert_eq!(secs(&["--config", file, "--config-json", &limit(3)]), 3);
+    }
+
+    #[test]
+    fn provider_flag_beats_env_beats_config() {
+        let env = || Some("env".to_string());
+        assert_eq!(
+            chosen_provider(Some("flag"), env()).as_deref(),
+            Some("flag")
+        );
+        assert_eq!(chosen_provider(None, env()).as_deref(), Some("env"));
+        assert_eq!(chosen_provider(None, None), None, "config.provider stays");
+        assert_eq!(chosen_provider(None, Some(String::new())), None);
+    }
+
+    #[test]
+    fn token_limit_flag_beats_config_and_provider() {
+        let ws = storage::util::temp_dir("config-tokens");
+        let provider = config::Provider::default();
+        let limit = |args: &[&str]| {
+            resolve_config(&p(args), &ws, false)
+                .unwrap()
+                .token_limit(&provider)
+        };
+        let json = r#"{"token_limit": 50}"#;
+        assert_eq!(limit(&[]), provider.token_limit);
+        assert_eq!(limit(&["--config-json", json]), 50);
+        assert_eq!(limit(&["--config-json", json, "--token-limit", "7"]), 7);
     }
 
     #[test]

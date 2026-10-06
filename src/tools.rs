@@ -1116,6 +1116,61 @@ mod tests {
     }
 
     #[test]
+    fn clipped_results_keep_the_head_and_bash_also_the_tail() {
+        let ws = temp_dir("clipped");
+        let text = format!("HEAD{}TAIL", "x".repeat(500));
+        let bash = bounded_result(&ws, 100, "bash", text.clone());
+        assert!(
+            bash.starts_with("HEAD") && bash.contains("TAIL\n[result"),
+            "{bash}"
+        );
+        let read = bounded_result(&ws, 100, "read", text);
+        assert!(read.starts_with("HEAD") && !read.contains("TAIL"), "{read}");
+        assert!(read.contains("[result (508 bytes) written to "), "{read}");
+    }
+
+    #[test]
+    fn tools_outside_the_allowlist_are_refused() {
+        let mut a = agent_for(reviewed_build());
+        let (out, is_error) = dispatch(&mut a, "bash", &json!({"command": "true"}));
+        assert!(is_error);
+        assert_eq!(out, "ERROR: tool `bash` is not available to this agent");
+    }
+
+    #[test]
+    fn bash_reports_its_timeout() {
+        let mut def = reviewed_build();
+        def.tools.push("bash".into());
+        let mut a = agent_for(def);
+        let args = json!({"command": "sleep 5", "timeout_secs": 1});
+        let (out, _) = dispatch(&mut a, "bash", &args);
+        assert!(out.contains("[timed out after 1s]"), "{out}");
+    }
+
+    #[test]
+    fn finish_records_one_verdict_per_run() {
+        let mut a = agent_for(reviewed_build());
+        finish(&mut a, &json!({"status": "done", "summary": "s"})).unwrap();
+        let again = finish(&mut a, &json!({"status": "done", "summary": "s"}));
+        assert!(format!("{:#}", again.unwrap_err()).contains("already recorded"));
+        a.agents.insert("build".into(), reviewed_build());
+        let e = hand_off(&mut a, &json!({"agent": "build", "task": "t"})).unwrap_err();
+        assert!(format!("{e:#}").contains("already recorded"), "{e:#}");
+    }
+
+    #[test]
+    fn subagents_cannot_hand_off_or_spawn_past_the_depth_limit() {
+        let mut a = agent_for(reviewed_build());
+        a.agents.insert("build".into(), reviewed_build());
+        a.parent_agent = Some("plan".into());
+        let e = hand_off(&mut a, &json!({"agent": "build", "task": "t"})).unwrap_err();
+        assert!(format!("{e:#}").contains("reports with `finish`"), "{e:#}");
+        a.depth = a.cfg.max_subagent_depth;
+        let e = spawn(&mut a, &json!({"agent": "build", "instructions": "x"})).unwrap_err();
+        assert_eq!(format!("{e:#}"), "subagent depth limit reached (2 >= 2)");
+    }
+
+    #[test]
     fn specs_follow_the_agent_definition() {
         let agents = defs(&[
             (

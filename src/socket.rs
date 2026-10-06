@@ -499,6 +499,40 @@ mod socket_tests {
     }
 
     #[test]
+    fn status_replies_with_the_current_status_line() {
+        let (ctrl, sock) = start("control-status", "");
+        assert_eq!(send(&sock, "/status").unwrap(), "status: starting");
+        ctrl.set_status("idle");
+        assert_eq!(send(&sock, "/status").unwrap(), "status: idle");
+        ctrl.shutdown();
+    }
+
+    #[test]
+    fn socket_is_private_replaces_a_stale_one_and_is_removed_on_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+        let sock = temp_dir("control-stale").join("control.sock");
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        assert!(sock.exists(), "a crashed run leaves its socket file");
+        let composer = || {
+            Arc::new(RwLock::new(ContextComposer::new(
+                String::new(),
+                Vec::new(),
+                1000,
+            )))
+        };
+        let ctrl = Control::open(Some(sock.clone()), composer()).expect("replace stale socket");
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(send(&sock, "/ping").unwrap(), "pong");
+        assert!(
+            Control::open(Some(sock.clone()), composer()).is_err(),
+            "a live socket is kept"
+        );
+        ctrl.shutdown();
+        assert!(!sock.exists());
+    }
+
+    #[test]
     fn watch_streams_published_lines_on_the_same_connection() {
         let (ctrl, sock) = start("control-watch", "");
         let s = UnixStream::connect(&sock).unwrap();

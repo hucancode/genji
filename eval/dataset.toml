@@ -176,3 +176,8 @@ digest = "sha256:76ff913a476696f65136f84e952145868f1c74eefa3f52fa225fdc4d9c5a0db
 [[tasks]]
 name = "ai-forever/harness-bench-fast__task_187_dead_functions"
 digest = "sha256:ac42b599bc68e47249f06ed96632e93c49278b354566de8bceb44a7a01ad0b13"
+
+[[tasks]]
+name = "hello-world/hello-world"
+digest = "sha256:38d7a077f07fbee8efc78db5dec9a72f82e727510ad1dcfeac0b55fa845256b7"
+
