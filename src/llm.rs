@@ -1,11 +1,11 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::config::Provider;
+use crate::config::{Api, Auth, Provider};
+use crate::storage::util::truncate;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -117,55 +117,6 @@ pub fn estimate_messages(messages: &[ChatMessage]) -> i64 {
     messages.iter().map(ChatMessage::est_tokens).sum::<i64>() + 8
 }
 
-#[derive(Debug, Deserialize)]
-struct WireResponse {
-    choices: Vec<WireChoice>,
-    #[serde(default)]
-    usage: Usage,
-}
-
-#[derive(Debug, Deserialize)]
-struct WireChoice {
-    #[serde(default)]
-    message: WireMessage,
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct WireMessage {
-    content: Option<String>,
-    reasoning_content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<WireToolCall>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WireToolCall {
-    id: Option<String>,
-    #[serde(default)]
-    function: WireFunction,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct WireFunction {
-    name: Option<String>,
-    arguments: Option<Value>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct Usage {
-    prompt_tokens: i64,
-    completion_tokens: i64,
-    prompt_tokens_details: PromptDetails,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct PromptDetails {
-    cached_tokens: i64,
-}
-
 #[derive(Debug)]
 pub struct LlmResponse {
     pub message: ChatMessage,
@@ -227,7 +178,7 @@ impl LlmClient {
     ) -> Result<LlmResponse> {
         let p = &self.provider;
         let hint = hint.map(|h| ChatMessage::user(format!("[note] {h}")));
-        let body = if p.api == "anthropic" {
+        let body = if p.api == Api::Anthropic {
             serde_json::to_vec(&anthropic_request(
                 &self.model,
                 messages,
@@ -275,7 +226,7 @@ impl LlmClient {
             retry_after: None,
         };
         let p = &self.provider;
-        let anthropic = p.api == "anthropic";
+        let anthropic = p.api == Api::Anthropic;
         let url = format!(
             "{}/{}",
             p.base_url.trim_end_matches('/'),
@@ -323,7 +274,7 @@ impl LlmClient {
 
 /// Auth, version and custom headers every request to `p` carries.
 fn authorize(p: &Provider, mut req: ureq::Request) -> ureq::Request {
-    let anthropic = p.api == "anthropic";
+    let anthropic = p.api == Api::Anthropic;
     if anthropic {
         req = req.set("anthropic-version", "2023-06-01");
     }
@@ -331,7 +282,7 @@ fn authorize(p: &Provider, mut req: ureq::Request) -> ureq::Request {
     if !key.is_empty() {
         req = if anthropic {
             req.set("x-api-key", &key)
-        } else if p.auth == "api-key" {
+        } else if p.auth == Auth::ApiKey {
             req.set("api-key", &key)
         } else {
             req.set("Authorization", &format!("Bearer {key}"))
@@ -353,7 +304,7 @@ pub fn model_context_window(p: &Provider, model: &str) -> Option<i64> {
     let base = p.base_url.trim_end_matches('/');
     let get =
         |url: &str| -> Option<Value> { authorize(p, agent.get(url)).call().ok()?.into_json().ok() };
-    if p.api == "anthropic" {
+    if p.api == Api::Anthropic {
         return get(&format!("{base}/models/{model}")).and_then(|v| v["max_input_tokens"].as_i64());
     }
     get(&format!("{base}/models"))
@@ -389,43 +340,50 @@ fn backoff(attempt: u32) -> Duration {
 }
 
 fn parse_response(text: &str) -> Result<LlmResponse> {
-    let parsed: WireResponse = serde_json::from_str(text)
+    let v: Value = serde_json::from_str(text)
         .with_context(|| format!("parsing llm response: {}", truncate(text, 400)))?;
-    let choice = parsed
-        .choices
+    let choice = &v["choices"][0];
+    if choice.is_null() {
+        bail!("llm response has no choices: {}", truncate(text, 400));
+    }
+    let m = &choice["message"];
+    let tool_calls = m["tool_calls"]
+        .as_array()
         .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("llm response has no choices: {}", truncate(text, 400)))?;
-    let tool_calls = choice
-        .message
-        .tool_calls
-        .into_iter()
+        .flatten()
         .enumerate()
-        .map(|(i, call)| {
-            let arguments = match call.function.arguments {
-                None => "{}".to_string(),
-                Some(Value::String(s)) => s,
-                Some(v) => v.to_string(),
+        .map(|(i, c)| {
+            let f = &c["function"];
+            // Kept as the raw string the model produced so a replayed request is byte-identical.
+            let arguments = match &f["arguments"] {
+                Value::Null => "{}".to_string(),
+                Value::String(s) => s.clone(),
+                a => a.to_string(),
             };
             ToolCall::new(
-                call.id.unwrap_or_else(|| format!("call_{i}")),
-                call.function.name.unwrap_or_default(),
+                c["id"]
+                    .as_str()
+                    .map_or_else(|| format!("call_{i}"), String::from),
+                f["name"].as_str().unwrap_or_default(),
                 arguments,
             )
         })
         .collect();
+    let u = &v["usage"];
     Ok(LlmResponse {
         message: ChatMessage {
             role: Role::Assistant,
-            content: choice.message.content.unwrap_or_default(),
+            content: m["content"].as_str().unwrap_or_default().to_string(),
             tool_calls,
             tool_call_id: None,
-            reasoning_content: choice.message.reasoning_content,
+            reasoning_content: m["reasoning_content"].as_str().map(String::from),
         },
-        prompt_tokens: parsed.usage.prompt_tokens,
-        completion_tokens: parsed.usage.completion_tokens,
-        cached_tokens: parsed.usage.prompt_tokens_details.cached_tokens,
-        truncated: choice.finish_reason.as_deref() == Some("length"),
+        prompt_tokens: u["prompt_tokens"].as_i64().unwrap_or(0),
+        completion_tokens: u["completion_tokens"].as_i64().unwrap_or(0),
+        cached_tokens: u["prompt_tokens_details"]["cached_tokens"]
+            .as_i64()
+            .unwrap_or(0),
+        truncated: choice["finish_reason"] == "length",
     })
 }
 
@@ -578,64 +536,9 @@ fn parse_anthropic(text: &str) -> Result<LlmResponse> {
     })
 }
 
-pub fn truncate(s: &str, max: usize) -> Cow<'_, str> {
-    if s.len() <= max {
-        return Cow::Borrowed(s);
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    Cow::Owned(format!(
-        "{}… [{} bytes truncated]",
-        &s[..end],
-        s.len() - end
-    ))
-}
-
-/// Join the kept head and tail of a text, noting how many bytes were dropped between them.
-pub fn join_head_tail(head: &str, tail: &str, omitted: usize) -> String {
-    format!("{head}\n[... {omitted} bytes omitted ...]\n{tail}")
-}
-
-/// Keep the first two thirds and the last third of `s`, cut on char boundaries; command
-/// output often puts the failure or summary at the end.
-pub fn head_and_tail(s: &str, max: usize) -> Cow<'_, str> {
-    if s.len() <= max {
-        return Cow::Borrowed(s);
-    }
-    let (mut head, mut tail) = (max * 2 / 3, max / 3);
-    while head > 0 && !s.is_char_boundary(head) {
-        head -= 1;
-    }
-    tail = s.len().saturating_sub(tail);
-    while tail < s.len() && !s.is_char_boundary(tail) {
-        tail += 1;
-    }
-    Cow::Owned(join_head_tail(&s[..head], &s[tail..], tail - head))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ChatMessage, Request, ToolCall, truncate};
-
-    #[test]
-    fn truncates_on_char_boundary() {
-        let s = "é".repeat(50);
-        let out = truncate(&s, 11);
-        assert!(out.contains("truncated"));
-        assert!(out.len() < 50 * 2 + 40);
-        assert_eq!(truncate("hi", 10), "hi");
-    }
-
-    #[test]
-    fn head_and_tail_keeps_both_ends() {
-        let s = format!("{}MID{}", "a".repeat(100), "z".repeat(100));
-        let out = super::head_and_tail(&s, 30);
-        assert!(out.starts_with("aaaa") && out.ends_with("zzzz") && out.contains("omitted"));
-        assert!(!out.contains("MID") && out.len() < 100);
-        assert_eq!(super::head_and_tail("short", 30), "short");
-    }
+    use super::{ChatMessage, Request, ToolCall};
 
     #[test]
     fn parses_cached_tokens_and_truncation() {

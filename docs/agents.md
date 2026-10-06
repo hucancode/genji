@@ -5,7 +5,7 @@ An agent is a markdown file: frontmatter plus the system prompt.
 ```markdown
 ---
 description: Reviews a diff and reports problems     # shown in `genji --help` and in other agents' prompts
-tools: read, ls, bash, finish                        # read write edit ls bash plan_write spawn ask hand_off finish verdict
+tools: read, ls, bash, finish                        # read write edit ls bash spawn ask hand_off finish verdict
 skills: formal                                         # optional: skills inlined into the system prompt at start
 context: docs/notes.md                                 # optional: files (or `dir/` listings) put in front of a fresh instance's task, after which come those of forced skills (`metadata.context`)
 finish: handoff, blocked                             # optional: statuses `finish` accepts (default: done, handoff, blocked)
@@ -40,7 +40,7 @@ The files `genji init` writes:
 
 | agent | tools | `finish` | role |
 |---|---|---|---|
-| `plan` | read write edit ls bash plan_write spawn ask finish | done, blocked; reviewed | breaks the request into requirements (or follows a requirements skill), settles decisions through `ask`, delegates fact-finding to `explore`, and writes a self-contained plan to `docs/notes/` (or tickets, under a ticket skill): steps with acceptance criteria, the tests that prove them, seed data, and a test and verification strategy; never writes code or tests, never hands off |
+| `plan` | read write edit ls bash spawn ask finish | done, blocked; reviewed | breaks the request into requirements (or follows a requirements skill), settles decisions through `ask`, delegates fact-finding to `explore`, and writes a self-contained plan to `docs/notes/` (or tickets, under a ticket skill): steps with acceptance criteria, the tests that prove them, seed data, and a test and verification strategy; never writes code or tests, never hands off |
 | `build` | read write edit ls bash spawn finish | done, blocked; reviewed | implements and verifies; delegates exploration to `explore` via `spawn`; `finish done` submits the work to its review pass |
 | `explore` | read ls bash spawn finish | handoff, blocked | internal; investigates read-only, hands terse `path:line` findings back to the agent that spawned it |
 | `retro` | read write edit ls bash finish | done, blocked | improves agents and skills from recorded sessions |

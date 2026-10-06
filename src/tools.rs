@@ -11,7 +11,7 @@ use crate::agent::Agent;
 use crate::config::{AgentDef, DEFAULT_FINISH};
 use crate::storage::events;
 use crate::storage::proc;
-use crate::storage::util::{TempPath, relative_path, sanitize, slugify, tmp_file, write_file};
+use crate::storage::util::{TempPath, relative_path, sanitize, tmp_file, write_file};
 
 /// Deserialize a tool payload.
 fn parse_args<'a, T: Deserialize<'a>>(args: &'a Value) -> Result<T> {
@@ -336,30 +336,6 @@ fn bash(agent: &mut Agent, args: &Value) -> Result<String> {
     Ok(out)
 }
 
-// --- plans and skills -----------------------------------------------------
-
-#[derive(Deserialize)]
-struct PlanArgs {
-    title: String,
-    content: String,
-}
-
-/// Write a plan to `docs/notes/<title-slug>.md`, adding a `# title` heading when missing.
-fn plan_write(agent: &mut Agent, args: &Value) -> Result<String> {
-    let a: PlanArgs = parse_args(args)?;
-    let path = agent
-        .workspace
-        .join("docs/notes")
-        .join(format!("{}.md", slugify(&a.title, "plan")));
-    let body = if a.content.trim_start().starts_with("# ") {
-        a.content.clone()
-    } else {
-        format!("# {}\n\n{}", a.title.trim(), a.content.trim_start())
-    };
-    write_file(&path, body)?;
-    Ok(format!("wrote plan to {}", agent.display_path(&path)))
-}
-
 // --- ask ------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -528,15 +504,15 @@ fn check_may_spawn(
     agents: &BTreeMap<String, AgentDef>,
     target: &str,
 ) -> Result<()> {
+    if agents.contains_key(target) && def.may_spawn(target) {
+        return Ok(());
+    }
     let allowed: Vec<_> = agents
         .keys()
         .filter(|n| def.may_spawn(n))
         .cloned()
         .collect();
-    if !allowed.iter().any(|n| n == target) {
-        bail!("cannot spawn `{target}`; available: {}", allowed.join(", "));
-    }
-    Ok(())
+    bail!("cannot spawn `{target}`; available: {}", allowed.join(", "))
 }
 
 /// Ends this run; genji continues with a fresh instance of `agent` working on `task`.
@@ -641,7 +617,7 @@ fn child_report(child: &str, agent: &str, events: &[Value], timed_out: bool, cap
             )
         }
     };
-    json!({ "subagent": child, "agent": agent, "status": status, "report": crate::llm::truncate(&report, cap), "run": run }).to_string()
+    json!({ "subagent": child, "agent": agent, "status": status, "report": crate::storage::util::truncate(&report, cap), "run": run }).to_string()
 }
 
 /// Run a child genji and return its handoff. The child id is derived from the
@@ -678,7 +654,6 @@ fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
     ]
     .map(String::from)
     .into();
-    cmd.extend(["--sessions-dir".into(), sessions.to_string_lossy().into()]);
     // The child's own socket, next to this one; none when this run has none.
     match &agent.control.path {
         Some(p) => {
@@ -687,13 +662,23 @@ fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
         }
         None => cmd.push("--socket-disabled".into()),
     }
-    if let Some(d) = &agent.cfg.agents_dir {
-        cmd.extend(["--agents-dir".into(), d.to_string_lossy().into()]);
-        cmd.extend(["--config-json".into(), serde_json::to_string(&agent.cfg)?]);
+    // The child runs on this run's effective config, overrides included. It goes through a
+    // private file rather than argv, which other users can read.
+    let mut cfg = agent.cfg.clone();
+    cfg.sessions_dir = Some(sessions.clone());
+    cfg.agents_dir = Some(agent.cfg.agents(&agent.workspace));
+    let config = TempPath(tmp_file(&tmp, "subagent-config", "json"));
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&config.0)
+            .context("creating subagent config")?;
+        std::io::Write::write_all(&mut f, serde_json::to_string(&cfg)?.as_bytes())?;
     }
-    if agent.cfg.token_limit > 0 {
-        cmd.extend(["--token-limit".into(), agent.cfg.token_limit.to_string()]);
-    }
+    cmd.extend(["--config".into(), config.0.to_string_lossy().into()]);
     if session.exists() {
         let past = events::read(&session)?;
         if past.iter().any(|e| e["type"] == "instance_end") {
@@ -733,32 +718,16 @@ fn spawn(agent: &mut Agent, args: &Value) -> Result<String> {
 
 // --- registry -------------------------------------------------------------
 
-struct Tool {
-    name: &'static str,
-    description: &'static str,
-    parameters: Value,
-    handler: fn(&mut Agent, &Value) -> Result<String>,
-}
+type Handler = fn(&mut Agent, &Value) -> Result<String>;
 
-fn tool(
-    name: &'static str,
-    description: &'static str,
-    parameters: Value,
-    handler: fn(&mut Agent, &Value) -> Result<String>,
-) -> Tool {
-    Tool {
-        name,
-        description,
-        parameters,
-        handler,
-    }
-}
+/// A tool: name, description, JSON-schema parameters and handler.
+struct Tool(&'static str, &'static str, Value, Handler);
 
 fn registry() -> &'static [Tool] {
     static TOOLS: OnceLock<Vec<Tool>> = OnceLock::new();
     TOOLS.get_or_init(|| {
         vec![
-            tool("read", "Read a text file with line numbers; offset is 1-indexed. Prefer this over cat/sed/head/tail in bash for reading files: page large files with offset/limit.", json!({
+            Tool("read", "Read a text file with line numbers; offset is 1-indexed. Prefer this over cat/sed/head/tail in bash for reading files: page large files with offset/limit.", json!({
                 "type":"object",
                 "properties":{
                     "path":{"type":"string","description":"File path"},
@@ -767,12 +736,12 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["path"]
             }), read),
-            tool("write", "Create or overwrite a file, creating parent directories.", json!({
+            Tool("write", "Create or overwrite a file, creating parent directories.", json!({
                 "type":"object",
                 "properties":{"path":{"type":"string"},"content":{"type":"string"}},
                 "required":["path","content"]
             }), write),
-            tool("edit", "Apply precise text replacements to a file. Each oldText must match uniquely.", json!({
+            Tool("edit", "Apply precise text replacements to a file. Each oldText must match uniquely.", json!({
                 "type":"object",
                 "properties":{
                     "path":{"type":"string"},
@@ -785,7 +754,7 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["path"]
             }), edit),
-            tool("ls", "List files/directories respecting .gitignore.", json!({
+            Tool("ls", "List files/directories respecting .gitignore.", json!({
                 "type":"object",
                 "properties":{
                     "path":{"type":"string","description":"Directory (default .)"},
@@ -793,7 +762,7 @@ fn registry() -> &'static [Tool] {
                     "show_hidden":{"type":"boolean","description":"default false"}
                 }
             }), ls),
-            tool("bash", "Run a shell command via bash -c in the workspace. Returns exit code, stdout, stderr.", json!({
+            Tool("bash", "Run a shell command via bash -c in the workspace. Returns exit code, stdout, stderr.", json!({
                 "type":"object",
                 "properties":{
                     "command":{"type":"string"},
@@ -802,15 +771,7 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["command"]
             }), bash),
-            tool("plan_write", "Persist an implementation plan as markdown at docs/notes/<title-slug>.md. Reuse the same title to refine an existing plan.", json!({
-                "type":"object",
-                "properties":{
-                    "title":{"type":"string","description":"Short plan title; drives the file name and default heading"},
-                    "content":{"type":"string","description":"Plan body in markdown"}
-                },
-                "required":["title","content"]
-            }), plan_write),
-            tool("ask", "Ask the human a multiple-choice question and wait for the answer. If nobody replies in time, the recommended option is used. A free-text reply is possible and comes back marked as such.", json!({
+            Tool("ask", "Ask the human a multiple-choice question and wait for the answer. If nobody replies in time, the recommended option is used. A free-text reply is possible and comes back marked as such.", json!({
                 "type":"object",
                 "properties":{
                     "question":{"type":"string"},
@@ -819,7 +780,7 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["question","options","recommended"]
             }), ask),
-            tool("spawn", "Run a subagent that works on the instructions and hands its report back as this call's result.", json!({
+            Tool("spawn", "Run a subagent that works on the instructions and hands its report back as this call's result.", json!({
                 "type":"object",
                 "properties":{
                     "agent":{"type":"string","description":"Agent name"},
@@ -827,12 +788,12 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["agent","instructions"]
             }), spawn),
-            tool("hand_off", "Your context is getting heavy or a batch is done and work remains: end this run and continue in a fresh instance of `agent` (it may be yourself) with an empty context. `task` must stand alone: the goal, what is done, what is left, where the state lives (branch, files, failing test), and the assumptions so far.", json!({
+            Tool("hand_off", "Your context is getting heavy or a batch is done and work remains: end this run and continue in a fresh instance of `agent` (it may be yourself) with an empty context. `task` must stand alone: the goal, what is done, what is left, where the state lives (branch, files, failing test), and the assumptions so far.", json!({
                 "type":"object",
                 "properties":{"agent":{"type":"string"},"task":{"type":"string"}},
                 "required":["agent","task"]
             }), hand_off),
-            tool("finish", "End your run. done: the goal is achieved and verified. handoff: your part is done and `next.agent` continues with `next.task` (self-contained: goal, what is done, what is left, where the state lives). blocked: a human must step in.", json!({
+            Tool("finish", "End your run. done: the goal is achieved and verified. handoff: your part is done and `next.agent` continues with `next.task` (self-contained: goal, what is done, what is left, where the state lives). blocked: a human must step in.", json!({
                 "type":"object",
                 "properties":{
                     "status":{"type":"string","enum":DEFAULT_FINISH},
@@ -843,7 +804,7 @@ fn registry() -> &'static [Tool] {
                 },
                 "required":["status","summary"]
             }), finish),
-            tool("verdict", "End the review. done: the request is met and verified. reject: the work pass refines its work using `notes`. handoff: a separate part remains; a fresh work instance continues with `notes` as its task (self-contained: goal, what is done, what is left, where the state lives). blocked: a human must step in.", json!({
+            Tool("verdict", "End the review. done: the request is met and verified. reject: the work pass refines its work using `notes`. handoff: a separate part remains; a fresh work instance continues with `notes` as its task (self-contained: goal, what is done, what is left, where the state lives). blocked: a human must step in.", json!({
                 "type":"object",
                 "properties":{
                     "verdict":{"type":"string","enum":["done","reject","handoff","blocked"]},
@@ -860,7 +821,7 @@ pub fn check(def: &AgentDef) -> Result<()> {
     if let Some(t) = def
         .tools
         .iter()
-        .find(|t| !registry().iter().any(|r| r.name == t.as_str()))
+        .find(|t| !registry().iter().any(|r| r.0 == t.as_str()))
     {
         bail!("unknown tool `{t}`");
     }
@@ -878,7 +839,9 @@ pub fn check(def: &AgentDef) -> Result<()> {
 pub fn list() -> Vec<Value> {
     registry()
         .iter()
-        .map(|t| json!({"name": t.name, "description": t.description, "parameters": t.parameters}))
+        .map(|Tool(name, description, parameters, _)| {
+            json!({"name": name, "description": description, "parameters": parameters})
+        })
         .collect()
 }
 
@@ -886,13 +849,13 @@ pub fn list() -> Vec<Value> {
 pub fn specs(def: &AgentDef, subagent: bool) -> Vec<Value> {
     registry()
         .iter()
-        .filter(|t| def.tools.iter().any(|n| n == t.name))
-        .map(|t| {
-            let mut parameters = t.parameters.clone();
-            if t.name == "finish" {
+        .filter(|t| def.tools.iter().any(|n| n == t.0))
+        .map(|Tool(name, description, parameters, _)| {
+            let mut parameters = parameters.clone();
+            if *name == "finish" {
                 parameters["properties"]["status"]["enum"] = json!(finish_statuses(def, subagent));
             }
-            json!({"type": "function", "function": {"name": t.name, "description": t.description, "parameters": parameters}})
+            json!({"type": "function", "function": {"name": name, "description": description, "parameters": parameters}})
         })
         .collect()
 }
@@ -904,9 +867,9 @@ pub fn dispatch(agent: &mut Agent, name: &str, args: &Value) -> (String, bool) {
         }
         let t = registry()
             .iter()
-            .find(|t| t.name == name)
+            .find(|t| t.0 == name)
             .ok_or_else(|| anyhow!("unknown tool `{name}`"))?;
-        (t.handler)(agent, args)
+        (t.3)(agent, args)
     })();
     let (text, is_error) = match result {
         Ok(s) => (s, false),
@@ -930,9 +893,9 @@ fn bounded_result(workspace: &Path, max: usize, name: &str, text: String) -> Str
     }
     // Failures and summaries come last in command output, so keep the tail as well.
     let clipped = if name == "bash" {
-        crate::llm::head_and_tail(&text, max)
+        crate::storage::util::head_and_tail(&text, max)
     } else {
-        crate::llm::truncate(&text, max)
+        crate::storage::util::truncate(&text, max)
     };
     let path: PathBuf = tmp_file(
         &std::env::temp_dir(),
@@ -951,84 +914,32 @@ fn bounded_result(workspace: &Path, max: usize, name: &str, text: String) -> Str
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn results_over_the_cap_keep_both_ends() {
-        let s = format!("{}MID{}", "a".repeat(100), "z".repeat(100));
-        let out = crate::llm::head_and_tail(&s, 30);
-        assert!(out.starts_with("aaaa") && out.ends_with("zzzz") && out.contains("omitted"));
-        assert!(!out.contains("MID") && out.len() < 100);
-        assert_eq!(crate::llm::head_and_tail("short", 30), "short");
-    }
-
-    #[test]
-    fn handoff_without_summary_is_accepted() {
-        let def = crate::config::AgentDef {
-            name: "build".into(),
-            description: String::new(),
-            prompt: String::new(),
-            tools: vec![],
-            skills: vec![],
-            context: vec![],
-            finish: vec!["done".into(), "handoff".into()],
-            spawns: None,
-            model: None,
-            internal: false,
-            review: None,
-        };
-        let agents = std::collections::BTreeMap::from([("build".to_string(), def.clone())]);
-        let args = serde_json::json!({"status":"handoff","next":{"agent":"build","task":"t"}});
-        let v = super::validate_finish(&def, &agents, None, &args).unwrap();
-        assert_eq!(v.summary, "handed off to build");
-        let none = serde_json::json!({"status":"done"});
-        assert!(super::validate_finish(&def, &agents, None, &none).is_err());
-    }
-
-    #[test]
-    fn ask_options_accept_array_or_encoded_array_and_explain_otherwise() {
-        let ok = |v: serde_json::Value| super::parse_args::<super::AskArgs>(&v);
-        let base = |o: serde_json::Value| serde_json::json!({"question":"q","recommended":"a","options":o});
-        assert_eq!(
-            ok(base(serde_json::json!(["a", "b"]))).unwrap().options,
-            ["a", "b"]
-        );
-        assert_eq!(
-            ok(base(serde_json::json!("[\"a\",\"b\"]")))
-                .unwrap()
-                .options,
-            ["a", "b"]
-        );
-        let err = format!(
-            "{:#}",
-            ok(base(serde_json::json!("\n<parameter name=\"option\">x")))
-                .err()
-                .unwrap()
-        );
-        assert!(err.contains("JSON array of 2-6 strings"), "{err}");
-    }
-
     use super::*;
     use crate::config;
     use crate::storage::util::temp_dir;
 
-    fn reviewed_build() -> config::AgentDef {
-        config::AgentDef {
+    /// Agent definitions parsed from `(name, file text)`, without touching disk.
+    fn defs(files: &[(&str, &str)]) -> BTreeMap<String, AgentDef> {
+        files
+            .iter()
+            .map(|(n, text)| (n.to_string(), config::parse_agent(n, text).0))
+            .collect()
+    }
+
+    fn reviewed_build() -> AgentDef {
+        AgentDef {
             name: "build".into(),
-            description: String::new(),
             prompt: "work".into(),
             tools: ["read", "write", "hand_off", "finish"]
                 .map(String::from)
                 .into(),
-            skills: vec![],
-            context: vec![],
             finish: vec!["done".into()],
-            spawns: None,
-            model: None,
-            internal: false,
             review: Some("judge".into()),
+            ..Default::default()
         }
     }
 
-    fn agent_for(def: config::AgentDef) -> Agent {
+    fn agent_for(def: AgentDef) -> Agent {
         use std::sync::{Arc, RwLock};
         let context = Arc::new(RwLock::new(crate::storage::context::ContextComposer::new(
             String::new(),
@@ -1054,6 +965,20 @@ mod tests {
     }
 
     #[test]
+    fn ask_options_accept_array_or_encoded_array_and_explain_otherwise() {
+        let parse = |o: Value| {
+            parse_args::<AskArgs>(&json!({"question": "q", "recommended": "a", "options": o}))
+        };
+        assert_eq!(parse(json!(["a", "b"])).unwrap().options, ["a", "b"]);
+        assert_eq!(parse(json!("[\"a\",\"b\"]")).unwrap().options, ["a", "b"]);
+        let err = format!(
+            "{:#}",
+            parse(json!("<parameter name=\"option\">x")).err().unwrap()
+        );
+        assert!(err.contains("JSON array of 2-6 strings"), "{err}");
+    }
+
+    #[test]
     fn a_review_pass_ends_with_a_verdict() {
         let r = reviewed_build().reviewer().unwrap();
         assert_eq!(
@@ -1073,7 +998,10 @@ mod tests {
             (next.agent.as_str(), next.task.as_str()),
             ("build", "part 2")
         );
-        assert!(verdict(&mut a, &json!({"verdict":"done","notes":"x"})).is_err());
+        assert!(
+            verdict(&mut a, &json!({"verdict":"done","notes":"x"})).is_err(),
+            "one verdict per run"
+        );
         let mut a = agent_for(r);
         verdict(&mut a, &json!({"verdict":"reject","notes":"no test"})).unwrap();
         assert!(!a.handed_off && a.verdict.unwrap().next.is_none());
@@ -1086,13 +1014,11 @@ mod tests {
         def.spawns = Some(vec!["explore".into()]);
         let mut a = agent_for(def.clone());
         for n in ["explore", "plan"] {
-            a.agents.insert(
-                n.into(),
-                config::AgentDef {
-                    name: n.into(),
-                    ..def.clone()
-                },
-            );
+            let d = AgentDef {
+                name: n.into(),
+                ..def.clone()
+            };
+            a.agents.insert(n.into(), d);
         }
         let err = |r: Result<String>| format!("{:#}", r.unwrap_err());
         let e = err(spawn(&mut a, &json!({"agent":"plan","instructions":"x"})));
@@ -1102,20 +1028,13 @@ mod tests {
         );
         let e = err(hand_off(&mut a, &json!({"agent":"plan","task":"x"})));
         assert!(e.contains("cannot spawn `plan`"), "{e}");
-        // A `finish` handoff uses the same gate, for both a top-level target and a parent.
-        let fail = |parent: Option<&str>, to: &str| {
+        // A `finish` handoff uses the same gate at the top level; a subagent reports to its parent.
+        let finish = |parent: Option<&str>, to: &str| {
             let v = json!({"status":"handoff","summary":"s","next":{"agent":to,"task":"x"}});
-            format!(
-                "{:#}",
-                validate_finish(&a.def, &a.agents, parent, &v).unwrap_err()
-            )
+            validate_finish(&a.def, &a.agents, parent, &v)
         };
-        let ok = |parent: Option<&str>, to: &str| {
-            let v = json!({"status":"handoff","summary":"s","next":{"agent":to,"task":"x"}});
-            validate_finish(&a.def, &a.agents, parent, &v).is_ok()
-        };
-        assert!(fail(None, "plan").contains("cannot spawn `plan`"));
-        assert!(ok(None, "explore") && ok(Some("plan"), "plan"));
+        assert!(err(finish(None, "plan").map(|_| String::new())).contains("cannot spawn `plan`"));
+        assert!(finish(None, "explore").is_ok() && finish(Some("plan"), "plan").is_ok());
     }
 
     fn e(old: &str, new: &str) -> (String, String) {
@@ -1124,24 +1043,37 @@ mod tests {
 
     #[test]
     fn edits() {
+        let edit = |src: &str, edits: &[(String, String)], all| apply_edits(src, edits, all);
         assert_eq!(
-            apply_edits("hello world", &[e("world", "there")], false).unwrap(),
+            edit("hello world", &[e("world", "there")], false).unwrap(),
             "hello there"
         );
         assert_eq!(
-            apply_edits("abcdefghi", &[e("abc", "x"), e("ghi", "y")], false).unwrap(),
+            edit("abcdefghi", &[e("abc", "x"), e("ghi", "y")], false).unwrap(),
             "xdefy"
         );
-        assert!(apply_edits("aa", &[e("a", "b")], false).is_err());
-        assert_eq!(apply_edits("aa", &[e("a", "b")], true).unwrap(), "bb");
-        assert!(apply_edits("abcdef", &[e("abc", "x"), e("cde", "y")], false).is_err());
-        assert!(apply_edits("abc", &[e("zzz", "x")], false).is_err());
-        let src = "fn a() {\n    let x = 1;\n    let y = 2;\n}\n";
+        assert!(edit("aa", &[e("a", "b")], false).is_err(), "not unique");
+        assert_eq!(edit("aa", &[e("a", "b")], true).unwrap(), "bb");
+        assert!(
+            edit("abcdef", &[e("abc", "x"), e("cde", "y")], false).is_err(),
+            "overlap"
+        );
+        assert!(edit("abc", &[e("zzz", "x")], false).is_err());
+        assert!(edit("abc", &[e("", "x")], false).is_err());
+        // Whitespace-insensitive line match keeps the original indentation and line ends.
+        let src = "fn a() {\n    let x = 1;  \n    let y = 2;\n}\n";
         assert_eq!(
-            apply_edits(src, &[e("let x = 1;\nlet y = 2;", "let z = 3;")], false).unwrap(),
+            edit(src, &[e("let x = 1;\nlet y = 2;", "let z = 3;")], false).unwrap(),
             "fn a() {\n    let z = 3;\n}\n"
         );
-        assert!(apply_edits("  a\n  b\n    a\n    b\n", &[e("a\nb", "c")], false).is_err());
+        assert!(
+            edit("  a\n  b\n    a\n    b\n", &[e("a\nb", "c")], false).is_err(),
+            "an ambiguous fuzzy match is refused"
+        );
+        assert!(
+            edit("  a\n  b\n", &[e("a\nb", "c")], true).is_err(),
+            "replace_all needs an exact match"
+        );
     }
 
     #[test]
@@ -1153,8 +1085,7 @@ mod tests {
             std::fs::write(ws.join(f), "x").unwrap();
         }
         let git = std::process::Command::new("git")
-            .arg("init")
-            .arg("-q")
+            .args(["init", "-q"])
             .current_dir(&ws)
             .status();
         let (mut lines, mut counts) = (Vec::new(), (0, 0));
@@ -1175,42 +1106,35 @@ mod tests {
         let ws = temp_dir("bounded");
         assert_eq!(bounded_result(&ws, 100, "bash", "short".into()), "short");
         let out = bounded_result(&ws, 100, "bash", "x".repeat(500));
-        assert!(out.contains("written to /tmp/tool-bash-"), "{out}");
         let log = out
             .split("written to ")
             .nth(1)
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap();
+            .and_then(|r| r.split(';').next())
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(Path::new(log).starts_with(std::env::temp_dir()), "{log}");
         assert_eq!(std::fs::read_to_string(log).unwrap().len(), 500);
     }
 
     #[test]
     fn specs_follow_the_agent_definition() {
-        let ws = temp_dir("specs");
-        config::tests::write_agents(
-            &ws,
-            &[
-                (
-                    "lead",
-                    "---\ntools: read, plan_write, finish\nfinish: done, handoff, blocked\n---\nl",
-                ),
-                (
-                    "worker",
-                    "---\ntools: read, finish\nfinish: handoff, blocked\n---\nw",
-                ),
-            ],
-        );
-        let agents = config::load_agents(&ws);
+        let agents = defs(&[
+            (
+                "lead",
+                "---\ntools: read, bash, finish\nfinish: done, handoff, blocked\n---\nl",
+            ),
+            (
+                "worker",
+                "---\ntools: read, finish\nfinish: handoff, blocked\n---\nw",
+            ),
+        ]);
         let names = |d: &AgentDef| {
             specs(d, false)
                 .iter()
                 .map(|s| s["function"]["name"].as_str().unwrap().to_string())
                 .collect::<Vec<_>>()
         };
-        assert!(names(&agents["lead"]).contains(&"plan_write".to_string()));
-        assert!(!names(&agents["worker"]).contains(&"plan_write".to_string()));
+        assert_eq!(names(&agents["lead"]), ["read", "bash", "finish"]);
+        assert_eq!(names(&agents["worker"]), ["read", "finish"]);
         let status = |d: &AgentDef, sub| {
             specs(d, sub)
                 .into_iter()
@@ -1228,62 +1152,56 @@ mod tests {
             json!(["handoff", "blocked"])
         );
         assert!(check(&agents["lead"]).is_ok());
+        assert!(check(&defs(&[("x", "---\ntools: nope\n---\n")])["x"]).is_err());
     }
 
     #[test]
     fn finish_validation() {
-        let ws = temp_dir("finish");
-        config::tests::write_agents(
-            &ws,
-            &[
-                (
-                    "lead",
-                    "---\ntools: read, finish\nfinish: done, handoff, blocked\n---\nl",
-                ),
-                (
-                    "worker",
-                    "---\ntools: read, finish\nfinish: handoff, blocked\n---\nw",
-                ),
-                (
-                    "scout",
-                    "---\ntools: read, finish\nfinish: handoff, blocked\n---\ns",
-                ),
-            ],
-        );
-        let agents = config::load_agents(&ws);
+        let agents = defs(&[
+            (
+                "lead",
+                "---\ntools: read, finish\nfinish: done, handoff, blocked\n---\nl",
+            ),
+            (
+                "worker",
+                "---\ntools: read, finish\nfinish: handoff, blocked\n---\nw",
+            ),
+            (
+                "scout",
+                "---\ntools: read, finish\nfinish: handoff, blocked\n---\ns",
+            ),
+        ]);
         let run = |agent: &str, parent: Option<&str>, v: Value| {
             validate_finish(&agents[agent], &agents, parent, &v)
         };
         let handoff = |to: &str| json!({"status": "handoff", "summary": "s", "next": {"agent": to, "task": "t"}});
-        assert!(run("lead", None, json!({"status": "done", "summary": "s"})).is_ok());
+        let done = |summary: &str| json!({"status": "done", "summary": summary});
+        assert!(run("lead", None, done("s")).is_ok());
+        assert!(run("lead", None, done(" ")).is_err(), "empty summary");
         assert!(
-            run("worker", None, json!({"status": "done", "summary": "s"})).is_err(),
-            "build cannot declare done"
+            run("worker", None, done("s")).is_err(),
+            "status not offered"
         );
         assert!(run("worker", None, handoff("lead")).is_ok());
         assert!(run("worker", None, json!({"status": "handoff", "summary": "s"})).is_err());
         assert!(run("worker", None, handoff("nope")).is_err());
-        assert!(
-            run(
-                "lead",
-                None,
-                json!({"status": "done", "summary": "s", "next": {"agent": "worker", "task": "t"}})
-            )
-            .is_err()
+        let next_on_done =
+            json!({"status": "done", "summary": "s", "next": {"agent": "worker", "task": "t"}});
+        assert!(run("lead", None, next_on_done).is_err());
+        // A handoff's `next.task` is its report, so the summary may be left out.
+        let bare = json!({"status": "handoff", "next": {"agent": "lead", "task": "t"}});
+        assert_eq!(
+            run("worker", None, bare).unwrap().summary,
+            "handed off to lead"
         );
-        assert!(run("lead", None, json!({"status": "done", "summary": " "})).is_err());
         assert!(run("scout", Some("lead"), handoff("lead")).is_ok());
         assert!(
             run("scout", Some("lead"), handoff("worker")).is_err(),
             "subagents report to the parent agent"
         );
         assert!(
-            run(
-                "lead",
-                Some("worker"),
-                json!({"status": "done", "summary": "s"})
-            )
-            .is_err()
+            run("lead", Some("worker"), done("s")).is_err(),
+            "subagents cannot declare done"
         );
     }
 
@@ -1293,17 +1211,22 @@ mod tests {
             json!({"type": "instance_end", "status": "done", "report": "r", "result": result})
                 .to_string()
         };
-        let ok = end(
-            json!({"status": "handoff", "summary": "s", "next": {"agent": "plan", "task": "findings"}}),
-        );
-        let v: Value = serde_json::from_str(&child_report(
-            "c",
-            "explore",
-            &events::parse_lines(&ok),
+        let report = |log: &str, timed_out| -> Value {
+            serde_json::from_str(&child_report(
+                "c",
+                "explore",
+                &events::parse_lines(log),
+                timed_out,
+                1000,
+            ))
+            .unwrap()
+        };
+        let v = report(
+            &end(
+                json!({"status": "handoff", "summary": "s", "next": {"agent": "plan", "task": "findings"}}),
+            ),
             false,
-            1000,
-        ))
-        .unwrap();
+        );
         assert_eq!(
             (
                 v["status"].as_str(),
@@ -1317,18 +1240,10 @@ mod tests {
             json!({"type": "assistant", "content": "I looked"}),
             end(Value::Null)
         );
-        let v: Value = serde_json::from_str(&child_report(
-            "c",
-            "explore",
-            &events::parse_lines(&no_verdict),
-            false,
-            1000,
-        ))
-        .unwrap();
+        let v = report(&no_verdict, false);
         assert_eq!(v["status"], "blocked");
         assert!(v["report"].as_str().unwrap().contains("I looked"));
-        let v: Value =
-            serde_json::from_str(&child_report("c", "explore", &[], true, 1000)).unwrap();
+        let v = report("", true);
         assert_eq!(
             (v["status"].as_str(), v["run"].as_str()),
             (Some("blocked"), Some("timed_out"))

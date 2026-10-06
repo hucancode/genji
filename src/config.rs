@@ -33,6 +33,26 @@ pub fn dot(workspace: &Path, name: &str) -> PathBuf {
     workspace.join(".genji").join(name)
 }
 
+/// Wire format of a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Api {
+    /// OpenAI chat-completions.
+    Chat,
+    /// Anthropic Messages API.
+    Anthropic,
+}
+
+/// How the API key is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Auth {
+    /// `Authorization: Bearer <key>`.
+    Bearer,
+    /// `api-key: <key>` (Azure).
+    ApiKey,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Provider {
@@ -40,11 +60,10 @@ pub struct Provider {
     pub api_key: String,
     /// Env var consulted when `api_key` is empty.
     pub api_key_env: String,
-    /// "bearer" (Authorization) or "api-key" (Azure). The anthropic api always sends `x-api-key`.
-    pub auth: String,
+    /// The anthropic api always sends `x-api-key` instead.
+    pub auth: Auth,
     pub model: String,
-    /// Wire format: "chat" (OpenAI chat-completions) or "anthropic" (Messages API).
-    pub api: String,
+    pub api: Api,
     /// "max_tokens" or "max_completion_tokens".
     pub max_tokens_field: String,
     pub send_tool_choice: bool,
@@ -61,9 +80,9 @@ impl Default for Provider {
             base_url: "http://127.0.0.1:8080/v1".into(),
             api_key: String::new(),
             api_key_env: String::new(),
-            auth: "bearer".into(),
+            auth: Auth::Bearer,
             model: "qwen3-coder-30b-a3b".into(),
-            api: "chat".into(),
+            api: Api::Chat,
             max_tokens_field: "max_tokens".into(),
             send_tool_choice: true,
             headers: BTreeMap::new(),
@@ -213,7 +232,7 @@ impl Config {
 }
 
 /// An agent: a system prompt, the tools it may call, and what it may declare when it finishes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AgentDef {
     pub name: String,
     pub description: String,
@@ -292,7 +311,7 @@ fn list(meta: &BTreeMap<String, String>, key: &str) -> Option<Vec<String>> {
 }
 
 /// Parses `<name>.md`; the flag is whether its frontmatter asks for a review pass.
-fn parse_agent(name: &str, text: &str) -> (AgentDef, bool) {
+pub(crate) fn parse_agent(name: &str, text: &str) -> (AgentDef, bool) {
     let (meta, prompt) = split_frontmatter(text);
     let review = meta.get("review").is_some_and(|v| v == "true");
     let def = AgentDef {
@@ -590,23 +609,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_existing_agents_dir_is_used_as_is() {
-        let ws = temp_dir("agents-as-is");
-        init_agents(&ws, false, &[]).unwrap();
-        std::fs::remove_file(agents_dir(&ws).join("plan.md")).unwrap();
-        ensure_agents(&ws).unwrap();
-        assert!(!load_agents(&ws).contains_key("plan"));
+    fn ensure_agents_initialises_only_a_missing_agents_dir() {
+        let fresh = temp_dir("agents-ensure");
+        ensure_agents(&fresh).unwrap();
+        assert_eq!(load_agents(&fresh).len(), 4);
+        std::fs::remove_file(agents_dir(&fresh).join("plan.md")).unwrap();
+        ensure_agents(&fresh).unwrap();
+        assert!(
+            !load_agents(&fresh).contains_key("plan"),
+            "an existing dir is used as is"
+        );
         let empty = temp_dir("agents-empty");
         std::fs::create_dir_all(agents_dir(&empty)).unwrap();
         ensure_agents(&empty).unwrap();
         assert!(load_agents(&empty).is_empty());
-    }
-
-    #[test]
-    fn ensure_agents_initialises_a_fresh_workspace() {
-        let ws = temp_dir("agents-ensure");
-        ensure_agents(&ws).unwrap();
-        assert_eq!(load_agents(&ws).len(), 4);
     }
 
     #[test]
@@ -616,7 +632,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("build.md"),
-            "---\ntools: read, ls\nskills: formal\n---\ncustom",
+            "---\ntools: read, ls\nskills: formal\nfinish: blocked\n---\ncustom",
         )
         .unwrap();
         std::fs::write(dir.join("help.md"), "---\ntools: read\n---\nx").unwrap();
@@ -637,6 +653,7 @@ pub(crate) mod tests {
         assert_eq!(agents["build"].prompt, "custom");
         assert_eq!(agents["build"].tools, ["read", "ls"]);
         assert_eq!(agents["build"].skills, ["formal"]);
+        assert_eq!(agents["build"].finish, ["blocked"]);
         assert!(agents["build"].review.is_none());
         assert_eq!(agents["check"].description, "checks");
         assert_eq!(agents["check"].review.as_deref(), Some("judge"));
@@ -651,33 +668,6 @@ pub(crate) mod tests {
         for (name, text) in defs {
             std::fs::write(dir.join(format!("{name}.md")), text).unwrap();
         }
-    }
-
-    #[test]
-    fn a_workspace_may_replace_every_default_and_add_its_own() {
-        let ws = temp_dir("agents-replaced");
-        write_agents(
-            &ws,
-            &[
-                ("plan", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
-                ("build", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
-                (
-                    "explore",
-                    "---\ntools: read\nfinish: blocked\n---\nreplaced",
-                ),
-                ("retro", "---\ntools: read\nfinish: blocked\n---\nreplaced"),
-                (
-                    "alpha",
-                    "---\ntools: read, finish\nfinish: handoff, done\n---\na",
-                ),
-            ],
-        );
-        let agents = load_agents(&ws);
-        for n in ["plan", "build", "explore", "retro"] {
-            assert_eq!(agents[n].prompt, "replaced");
-            assert_eq!(agents[n].finish, ["blocked"]);
-        }
-        assert_eq!(agents["alpha"].finish, ["handoff", "done"]);
     }
 
     fn skill(ws: &Path, rel: &str, text: &str) {

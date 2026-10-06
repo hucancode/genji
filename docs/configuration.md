@@ -34,6 +34,8 @@ Run flags:
 | `--sessions-dir <dir>` | Where session files are written and read (default `.genji/sessions`); spawned subagents inherit it |
 | `--token-limit <n>` | Per-run token budget; overrides `token_limit` in the config and the provider; spawned subagents inherit it |
 
+A spawned subagent runs on its parent's effective config, including `--provider`, `--config`, `--config-json` and the overrides above.
+
 ## Directory layout
 
 ```

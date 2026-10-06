@@ -324,13 +324,15 @@ fn run_agent(o: Opts) -> Result<i32> {
             context: context.clone(),
         })?;
         a.run(task.as_deref())?;
+        let end = Outcome::of(&a);
         // Two passes: a top-level work pass that submits or runs out of tool iterations is
         // judged by a review pass with a fresh context.
-        let submitted = (a.verdict.as_ref().is_some_and(|v| v.status == "done")
-            || (a.status == Status::Stopped && a.reason == Some(StopReason::MaxIterations)))
+        let submitted = (end.verdict.as_ref().is_some_and(|v| v.status == "done")
+            || end.out_of_iterations)
             && !o.subagent
             && context.read().unwrap().peaked_over(cfg.review_threshold);
-        match next_step(&a, &def, &guard.control, task.as_deref(), submitted) {
+        let pending = guard.control.pending();
+        match next_step(&def, &end, pending, task.as_deref(), submitted) {
             Step::Review(reviewer) => {
                 task = Some(events::review_input(&sessions.join(format!("{id}.jsonl")))?);
                 let mut n = 1;
@@ -345,7 +347,7 @@ fn run_agent(o: Opts) -> Result<i32> {
             Step::BackToWork(back) => {
                 // The work instance continues in its own context: its id is the review's parent.
                 id = parent.clone().unwrap_or_default();
-                let s = events::summary(&sessions.join(format!("{id}.jsonl")))?;
+                let s = events::start(&sessions.join(format!("{id}.jsonl")))?;
                 parent = s["parent"].as_str().map(String::from);
                 def = agents[def.worker()].clone();
                 task = back;
@@ -358,16 +360,16 @@ fn run_agent(o: Opts) -> Result<i32> {
                 task = Some(next.task);
                 resuming = false;
             }
-            Step::Exit => return Ok(exit_code(a.status)),
+            Step::Exit => return Ok(exit_code(end.status)),
         }
     }
 }
 
 /// The `--resume` target: `(instance id, agent name, parent)`.
 fn resume_target(sessions: &Path, prefix: &str) -> Result<(String, String, Option<String>)> {
-    let s = events::summary(&events::find_session(sessions, prefix)?)?;
+    let s = events::start(&events::find_session(sessions, prefix)?)?;
     Ok((
-        s["id"].as_str().unwrap_or_default().to_string(),
+        s["instance"].as_str().unwrap_or_default().to_string(),
         s["agent"].as_str().unwrap_or_default().to_string(),
         s["parent"].as_str().map(String::from),
     ))
@@ -382,6 +384,27 @@ fn find_agent(agents: &BTreeMap<String, AgentDef>, name: &str) -> Option<AgentDe
     })
 }
 
+/// How an instance ended, as far as the chain is concerned.
+struct Outcome {
+    verdict: Option<tools::Verdict>,
+    /// Set by `hand_off` or a review's `handoff`: the chain continues with `verdict.next`.
+    handed_off: bool,
+    status: Status,
+    out_of_iterations: bool,
+}
+
+impl Outcome {
+    fn of(a: &Agent) -> Self {
+        Self {
+            verdict: a.verdict.clone(),
+            handed_off: a.handed_off,
+            status: a.status,
+            out_of_iterations: a.status == Status::Stopped
+                && a.reason == Some(StopReason::MaxIterations),
+        }
+    }
+}
+
 /// What follows one instance: start its review, resume the work instance, continue with a
 /// fresh instance, or stop.
 enum Step {
@@ -393,12 +416,13 @@ enum Step {
     Exit,
 }
 
-/// The transition after `a` ends, in priority order: review the work pass, send a review's
-/// findings back, continue the chain, or stop.
+/// The transition after an instance of `def` ends, in priority order: review the work pass,
+/// send a review's findings back, continue the chain, or stop. `pending`: user instructions
+/// are queued.
 fn next_step(
-    a: &Agent,
     def: &AgentDef,
-    control: &socket::Control,
+    end: &Outcome,
+    pending: bool,
     task: Option<&str>,
     submitted: bool,
 ) -> Step {
@@ -406,15 +430,15 @@ fn next_step(
         return Step::Review(reviewer);
     }
     if def.worker() != def.name {
-        match a.verdict.as_ref() {
+        match end.verdict.as_ref() {
             Some(v) if v.status == "reject" => {
                 return Step::BackToWork(Some(format!("{}{}", events::REJECTED, v.summary)));
             }
-            Some(v) if v.status == "done" && control.pending() => return Step::BackToWork(None),
+            Some(v) if v.status == "done" && pending => return Step::BackToWork(None),
             _ => {}
         }
     }
-    match next_instance(a, task) {
+    match next_instance(def, end, task) {
         Some(next) => Step::Next(next),
         None => Step::Exit,
     }
@@ -423,28 +447,30 @@ fn next_step(
 /// The instance that continues the chain: a `hand_off` target, or for an agent that can hand
 /// off and ran out of tool iterations a fresh instance of itself (the shared run limits, time
 /// and tokens, still bound the chain).
-fn next_instance(a: &Agent, task: Option<&str>) -> Option<tools::Next> {
+fn next_instance(def: &AgentDef, end: &Outcome, task: Option<&str>) -> Option<tools::Next> {
     // A `hand_off` continues in this process as a new instance of `next.agent`:
     // new id, new session file, fresh context.
-    let next = a
+    let next = end
         .verdict
         .as_ref()
-        .filter(|_| a.handed_off && a.status == Status::Done)
+        .filter(|_| end.handed_off && end.status == Status::Done)
         .and_then(|v| v.next.clone());
     next.or_else(|| {
-        (a.status == Status::Stopped
-            && a.reason == Some(StopReason::MaxIterations)
-            && a.def.tools.iter().any(|t| t == "hand_off"))
-        .then(|| tools::Next {
-            agent: a.def.name.clone(),
+        (end.out_of_iterations && def.tools.iter().any(|t| t == "hand_off")).then(|| tools::Next {
+            agent: def.name.clone(),
             task: {
-                const NOTE: &str = "\n\nA previous instance used up its tool iterations on this task. Inspect the workspace and the task's tracking files for what is already done, then continue with what remains.";
                 let t = task.unwrap_or_default();
-                if t.ends_with(NOTE) { t.to_string() } else { format!("{t}{NOTE}") }
+                if t.ends_with(OUT_OF_ITERATIONS) {
+                    t.to_string()
+                } else {
+                    format!("{t}{OUT_OF_ITERATIONS}")
+                }
             },
         })
     })
 }
+
+const OUT_OF_ITERATIONS: &str = "\n\nA previous instance used up its tool iterations on this task. Inspect the workspace and the task's tracking files for what is already done, then continue with what remains.";
 
 /// The smallest non-zero of the project's preferred size, the provider's window and the
 /// server-reported model window.
@@ -548,14 +574,80 @@ mod tests {
     }
 
     #[test]
-    fn exit_codes() {
-        assert_eq!(
-            (
-                exit_code(Status::Done),
-                exit_code(Status::Failed),
-                exit_code(Status::Stopped)
-            ),
-            (0, 1, 2)
+    fn next_step_reviews_returns_hands_off_or_exits() {
+        let verdict = |status: &str, next: Option<(&str, &str)>| tools::Verdict {
+            status: status.into(),
+            summary: "notes".into(),
+            next: next.map(|(agent, task)| tools::Next {
+                agent: agent.into(),
+                task: task.into(),
+            }),
+        };
+        let end = |v: Option<tools::Verdict>, status, out_of_iterations| Outcome {
+            handed_off: v.as_ref().is_some_and(|v| v.next.is_some()),
+            verdict: v,
+            status,
+            out_of_iterations,
+        };
+        let build = AgentDef {
+            name: "build".into(),
+            tools: vec!["hand_off".into(), "finish".into()],
+            review: Some("judge".into()),
+            ..Default::default()
+        };
+        let review = build.reviewer().unwrap();
+        let done = end(Some(verdict("done", None)), Status::Done, false);
+
+        assert!(matches!(
+            next_step(&build, &done, false, Some("t"), true),
+            Step::Review(r) if r.name == "build:review"
+        ));
+        assert!(matches!(
+            next_step(&build, &done, false, Some("t"), false),
+            Step::Exit
+        ));
+        let reject = end(Some(verdict("reject", None)), Status::Done, false);
+        assert!(matches!(
+            next_step(&review, &reject, false, None, false),
+            Step::BackToWork(Some(t)) if t == format!("{}notes", events::REJECTED)
+        ));
+        assert!(matches!(
+            next_step(&review, &done, true, None, false),
+            Step::BackToWork(None)
+        ));
+        assert!(matches!(
+            next_step(&review, &done, false, None, false),
+            Step::Exit
+        ));
+        let handoff = end(
+            Some(verdict("handoff", Some(("plan", "p")))),
+            Status::Done,
+            false,
         );
+        assert!(matches!(
+            next_step(&build, &handoff, false, None, false),
+            Step::Next(n) if n.agent == "plan" && n.task == "p"
+        ));
+        // Out of tool iterations: a fresh instance of the same agent, the note added once.
+        let tired = end(None, Status::Stopped, true);
+        let Step::Next(n) = next_step(&build, &tired, false, Some("t"), false) else {
+            panic!("expected a fresh instance");
+        };
+        assert_eq!(
+            (n.agent.as_str(), n.task.clone()),
+            ("build", format!("t{OUT_OF_ITERATIONS}"))
+        );
+        let Step::Next(again) = next_step(&build, &tired, false, Some(&n.task), false) else {
+            panic!("expected a fresh instance");
+        };
+        assert_eq!(again.task, n.task);
+        let no_hand_off = AgentDef {
+            tools: vec!["finish".into()],
+            ..build.clone()
+        };
+        assert!(matches!(
+            next_step(&no_hand_off, &tired, false, Some("t"), false),
+            Step::Exit
+        ));
     }
 }

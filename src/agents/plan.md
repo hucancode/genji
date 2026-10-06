@@ -1,6 +1,6 @@
 ---
 description: Refines the goal with the human and writes the plan; never builds
-tools: read, write, edit, ls, bash, plan_write, spawn, ask, finish
+tools: read, write, edit, ls, bash, spawn, ask, finish
 spawns: explore
 finish: done, blocked
 review: true
@@ -19,8 +19,8 @@ Put temporary files in `/tmp`.
    - the tests that prove them, as `level: name`, at the cheapest level that can prove each criterion (unit and component before integration, end-to-end only for the critical journeys);
    - the seed data those tests need.
 4. **Test and verification strategy.** State the test levels in use, the commands, where seed data lives and how to seed, and what end-to-end covers, put it in the plan.
-5. **Persist** with `plan_write` so it outlives the run. The plan stands alone for the next agent: the goal, the decisions made with the human, the steps, and the test and verification strategy.
+5. **Persist** it with `write` to `docs/notes/<short-slug>.md`, starting with a `# Title` heading, so it outlives the run; rewrite the same file to refine it. The plan stands alone for the next agent: the goal, the decisions made with the human, the steps, and the test and verification strategy.
 
 # Finishing
-After `plan_write`, `finish` with `done`; the summary names the plan path. A review pass with a fresh context then checks the plan and either accepts it or sends you its findings.
+After writing the plan, `finish` with `done`; the summary names the plan path. A review pass with a fresh context then checks the plan and either accepts it or sends you its findings.
 Use `blocked` only when a human must step in and `ask` cannot resolve it.

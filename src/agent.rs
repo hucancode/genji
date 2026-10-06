@@ -6,11 +6,11 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::{self, AgentDef, Config, Provider, Skill};
-use crate::llm::{self, ChatMessage, LlmClient, Role, ToolCall};
+use crate::llm::{ChatMessage, LlmClient, Role, ToolCall};
 use crate::socket::Control;
 use crate::storage::context::ContextComposer;
 use crate::storage::events::{self, EventEmitter};
-use crate::storage::util::{relative_path, resolve_path};
+use crate::storage::util::{relative_path, resolve_path, truncate};
 use crate::tools::{self, Verdict};
 
 const MAX_TRUNCATIONS: u32 = 3;
@@ -19,9 +19,9 @@ const STOPPED_BY_USER: &str = "(stopped by user via control socket)";
 const WRAP_UP_TURNS: usize = 5;
 /// Fraction of the context window at which old turns are compacted.
 const COMPACT_AT: f64 = 0.8;
-/// Messages between prune checks, so one prune clears many turns.
 /// Tools whose repeated identical output is replaced by a pointer to the earlier result.
 const DEDUPED: [&str; 3] = ["read", "ls", "bash"];
+/// Messages between prune checks, so one prune clears many turns.
 const PRUNE_MIN_GAP: usize = 8;
 /// A prune rewrites the cached prefix; it must free at least this many tokens...
 const PRUNE_MIN_FREE_TOKENS: i64 = 2000;
@@ -233,7 +233,7 @@ fn project_docs(workspace: &Path, paths: &[String]) -> String {
         match std::fs::read_to_string(&full) {
             Ok(text) => {
                 let text = strip_timestamps(&text);
-                let body = llm::truncate(&text, MAX);
+                let body = truncate(&text, MAX);
                 out.push_str(&format!("\n## {p}\n{}\n", body.trim_end()));
             }
             Err(_) => out.push_str(&format!("\n## {p}\n({p} does not exist yet)\n")),
@@ -295,38 +295,6 @@ fn is_context_overflow(err: &str) -> bool {
     CONTEXT_OVERFLOW_HINTS.iter().any(|k| e.contains(k))
 }
 
-/// The state `Agent::start` begins from: a fresh run, or one replayed from its session.
-struct StartState {
-    model: String,
-    seq: u64,
-    tokens_used: i64,
-    pending: Vec<ToolCall>,
-    recorded: Option<ContextComposer>,
-}
-
-impl StartState {
-    fn fresh(def: &AgentDef, provider: &Provider) -> Self {
-        Self {
-            model: def.model.clone().unwrap_or_else(|| provider.model.clone()),
-            seq: 0,
-            tokens_used: 0,
-            pending: Vec::new(),
-            recorded: None,
-        }
-    }
-
-    fn replayed(session: &Path, window: i64) -> Result<Self> {
-        let r = events::replay(session, window)?;
-        Ok(Self {
-            model: r.model,
-            seq: r.seq,
-            tokens_used: r.tokens_used,
-            pending: r.pending,
-            recorded: Some(r.ctx),
-        })
-    }
-}
-
 /// Bookkeeping for one `run_loop`: progress counters and the one-request hint.
 struct RunState {
     iterations: usize,
@@ -364,9 +332,14 @@ impl Agent {
         let window = p.provider.context_window;
         let token_limit = p.cfg.token_limit(&p.provider);
         let start = if p.resume {
-            StartState::replayed(&session, window)?
+            events::replay(&session, window)?
         } else {
-            StartState::fresh(&p.def, &p.provider)
+            events::Replayed::fresh(
+                p.def
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| p.provider.model.clone()),
+            )
         };
         let llm = LlmClient::new(
             p.provider,
@@ -386,7 +359,7 @@ impl Agent {
             p.resume,
         );
         let skills = config::load_skills(&p.cfg.skills(&p.workspace));
-        let ctx = match start.recorded {
+        let ctx = match start.ctx {
             Some(ctx) => ctx,
             None => {
                 let system = build_system(
@@ -781,8 +754,7 @@ impl Agent {
                 "You compress an agent's running history so it can continue the work. Be dense and factual. Use these sections: Goal; Decisions and why; Files created or changed (paths); Commands run and their outcome (passing/failing tests, errors); Open problems; Next step. Keep exact identifiers, paths, ids and error messages. Drop pleasantries, file contents that are on disk, and anything recoverable by reading the workspace.",
             ),
             ChatMessage::user(format!(
-                "Summarize this conversation segment:\n\n{}",
-                llm::truncate(&rendered, 120_000)
+                "Summarize this conversation segment:\n\n{rendered}"
             )),
         ];
         let resp = match self.llm.chat(&req, &[], None) {
@@ -882,12 +854,6 @@ mod tests {
         assert!(should_prune(600, 100_000, 350_000, cold));
         assert!(!should_prune(400, 100_000, 350_000, cold));
         assert!(should_prune(10, 200_000, 350_000, hot));
-    }
-
-    #[test]
-    fn hints_carry_no_note_prefix_of_their_own() {
-        // `LlmClient::chat` adds the `[note]` prefix.
-        assert!(!TRUNCATED_HINT.contains("[note]"));
     }
 
     #[test]

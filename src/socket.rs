@@ -272,7 +272,7 @@ impl Control {
                 {
                     eprintln!(
                         "error: stdin command `{}`: {e:#}",
-                        crate::llm::truncate(line, 80)
+                        crate::storage::util::truncate(line, 80)
                     );
                 }
             }
@@ -310,6 +310,18 @@ impl Control {
             "answered".to_string()
         } else {
             format!("error: no ask call {id} is waiting")
+        }
+    }
+}
+
+#[cfg(test)]
+impl Control {
+    /// Block until an `ask` call `id` is waiting for its answer.
+    fn await_waiter(&self, id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.state().waiting.contains(id) {
+            assert!(Instant::now() < deadline, "no ask call {id} is waiting");
+            thread::sleep(Duration::from_millis(1));
         }
     }
 }
@@ -359,7 +371,7 @@ mod tests {
         );
         let c = ctrl.clone();
         let h = std::thread::spawn(move || c.wait_answer("c1", Duration::from_secs(5)));
-        std::thread::sleep(Duration::from_millis(100));
+        ctrl.await_waiter("c1");
         let input = concat!(
             "{\"type\":\"instruction\",\"text\":\"/not a command\"}\n",
             "garbage\n\n",
@@ -437,7 +449,7 @@ mod socket_tests {
         );
         let c = ctrl.clone();
         let h = std::thread::spawn(move || c.wait_answer("call_1", Duration::from_secs(2)));
-        std::thread::sleep(Duration::from_millis(100));
+        ctrl.await_waiter("call_1");
         assert_eq!(send(&sock, "/answer call_1 \"blue\"").unwrap(), "answered");
         assert_eq!(h.join().unwrap().as_deref(), Some("blue"));
         assert!(send(&sock, "/answer call_1").unwrap().starts_with("error"));
@@ -446,7 +458,7 @@ mod socket_tests {
 
         let c = ctrl.clone();
         let h = std::thread::spawn(move || c.wait_answer("call_3", Duration::from_secs(5)));
-        std::thread::sleep(Duration::from_millis(100));
+        ctrl.await_waiter("call_3");
         send(&sock, "/stop").unwrap();
         assert_eq!(h.join().unwrap(), None);
         ctrl.shutdown();
@@ -457,7 +469,7 @@ mod socket_tests {
         let (ctrl, sock) = start("control-bare", "");
         let c = ctrl.clone();
         let h = std::thread::spawn(move || c.wait_answer("c9", Duration::from_secs(2)));
-        std::thread::sleep(Duration::from_millis(100));
+        ctrl.await_waiter("c9");
         assert_eq!(send(&sock, "/answer c9 Postgres 16").unwrap(), "answered");
         assert_eq!(h.join().unwrap().as_deref(), Some("Postgres 16"));
         ctrl.shutdown();
