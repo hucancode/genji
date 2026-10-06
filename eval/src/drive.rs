@@ -13,6 +13,7 @@
 //! genji binary (default `genji` on PATH).
 
 use anyhow::{Context, Result};
+use genji_eval::copy_dir_if_exists;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
@@ -131,14 +132,20 @@ fn main() {
 }
 
 fn shell(cmd: &str, dir: &str) -> Result<()> {
-    let ok = Command::new("sh").arg("-c").arg(cmd).current_dir(dir).status()?.success();
+    let ok = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(dir)
+        .status()?
+        .success();
     anyhow::ensure!(ok, "command failed: {cmd}");
     Ok(())
 }
 
 fn run(path: &str) -> Result<i32> {
-    let step: Step = serde_json::from_str(&fs::read_to_string(path).with_context(|| format!("read {path}"))?)
-        .with_context(|| format!("parse {path}"))?;
+    let step: Step =
+        serde_json::from_str(&fs::read_to_string(path).with_context(|| format!("read {path}"))?)
+            .with_context(|| format!("parse {path}"))?;
     let home = home();
     let out = Path::new(&step.out);
     let file = |suffix: &str, default: &str| match &step.name {
@@ -207,11 +214,15 @@ fn run(path: &str) -> Result<i32> {
             let line = line?;
             writeln!(trace, "{line}")?;
             writeln!(all, "{line}")?;
-            let Ok(e) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(e) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             metrics.count(&e);
             match e["type"].as_str().unwrap_or_default() {
                 // A review pass is not resumable on its own; the work instance is.
-                "instance_start" if !e["agent"].as_str().unwrap_or_default().ends_with(":review") => {
+                "instance_start"
+                    if !e["agent"].as_str().unwrap_or_default().ends_with(":review") =>
+                {
                     current = Some((
                         e["instance"].as_str().unwrap_or_default().to_string(),
                         e["agent"].as_str().unwrap_or_default().to_string(),
@@ -244,7 +255,10 @@ fn run(path: &str) -> Result<i32> {
             break;
         }
         // A handoff continues with the named agent, a blocked report with the same agent.
-        let r = end.as_ref().map(|e| e["result"].clone()).unwrap_or(Value::Null);
+        let r = end
+            .as_ref()
+            .map(|e| e["result"].clone())
+            .unwrap_or(Value::Null);
         let Some((id, _)) = &current else { break };
         match (r["status"].as_str(), r["next"]["agent"].as_str()) {
             (Some("handoff"), Some(next)) => {
@@ -290,11 +304,14 @@ fn run(path: &str) -> Result<i32> {
         "instances": metrics.instances,
         "duration_secs": started.elapsed().as_secs_f64(),
     });
-    fs::write(file(".metrics.json", "metrics.json"), serde_json::to_string_pretty(&summary)?)?;
+    fs::write(
+        file(".metrics.json", "metrics.json"),
+        serde_json::to_string_pretty(&summary)?,
+    )?;
     if step.snapshot {
         let _ = fs::copy(&config, out.join("config.json"));
-        copy_dir(&home.join("sessions"), &out.join("sessions"))?;
-        copy_dir(&home.join("agents"), &out.join("agents"))?;
+        copy_dir_if_exists(&home.join("sessions"), &out.join("sessions"))?;
+        copy_dir_if_exists(&home.join("agents"), &out.join("agents"))?;
     }
     Ok(code)
 }
@@ -305,19 +322,4 @@ fn append(path: &Path) -> Result<File> {
         .append(true)
         .open(path)
         .with_context(|| format!("open {}", path.display()))
-}
-
-fn copy_dir(from: &Path, to: &Path) -> Result<()> {
-    let Ok(entries) = fs::read_dir(from) else { return Ok(()) };
-    fs::create_dir_all(to)?;
-    for entry in entries {
-        let entry = entry?;
-        let dest = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir(&entry.path(), &dest)?;
-        } else {
-            fs::copy(entry.path(), dest)?;
-        }
-    }
-    Ok(())
 }

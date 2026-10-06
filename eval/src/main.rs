@@ -6,6 +6,7 @@
 //! another host.
 
 use anyhow::{Context, Result, bail};
+use genji_eval::copy_dir;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -62,7 +63,9 @@ fn parse(args: Vec<String>) -> Result<Opts> {
         };
         match flag.as_str() {
             "-k" | "--attempts" => o.attempts = value()?.parse().context("-k needs a number")?,
-            "-j" | "--concurrency" => o.concurrency = value()?.parse().context("-j needs a number")?,
+            "-j" | "--concurrency" => {
+                o.concurrency = value()?.parse().context("-j needs a number")?
+            }
             "--profile" => o.profile = Some(value()?),
             "-m" | "--model" => o.model = Some(value()?),
             "--agents" => o.agents = Some(value()?),
@@ -106,7 +109,10 @@ fn main() {
 // -- catalog -------------------------------------------------------------- //
 
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn eval_dir() -> PathBuf {
@@ -132,16 +138,24 @@ impl Task {
 
 fn load_toml(path: &Path) -> Result<toml::Table> {
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    text.parse().with_context(|| format!("parse {}", path.display()))
+    text.parse()
+        .with_context(|| format!("parse {}", path.display()))
 }
 
 /// Registry task names in `dataset.toml` mapped to their pinned digests.
 fn registry_tasks(dir: &Path) -> Result<BTreeMap<String, String>> {
     let ds = load_toml(&dir.join("dataset.toml"))?;
     let mut out = BTreeMap::new();
-    for t in ds.get("tasks").and_then(|t| t.as_array()).into_iter().flatten() {
+    for t in ds
+        .get("tasks")
+        .and_then(|t| t.as_array())
+        .into_iter()
+        .flatten()
+    {
         let name = t["name"].as_str().context("dataset.toml: task name")?;
-        let digest = t["digest"].as_str().with_context(|| format!("dataset.toml: {name} has no digest"))?;
+        let digest = t["digest"]
+            .as_str()
+            .with_context(|| format!("dataset.toml: {name} has no digest"))?;
         out.insert(name.to_string(), digest.to_string());
     }
     Ok(out)
@@ -153,15 +167,29 @@ fn catalog(dir: &Path) -> Result<Vec<Task>> {
     let local = local_tasks(dir)?;
     let registry = registry_tasks(dir)?;
     let mut out = Vec::new();
-    for (name, entry) in cat.get("tasks").and_then(|t| t.as_table()).into_iter().flatten() {
-        let field = |k: &str| entry.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    for (name, entry) in cat
+        .get("tasks")
+        .and_then(|t| t.as_table())
+        .into_iter()
+        .flatten()
+    {
+        let field = |k: &str| {
+            entry
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
         out.push(Task {
             name: name.clone(),
             capability: field("capability"),
             difficulty: field("difficulty"),
-            path: local
-                .get(name)
-                .map(|p| p.strip_prefix(dir).unwrap_or(p).to_string_lossy().into_owned()),
+            path: local.get(name).map(|p| {
+                p.strip_prefix(dir)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .into_owned()
+            }),
             digest: registry.get(name).cloned(),
         });
     }
@@ -173,7 +201,9 @@ fn local_tasks(dir: &Path) -> Result<BTreeMap<String, PathBuf>> {
     let mut out = BTreeMap::new();
     let mut stack = vec![dir.join("tasks")];
     while let Some(d) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&d) else { continue };
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
             if p.join("task.toml").is_file() {
@@ -193,7 +223,9 @@ fn select(o: &Opts, tasks: Vec<Task>) -> Vec<Task> {
         .into_iter()
         .filter(|t| {
             o.positional.is_empty()
-                || o.positional.iter().any(|f| t.name.contains(f.as_str()) || t.capability.contains(f.as_str()))
+                || o.positional
+                    .iter()
+                    .any(|f| t.name.contains(f.as_str()) || t.capability.contains(f.as_str()))
         })
         .filter(|t| o.capability.as_ref().is_none_or(|c| &t.capability == c))
         .filter(|t| o.difficulty.as_ref().is_none_or(|d| &t.difficulty == d))
@@ -204,7 +236,10 @@ fn cmd_list(o: &Opts) -> Result<i32> {
     let tasks = select(o, catalog(&eval_dir())?);
     for t in &tasks {
         let src = if t.local() { "local" } else { "registry" };
-        println!("{:<60} {:<13} {:<7} {src}", t.name, t.capability, t.difficulty);
+        println!(
+            "{:<60} {:<13} {:<7} {src}",
+            t.name, t.capability, t.difficulty
+        );
     }
     println!("{} task(s)", tasks.len());
     Ok(0)
@@ -219,7 +254,9 @@ fn sh(cmd: &mut Command) -> Result<()> {
 }
 
 fn capture(cmd: &mut Command) -> String {
-    cmd.output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()
+    cmd.output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
 }
 
 fn quote(s: &str) -> String {
@@ -278,7 +315,10 @@ fn harbor_run(o: &Opts, job: &str, agent: &str, tasks: &[Task], attempts: u32) -
     in_repo(&format!("( {} )", materialize(job, tasks)))?;
     let mut args = vec![
         format!("harbor run -y -q -p eval/.runs/{job} -o eval/jobs"),
-        format!("--job-name {job} -a {agent} -k {attempts} -n {}", o.concurrency),
+        format!(
+            "--job-name {job} -a {agent} -k {attempts} -n {}",
+            o.concurrency
+        ),
     ];
     if agent.starts_with("genji_agent") {
         args.push("--artifact /app --ak catalog=eval/catalog.toml".into());
@@ -290,7 +330,10 @@ fn harbor_run(o: &Opts, job: &str, agent: &str, tasks: &[Task], attempts: u32) -
         }
         if let Some(a) = &o.agents {
             // Kept with the job.
-            copy_dir(Path::new(a), &eval_dir().join("jobs").join(job).join("agents"))?;
+            copy_dir(
+                Path::new(a),
+                &eval_dir().join("jobs").join(job).join("agents"),
+            )?;
             args.push(format!("--ak agents_dir=eval/jobs/{job}/agents"));
         }
     }
@@ -308,7 +351,9 @@ fn provenance(o: &Opts, job: &str) -> Result<()> {
     let profile = o
         .profile
         .as_ref()
-        .and_then(|p| fs::read_to_string(eval_dir().join("profiles").join(format!("{p}.json"))).ok())
+        .and_then(|p| {
+            fs::read_to_string(eval_dir().join("profiles").join(format!("{p}.json"))).ok()
+        })
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
     let info = json!({
         "commit": git(&["rev-parse", "HEAD"]),
@@ -330,7 +375,10 @@ fn provenance(o: &Opts, job: &str) -> Result<()> {
 fn cmd_run(o: &Opts) -> Result<i32> {
     let tasks = select(o, catalog(&eval_dir())?);
     anyhow::ensure!(!tasks.is_empty(), "no task matches");
-    let job = o.name.clone().unwrap_or_else(|| format!("eval-{}", timestamp()));
+    let job = o
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("eval-{}", timestamp()));
     provenance(o, &job)?;
     build()?;
     harbor_run(o, &job, "genji_agent:Genji", &tasks, o.attempts)?;
@@ -338,7 +386,10 @@ fn cmd_run(o: &Opts) -> Result<i32> {
 }
 
 fn cmd_check(o: &Opts) -> Result<i32> {
-    let tasks: Vec<Task> = select(o, catalog(&eval_dir())?).into_iter().filter(Task::local).collect();
+    let tasks: Vec<Task> = select(o, catalog(&eval_dir())?)
+        .into_iter()
+        .filter(Task::local)
+        .collect();
     anyhow::ensure!(!tasks.is_empty(), "no hand-authored task matches");
     let stamp = timestamp();
     let mut bad = 0;
@@ -349,7 +400,10 @@ fn cmd_check(o: &Opts) -> Result<i32> {
             for t in trials {
                 if t.reward != Some(want) {
                     bad += 1;
-                    println!("check {task}: {agent} scored {:?}, expected {want}", t.reward);
+                    println!(
+                        "check {task}: {agent} scored {:?}, expected {want}",
+                        t.reward
+                    );
                 }
             }
         }
@@ -381,19 +435,30 @@ fn trials_by_task(job: &Path) -> Result<BTreeMap<String, Vec<Trial>>> {
     let entries = fs::read_dir(job).with_context(|| format!("read {}", job.display()))?;
     for e in entries.flatten() {
         let path = e.path().join("result.json");
-        let Ok(text) = fs::read_to_string(&path) else { continue };
-        let Ok(r) = serde_json::from_str::<Value>(&text) else { continue };
-        let Some(task) = r["task_name"].as_str() else { continue };
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(r) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let Some(task) = r["task_name"].as_str() else {
+            continue;
+        };
         let mut t = Trial {
             reward: r["verifier_result"]["rewards"]["reward"].as_f64(),
-            error: r["exception_info"]["exception_type"].as_str().map(String::from),
+            error: r["exception_info"]["exception_type"]
+                .as_str()
+                .map(String::from),
             ..Default::default()
         };
         for m in find(&e.path(), "metrics.json") {
-            let Ok(v) = fs::read_to_string(&m).map(|s| serde_json::from_str::<Value>(&s).unwrap_or_default()) else {
+            let Ok(v) = fs::read_to_string(&m)
+                .map(|s| serde_json::from_str::<Value>(&s).unwrap_or_default())
+            else {
                 continue;
             };
-            t.tokens += v["prompt_tokens"].as_u64().unwrap_or(0) + v["completion_tokens"].as_u64().unwrap_or(0);
+            t.tokens += v["prompt_tokens"].as_u64().unwrap_or(0)
+                + v["completion_tokens"].as_u64().unwrap_or(0);
             t.secs += v["duration_secs"].as_f64().unwrap_or(0.0);
         }
         out.entry(task.to_string()).or_default().push(t);
@@ -403,7 +468,9 @@ fn trials_by_task(job: &Path) -> Result<BTreeMap<String, Vec<Trial>>> {
 
 fn find(dir: &Path, name: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else { return out };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -441,16 +508,23 @@ impl Row {
 }
 
 fn rows(job: &Path) -> Result<Vec<Row>> {
-    let cat: BTreeMap<String, Task> =
-        catalog(&eval_dir()).unwrap_or_default().into_iter().map(|t| (t.name.clone(), t)).collect();
+    let cat: BTreeMap<String, Task> = catalog(&eval_dir())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| (t.name.clone(), t))
+        .collect();
     Ok(trials_by_task(job)?
         .into_iter()
         .map(|(task, trials)| {
             let n = trials.len().max(1) as f64;
             let c = cat.get(&task);
             Row {
-                capability: c.map(|c| c.capability.clone()).unwrap_or_else(|| "-".into()),
-                difficulty: c.map(|c| c.difficulty.clone()).unwrap_or_else(|| "-".into()),
+                capability: c
+                    .map(|c| c.capability.clone())
+                    .unwrap_or_else(|| "-".into()),
+                difficulty: c
+                    .map(|c| c.difficulty.clone())
+                    .unwrap_or_else(|| "-".into()),
                 passed: trials.iter().filter(|t| passed(t)).count(),
                 total: trials.len(),
                 tokens: (trials.iter().map(|t| t.tokens).sum::<u64>() as f64 / n) as u64,
@@ -472,17 +546,27 @@ fn human_tokens(n: u64) -> String {
 
 fn human_secs(s: f64) -> String {
     let s = s as u64;
-    if s >= 60 { format!("{}m{:02}s", s / 60, s % 60) } else { format!("{s}s") }
+    if s >= 60 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
 }
 
 /// Prints the job like `cargo test`, writes summary.md/summary.json into it, and fails
 /// when a task passed no trial.
 fn report(job: &Path) -> Result<i32> {
     let rows = rows(job)?;
-    let mut md = String::from("| task | capability | difficulty | passed | avg tokens | avg time | errors |\n|---|---|---|---|---|---|---|\n");
+    let mut md = String::from(
+        "| task | capability | difficulty | passed | avg tokens | avg time | errors |\n|---|---|---|---|---|---|---|\n",
+    );
     let mut by_cap: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for r in &rows {
-        let errors = if r.errors.is_empty() { String::new() } else { format!(" [{}]", r.errors.join(", ")) };
+        let errors = if r.errors.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", r.errors.join(", "))
+        };
         println!(
             "test {} ... {} {}/{} ({} tok, {}){errors}",
             r.task,
@@ -515,7 +599,10 @@ fn report(job: &Path) -> Result<i32> {
     println!();
     md.push_str("\n| capability | pass rate |\n|---|---|\n");
     for (cap, (p, t)) in &by_cap {
-        println!("{cap:<14} {p}/{t} ({:.0}%)", 100.0 * *p as f64 / (*t).max(1) as f64);
+        println!(
+            "{cap:<14} {p}/{t} ({:.0}%)",
+            100.0 * *p as f64 / (*t).max(1) as f64
+        );
         let _ = writeln!(md, "| {cap} | {p}/{t} |");
     }
     println!(
@@ -533,14 +620,21 @@ fn report(job: &Path) -> Result<i32> {
                    "avg_secs": r.secs, "errors": r.errors, "verdict": r.verdict()})
         })
         .collect();
-    fs::write(job.join("summary.json"), serde_json::to_string_pretty(&json)?)?;
+    fs::write(
+        job.join("summary.json"),
+        serde_json::to_string_pretty(&json)?,
+    )?;
     Ok(if failed == 0 { 0 } else { 1 })
 }
 
 fn job_dir(name: Option<&String>) -> Result<PathBuf> {
     let jobs = eval_dir().join("jobs");
     match name.map(String::as_str) {
-        Some(n) if n != "latest" => Ok(if Path::new(n).is_dir() { PathBuf::from(n) } else { jobs.join(n) }),
+        Some(n) if n != "latest" => Ok(if Path::new(n).is_dir() {
+            PathBuf::from(n)
+        } else {
+            jobs.join(n)
+        }),
         _ => {
             let mut dirs: Vec<PathBuf> = fs::read_dir(&jobs)
                 .with_context(|| format!("read {}", jobs.display()))?
@@ -559,38 +653,44 @@ fn cmd_report(o: &Opts) -> Result<i32> {
 }
 
 fn cmd_compare(o: &Opts) -> Result<i32> {
-    let [a, b] = o.positional.as_slice() else { bail!("usage: cargo eval compare JOB_A JOB_B") };
-    let ra: BTreeMap<String, Row> = rows(&job_dir(Some(a))?)?.into_iter().map(|r| (r.task.clone(), r)).collect();
-    let rb: BTreeMap<String, Row> = rows(&job_dir(Some(b))?)?.into_iter().map(|r| (r.task.clone(), r)).collect();
+    let [a, b] = o.positional.as_slice() else {
+        bail!("usage: cargo eval compare JOB_A JOB_B")
+    };
+    let ra: BTreeMap<String, Row> = rows(&job_dir(Some(a))?)?
+        .into_iter()
+        .map(|r| (r.task.clone(), r))
+        .collect();
+    let rb: BTreeMap<String, Row> = rows(&job_dir(Some(b))?)?
+        .into_iter()
+        .map(|r| (r.task.clone(), r))
+        .collect();
     let rate = |r: &Row| r.passed as f64 / r.total.max(1) as f64;
-    println!("{:<60} {:>9} {:>9} {:>10} {:>10}", "task", "a", "b", "a tok", "b tok");
+    println!(
+        "{:<60} {:>9} {:>9} {:>10} {:>10}",
+        "task", "a", "b", "a tok", "b tok"
+    );
     let names: std::collections::BTreeSet<&String> = ra.keys().chain(rb.keys()).collect();
     for name in names {
         let (x, y) = (ra.get(name), rb.get(name));
-        let cell = |r: Option<&Row>| r.map(|r| format!("{}/{}", r.passed, r.total)).unwrap_or("-".into());
+        let cell = |r: Option<&Row>| {
+            r.map(|r| format!("{}/{}", r.passed, r.total))
+                .unwrap_or("-".into())
+        };
         let tok = |r: Option<&Row>| r.map(|r| human_tokens(r.tokens)).unwrap_or("-".into());
         let mark = match (x, y) {
             (Some(x), Some(y)) if rate(y) > rate(x) => " +",
             (Some(x), Some(y)) if rate(y) < rate(x) => " -",
             _ => "",
         };
-        println!("{name:<60} {:>9} {:>9} {:>10} {:>10}{mark}", cell(x), cell(y), tok(x), tok(y));
+        println!(
+            "{name:<60} {:>9} {:>9} {:>10} {:>10}{mark}",
+            cell(x),
+            cell(y),
+            tok(x),
+            tok(y)
+        );
     }
     Ok(0)
-}
-
-fn copy_dir(from: &Path, to: &Path) -> Result<()> {
-    fs::create_dir_all(to)?;
-    for e in fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
-        let e = e?;
-        let dest = to.join(e.file_name());
-        if e.file_type()?.is_dir() {
-            copy_dir(&e.path(), &dest)?;
-        } else {
-            fs::copy(e.path(), dest)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -606,17 +706,31 @@ mod tests {
         let registry = registry_tasks(&dir).unwrap();
         let mut known: Vec<String> = local.keys().chain(registry.keys()).cloned().collect();
         known.sort();
-        assert_eq!(cat, known, "eval/catalog.toml does not match eval/tasks/ + eval/dataset.toml");
+        assert_eq!(
+            cat, known,
+            "eval/catalog.toml does not match eval/tasks/ + eval/dataset.toml"
+        );
         for name in local.keys() {
-            assert!(!registry.contains_key(name), "{name} is both hand-authored and in dataset.toml");
+            assert!(
+                !registry.contains_key(name),
+                "{name} is both hand-authored and in dataset.toml"
+            );
         }
     }
 
     #[test]
     fn materialize_links_local_and_pinned_tasks() {
         let tasks = [
-            Task { name: "genji/x".into(), path: Some("tasks/a/x".into()), ..Default::default() },
-            Task { name: "org/y".into(), digest: Some("sha256:ab".into()), ..Default::default() },
+            Task {
+                name: "genji/x".into(),
+                path: Some("tasks/a/x".into()),
+                ..Default::default()
+            },
+            Task {
+                name: "org/y".into(),
+                digest: Some("sha256:ab".into()),
+                ..Default::default()
+            },
         ];
         let s = materialize("j", &tasks);
         assert!(s.contains("ln -sfn '../../tasks/a/x' 'genji__x'"));
@@ -628,7 +742,12 @@ mod tests {
     fn catalog_entries_are_complete() {
         for t in catalog(&eval_dir()).unwrap() {
             assert!(!t.capability.is_empty(), "{}: no capability", t.name);
-            assert!(["easy", "medium"].contains(&t.difficulty.as_str()), "{}: difficulty {:?}", t.name, t.difficulty);
+            assert!(
+                ["easy", "medium"].contains(&t.difficulty.as_str()),
+                "{}: difficulty {:?}",
+                t.name,
+                t.difficulty
+            );
         }
     }
 
@@ -639,17 +758,27 @@ mod tests {
         for (name, dir) in local_tasks(&eval_dir()).unwrap() {
             let t = load_toml(&dir.join("task.toml")).unwrap();
             let steps: Vec<PathBuf> = match t.get("steps").and_then(|s| s.as_array()) {
-                Some(steps) => steps.iter().map(|s| dir.join("steps").join(s["name"].as_str().unwrap())).collect(),
+                Some(steps) => steps
+                    .iter()
+                    .map(|s| dir.join("steps").join(s["name"].as_str().unwrap()))
+                    .collect(),
                 None => vec![dir.clone()],
             };
             for s in steps {
                 for f in ["instruction.md", "tests/test.sh", "solution/solve.sh"] {
-                    assert!(s.join(f).is_file(), "{name}: missing {}", s.join(f).display());
+                    assert!(
+                        s.join(f).is_file(),
+                        "{name}: missing {}",
+                        s.join(f).display()
+                    );
                 }
                 let text = fs::read_to_string(s.join("instruction.md")).unwrap();
                 if let Some(rest) = text.strip_prefix("+++\n") {
-                    let (head, _) = rest.split_once("\n+++\n").unwrap_or_else(|| panic!("{name}: unclosed front matter"));
-                    head.parse::<toml::Table>().unwrap_or_else(|e| panic!("{name}: front matter: {e}"));
+                    let (head, _) = rest
+                        .split_once("\n+++\n")
+                        .unwrap_or_else(|| panic!("{name}: unclosed front matter"));
+                    head.parse::<toml::Table>()
+                        .unwrap_or_else(|e| panic!("{name}: front matter: {e}"));
                 }
             }
         }
@@ -659,7 +788,12 @@ mod tests {
     fn verifier_helpers_are_current() {
         let lib = fs::read_to_string(eval_dir().join("lib/verify.sh")).unwrap();
         for copy in find(&eval_dir().join("tasks"), "lib.sh") {
-            assert_eq!(fs::read_to_string(&copy).unwrap(), lib, "{} differs from eval/lib/verify.sh", copy.display());
+            assert_eq!(
+                fs::read_to_string(&copy).unwrap(),
+                lib,
+                "{} differs from eval/lib/verify.sh",
+                copy.display()
+            );
         }
     }
 
@@ -692,11 +826,25 @@ mod tests {
 
     #[test]
     fn filters_select_by_name_capability_and_difficulty() {
-        let t = |n: &str, c: &str, d: &str| Task { name: n.into(), capability: c.into(), difficulty: d.into(), ..Default::default() };
-        let all = vec![t("genji/needle", "long-output", "easy"), t("quixbugs/python-gcd", "instruction", "medium")];
-        let o = Opts { positional: vec!["long".into()], ..Default::default() };
+        let t = |n: &str, c: &str, d: &str| Task {
+            name: n.into(),
+            capability: c.into(),
+            difficulty: d.into(),
+            ..Default::default()
+        };
+        let all = vec![
+            t("genji/needle", "long-output", "easy"),
+            t("quixbugs/python-gcd", "instruction", "medium"),
+        ];
+        let o = Opts {
+            positional: vec!["long".into()],
+            ..Default::default()
+        };
         assert_eq!(select(&o, all.clone()).len(), 1);
-        let o = Opts { difficulty: Some("medium".into()), ..Default::default() };
+        let o = Opts {
+            difficulty: Some("medium".into()),
+            ..Default::default()
+        };
         assert_eq!(select(&o, all)[0].name, "quixbugs/python-gcd");
     }
 }
