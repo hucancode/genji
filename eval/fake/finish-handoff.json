@@ -1,0 +1,39 @@
+[
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "handoff",
+          "summary": "handing off",
+          "next": {
+            "agent": "build",
+            "task": "Create /app/result.txt containing handed"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "write",
+        "arguments": {
+          "path": "/app/result.txt",
+          "content": "handed"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "done",
+          "summary": "created result.txt"
+        }
+      }
+    ]
+  }
+]

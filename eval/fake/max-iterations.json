@@ -1,0 +1,52 @@
+[
+  {
+    "tool_calls": [
+      {
+        "name": "read",
+        "arguments": {
+          "path": "/app/chain/start.txt"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "read",
+        "arguments": {
+          "path": "/app/chain/k4.txt"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "read",
+        "arguments": {
+          "path": "/app/chain/m9.txt"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "read",
+        "arguments": {
+          "path": "/app/chain/z2.txt"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "read",
+        "arguments": {
+          "path": "/app/chain/end.txt"
+        }
+      }
+    ]
+  }
+]

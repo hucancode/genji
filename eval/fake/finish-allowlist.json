@@ -1,0 +1,23 @@
+[
+  {
+    "tool_calls": [
+      {
+        "name": "ls",
+        "arguments": {
+          "path": "/app"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "blocked",
+          "summary": "listed /app"
+        }
+      }
+    ]
+  }
+]

@@ -1,0 +1,56 @@
+[
+  {
+    "tool_calls": [
+      {
+        "name": "bash",
+        "arguments": {
+          "command": "ls /app"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "read",
+        "arguments": {
+          "path": "/app/notes.txt"
+        }
+      }
+    ],
+    "delay": 2
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "write",
+        "arguments": {
+          "path": "/app/a.txt",
+          "content": "maple"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "write",
+        "arguments": {
+          "path": "/app/b.txt",
+          "content": "b"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "done",
+          "summary": "created a.txt and b.txt"
+        }
+      }
+    ]
+  }
+]

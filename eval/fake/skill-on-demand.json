@@ -1,0 +1,34 @@
+[
+  {
+    "tool_calls": [
+      {
+        "name": "read",
+        "arguments": {
+          "path": "/app/.agents/skills/secret-word/SKILL.md"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "write",
+        "arguments": {
+          "path": "/app/answer.txt",
+          "content": "quill-4827-amber"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "done",
+          "summary": "wrote the secret word"
+        }
+      }
+    ]
+  }
+]

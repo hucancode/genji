@@ -1,0 +1,104 @@
+[
+  {
+    "tool_calls": [
+      {
+        "name": "write",
+        "arguments": {
+          "path": "/app/one.txt",
+          "content": "1"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 400,
+      "completion_tokens": 50
+    }
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "bash",
+        "arguments": {
+          "command": "cat /app/one.txt"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 400,
+      "completion_tokens": 50
+    }
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "write",
+        "arguments": {
+          "path": "/app/two.txt",
+          "content": "2"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 400,
+      "completion_tokens": 50
+    }
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "bash",
+        "arguments": {
+          "command": "cat /app/two.txt"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 400,
+      "completion_tokens": 50
+    }
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "write",
+        "arguments": {
+          "path": "/app/three.txt",
+          "content": "3"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 400,
+      "completion_tokens": 50
+    }
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "bash",
+        "arguments": {
+          "command": "cat /app/three.txt"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 400,
+      "completion_tokens": 50
+    }
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "done",
+          "summary": "wrote three files"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 400,
+      "completion_tokens": 50
+    }
+  }
+]

@@ -3,7 +3,8 @@
 Uploads statically linked ``genji`` and ``genji-drive`` binaries into the task
 container, writes ``/genji/config.json`` (the runner's config, never the key
 itself) and runs each task step through ``genji-drive``, which holds genji's
-stdin/stdout.
+stdin/stdout. With the ``fake_dir`` option the provider's ``base_url`` points at ``eval/fake_llm.py``
+running in the container, replaying the task's script from that directory.
 
 An ``instruction.md`` may start with a TOML front matter block between ``+++``
 lines; it is stripped from the prompt and steers the step:
@@ -52,6 +53,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HOME = PurePosixPath("/genji")
 _BIN_DIR = PurePosixPath("/usr/local/bin")
 _OUT = "/logs/agent"
+_FAKE_PORT = 18080
 
 
 class GenjiOptions(InstalledAgentOptions):
@@ -62,6 +64,9 @@ class GenjiOptions(InstalledAgentOptions):
     agents_dir: str | None = None
     #: eval/catalog.toml: per-task `config` overrides.
     catalog: str | None = None
+    #: Directory of fake LLM scripts (eval/fake): replay `<task>.json` from a local fake
+    #: endpoint in the container instead of calling the runner's provider.
+    fake_dir: str | None = None
 
 
 def split_front_matter(instruction: str) -> tuple[dict[str, Any], str]:
@@ -151,6 +156,26 @@ class Genji(BaseInstalledAgent):
             command=f"chmod 0755 {_BIN_DIR}/genji {_BIN_DIR}/genji-drive && "
             f"chmod -R a+rwX {_HOME} && genji --version",
         )
+        if self.options.fake_dir:
+            await self._start_fake(environment)
+
+    async def _start_fake(self, environment: BaseEnvironment) -> None:
+        """Serve the task's fake LLM script on localhost, for every step of the task."""
+        script = Path(self.options.fake_dir) / f"{environment.environment_name}.json"
+        if not script.is_file():
+            raise FileNotFoundError(f"no fake LLM script {script}")
+        await environment.upload_file(str(Path(__file__).resolve().parents[1] / "fake_llm.py"), str(_HOME / "fake_llm.py"))
+        await environment.upload_file(str(script), str(_HOME / "fake.json"))
+        await self.exec_as_root(
+            environment,
+            command=f"chmod -R a+rwX {_HOME}; cd {_HOME} && "
+            f"(setsid python3 fake_llm.py fake.json --port {_FAKE_PORT} --log fake.log >/dev/null 2>&1 </dev/null &) && "
+            "python3 -c \"import socket,time\n"
+            "for _ in range(50):\n"
+            f" try: socket.create_connection(('127.0.0.1',{_FAKE_PORT})).close(); break\n"
+            " except OSError: time.sleep(0.1)\n"
+            "else: raise SystemExit('fake llm did not start')\"",
+        )
 
     # -- config / run ----------------------------------------------------- #
 
@@ -193,6 +218,11 @@ class Genji(BaseInstalledAgent):
         model_cfg, env = self._model_config()
         cfg = merge(model_cfg, self._catalog_config(environment))
         cfg = merge(cfg, directives.pop("config", {}) or {})
+        if self.options.fake_dir:
+            provider = cfg["providers"][cfg["provider"]]
+            provider.update(base_url=f"http://127.0.0.1:{_FAKE_PORT}/v1", api_key="fake")
+            provider.pop("api_key_env", None)
+            env = {}
         cfg.update(
             agents_dir=str(_HOME / "agents"),
             sessions_dir=str(_HOME / "sessions"),

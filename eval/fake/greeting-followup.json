@@ -1,0 +1,46 @@
+[
+  {
+    "tool_calls": [
+      {
+        "name": "write",
+        "arguments": {
+          "path": "/app/greet.py",
+          "content": "import sys\nfrom datetime import datetime\n\nGREETINGS = {\n    \"en\": (\"Good morning\", \"Good afternoon\", \"Good evening\", \"Hello\"),\n}\n\n\ndef greeting(lang, hour):\n    morning, afternoon, evening, fallback = GREETINGS[lang]\n    if 5 <= hour < 12:\n        return morning\n    if 12 <= hour < 18:\n        return afternoon\n    if 18 <= hour < 23:\n        return evening\n    return fallback\n\n\nif __name__ == \"__main__\":\n    print(greeting(\"en\", datetime.now().hour))\n"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "done",
+          "summary": "greet.py prints the greeting for the time of day"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "write",
+        "arguments": {
+          "path": "/app/greet.py",
+          "content": "import sys\nfrom datetime import datetime\n\nGREETINGS = {\n    \"en\": (\"Good morning\", \"Good afternoon\", \"Good evening\", \"Hello\"),\n    \"jp\": (\"おはようございます\", \"こんにちは\", \"こんばんは\", \"やあ\"),\n}\n\n\ndef greeting(lang, hour):\n    morning, afternoon, evening, fallback = GREETINGS[lang]\n    if 5 <= hour < 12:\n        return morning\n    if 12 <= hour < 18:\n        return afternoon\n    if 18 <= hour < 23:\n        return evening\n    return fallback\n\n\nif __name__ == \"__main__\":\n    print(greeting(\"jp\" if \"jp\" in sys.argv[1:] else \"en\", datetime.now().hour))\n"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "done",
+          "summary": "greet.py supports the jp parameter"
+        }
+      }
+    ]
+  }
+]

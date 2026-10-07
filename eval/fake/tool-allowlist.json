@@ -1,0 +1,13 @@
+[
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "blocked",
+          "summary": "I have no tool that can write a file"
+        }
+      }
+    ]
+  }
+]

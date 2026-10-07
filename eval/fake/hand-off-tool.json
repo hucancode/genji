@@ -1,0 +1,35 @@
+[
+  {
+    "tool_calls": [
+      {
+        "name": "hand_off",
+        "arguments": {
+          "agent": "build",
+          "task": "Create /app/result.txt containing routed"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "write",
+        "arguments": {
+          "path": "/app/result.txt",
+          "content": "routed"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "done",
+          "summary": "created result.txt"
+        }
+      }
+    ]
+  }
+]

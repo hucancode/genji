@@ -1,0 +1,35 @@
+[
+  {
+    "tool_calls": [
+      {
+        "name": "write",
+        "arguments": {
+          "path": "/app/hello.txt",
+          "content": "hello"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "done",
+          "summary": "created hello.txt"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "verdict",
+        "arguments": {
+          "verdict": "done",
+          "notes": "hello.txt holds hello"
+        }
+      }
+    ]
+  }
+]

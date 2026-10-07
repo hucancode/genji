@@ -39,3 +39,20 @@ A `[benchmarks.NAME]` entry in `catalog.toml` takes one of two forms:
 
 - A registry dataset pinned to a revision (`dataset = "org/name@N"`), optionally filtered by `category` and cut to a fixed `sample`. It is downloaded once into `eval/.store/`.
 - The catalog tasks marked `level = "benchmark"` with `suite = NAME`.
+
+## Fake LLM (`--fake`)
+
+`cargo eval unit --fake` (or `eval/remote.py unit --fake`) runs the tasks without a model. Each
+task container starts `eval/fake_llm.py` on localhost, which replays `eval/fake/<task>.json`: a
+list of turns, the Nth LLM request getting the Nth turn whatever it asks. No key is needed
+(`eval/config.fake.json` is the default config). A request past the last turn gets HTTP 500, so a
+stale script fails instead of passing.
+
+```json
+[{"tool_calls": [{"name": "write", "arguments": {"path": "/app/a.txt", "content": "x"}}]},
+ {"text": "done", "usage": {"prompt_tokens": 400, "completion_tokens": 50}, "delay": 2}]
+```
+
+A turn has `text` and/or `tool_calls`, optional `usage` and `delay` (seconds). One script covers
+every step, subagent, review pass and handoff of its task, in execution order. Every unit task
+needs a script (checked by `cargo test`). `python3 -m unittest eval/test_fake_llm.py` tests the server.

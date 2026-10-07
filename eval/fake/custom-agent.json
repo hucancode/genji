@@ -1,0 +1,24 @@
+[
+  {
+    "tool_calls": [
+      {
+        "name": "write",
+        "arguments": {
+          "path": "/app/greeting.txt",
+          "content": "hello from greeter"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "done",
+          "summary": "wrote the greeting"
+        }
+      }
+    ]
+  }
+]

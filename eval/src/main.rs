@@ -27,7 +27,9 @@ const USAGE: &str = "usage:
   cargo eval compare JOB_A JOB_B
 
 options: --config FILE (default eval/config.json, see eval/config.example.json), -k ATTEMPTS
-(1; `run`: 3), -j CONCURRENCY, --agents DIR, --capability C, --difficulty D, --name JOB.
+(1; `run`: 3), -j CONCURRENCY, --agents DIR, --capability C, --difficulty D, --name JOB,
+--fake (replay eval/fake/<task>.json from a local fake LLM instead of calling the model;
+no key needed, a task without a script errors).
 A filter matches a task name or capability by substring. Levels: smoke, unit, benchmark.
 `cargo eval list` without a level or suite also lists the benchmark suites.";
 
@@ -46,6 +48,7 @@ struct Opts {
     capability: Option<String>,
     difficulty: Option<String>,
     name: Option<String>,
+    fake: bool,
 }
 
 fn parse(args: Vec<String>) -> Result<Opts> {
@@ -79,6 +82,7 @@ fn parse(args: Vec<String>) -> Result<Opts> {
             "--capability" => o.capability = Some(value()?),
             "--difficulty" => o.difficulty = Some(value()?),
             "--name" => o.name = Some(value()?),
+            "--fake" => o.fake = true,
             "-h" | "--help" => o.cmd = "help".into(),
             f if f.starts_with('-') => bail!("unknown option `{f}`"),
             _ if o.cmd.is_empty() => o.cmd = arg,
@@ -527,6 +531,9 @@ fn harbor_run(o: &Opts, job: &str, agent: &str, tasks: &[Task], attempts: u32) -
     ];
     if agent.starts_with("genji_agent") {
         args.push("--artifact /app --ak catalog=eval/catalog.toml".into());
+        if o.fake {
+            args.push("--ak fake_dir=eval/fake".into());
+        }
         let config = config_path(o)?;
         args.push(format!(
             "--ak genji_config={}",
@@ -544,10 +551,12 @@ fn harbor_run(o: &Opts, job: &str, agent: &str, tasks: &[Task], attempts: u32) -
     in_repo(&args.join(" "))
 }
 
-/// The runner's genji config: `--config`, else `eval/config.json`.
+/// The runner's genji config: `--config`, else `eval/config.json` (`eval/config.fake.json`
+/// with `--fake`).
 fn config_path(o: &Opts) -> Result<PathBuf> {
     let path = match &o.config {
         Some(c) => fs::canonicalize(c).with_context(|| format!("--config {c}"))?,
+        None if o.fake => eval_dir().join("config.fake.json"),
         None => eval_dir().join("config.json"),
     };
     anyhow::ensure!(
@@ -1069,6 +1078,28 @@ mod tests {
                         .unwrap_or_else(|e| panic!("{name}: front matter: {e}"));
                 }
             }
+        }
+    }
+
+    /// `--fake` replays `eval/fake/<task>.json`: every unit task has a script of turns.
+    #[test]
+    fn unit_tasks_have_fake_scripts() {
+        for t in catalog(&eval_dir())
+            .unwrap()
+            .iter()
+            .filter(|t| t.level == "unit")
+        {
+            let short = t.name.rsplit('/').next().unwrap();
+            let path = eval_dir().join("fake").join(format!("{short}.json"));
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("{}: no fake script {}", t.name, path.display()));
+            let turns: Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{}: fake script: {e}", t.name));
+            assert!(
+                turns.as_array().is_some_and(|a| !a.is_empty()),
+                "{}: fake script is not a list of turns",
+                t.name
+            );
         }
     }
 

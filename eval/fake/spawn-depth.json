@@ -1,0 +1,45 @@
+[
+  {
+    "tool_calls": [
+      {
+        "name": "spawn",
+        "arguments": {
+          "agent": "explore",
+          "instructions": "List the files in /app"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "ls",
+        "arguments": {
+          "path": "/app"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "write",
+        "arguments": {
+          "path": "/app/answer.txt",
+          "content": "README.md\nmain.py\n"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "done",
+          "summary": "wrote answer.txt"
+        }
+      }
+    ]
+  }
+]
