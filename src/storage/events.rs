@@ -479,6 +479,26 @@ pub fn find_session(dir: &Path, prefix: &str) -> Result<PathBuf> {
     }
 }
 
+/// The newest session in `dir` that can be resumed on its own: a top-level instance, not a
+/// subagent or a review pass.
+pub fn last_session(dir: &Path) -> Result<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .filter(|p| {
+            start(p).is_ok_and(|s| {
+                s["depth"] == 0 && !s["agent"].as_str().unwrap_or_default().ends_with(":review")
+            })
+        })
+        .filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p)))
+        .max()
+        .map(|(_, p)| p)
+        .with_context(|| format!("no recorded instance in {}", dir.display()))
+}
+
 /// The `instance_start` event of a recorded instance: its id (`instance`), agent and parent.
 pub fn start(path: &Path) -> Result<Value> {
     read(path)?
@@ -592,6 +612,25 @@ mod tests {
         assert_eq!(ctx.est_tokens(), live.est_tokens());
         assert_eq!(start(&path).unwrap()["agent"], "build");
         assert_eq!(find_session(&dir, "s").unwrap(), path);
+    }
+
+    #[test]
+    fn last_session_is_the_newest_top_level_instance() {
+        let dir = util::temp_dir("last-session");
+        let open = |id: &str, agent: &str, depth: u32| {
+            let e = EventEmitter::open(id, &dir.join(format!("{id}.jsonl")), 0).unwrap();
+            e.instance_start("/w", agent, "m", None, depth, "t", false);
+        };
+        assert!(last_session(&dir).is_err());
+        open("a", "build", 0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        open("b", "explore", 1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        open("c", "build:review", 0);
+        assert_eq!(last_session(&dir).unwrap(), dir.join("a.jsonl"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        open("d", "plan", 0);
+        assert_eq!(last_session(&dir).unwrap(), dir.join("d.jsonl"));
     }
 
     #[test]

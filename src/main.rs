@@ -18,7 +18,7 @@ use storage::context::ContextComposer;
 use storage::events;
 
 const USAGE: &str = "usage:
-  genji <agent> [task] [--resume ID] [--parent ID] [--workspace DIR] [--provider P]
+  genji <agent> [task] [--resume ID|last] [--parent ID] [--workspace DIR] [--provider P]
                 [--socket PATH | --socket-disabled] [--sessions-dir DIR] [--token-limit N]
                 [--config FILE] [--config-json JSON] [--agents-dir DIR]
   genji init [agent...] [--force] [--workspace DIR]
@@ -365,9 +365,14 @@ fn run_agent(o: Opts) -> Result<i32> {
     }
 }
 
-/// The `--resume` target: `(instance id, agent name, parent)`.
+/// The `--resume` target: `(instance id, agent name, parent)`. `last` is the newest
+/// top-level instance.
 fn resume_target(sessions: &Path, prefix: &str) -> Result<(String, String, Option<String>)> {
-    let s = events::start(&events::find_session(sessions, prefix)?)?;
+    let path = match prefix {
+        "last" => events::last_session(sessions)?,
+        _ => events::find_session(sessions, prefix)?,
+    };
+    let s = events::start(&path)?;
     Ok((
         s["instance"].as_str().unwrap_or_default().to_string(),
         s["agent"].as_str().unwrap_or_default().to_string(),
