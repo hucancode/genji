@@ -1,9 +1,6 @@
 +++
 socket = true
-socket_send = [
-  { after_tool_calls = 1, line = "/ping" },
-  { after_tool_calls = 1, line = "Also create /app/b.txt containing b" },
-]
+wrap = "python3 /opt/task/wrap.py"
 +++
 Do these steps one at a time, one tool call per step:
 

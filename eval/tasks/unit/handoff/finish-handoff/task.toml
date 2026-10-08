@@ -2,7 +2,7 @@ schema_version = "1.3"
 
 [task]
 name = "genji/finish-handoff"
-description = "genji-drive follows a finish handoff to the named agent, linked by parent"
+description = "A top-level finish handoff continues in the same process to the named agent, linked by parent"
 
 [metadata]
 difficulty = "easy"

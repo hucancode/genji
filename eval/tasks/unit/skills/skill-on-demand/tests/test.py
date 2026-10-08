@@ -4,7 +4,9 @@ from pathlib import Path
 
 
 def check():
-    events = [json.loads(l) for l in Path("/genji/trace/all.jsonl").read_text().splitlines()]
+    # Every instance counts: the agent may have a subagent read the skill.
+    events = [json.loads(l) for f in sorted(Path("/genji/sessions").glob("*.jsonl"))
+              for l in f.read_text().splitlines()]
     def reads_skill(e):
         args = e.get("arguments") or {}
         return (e["name"] == "read" and args.get("path", "").endswith("SKILL.md")) or (

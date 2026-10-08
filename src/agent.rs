@@ -54,12 +54,16 @@ impl Status {
     }
 }
 
+/// Identical failures of one tool in a row after which the run gives up.
+const MAX_REPEATED_FAILURES: u32 = 5;
+
 /// Why a stopped run stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     TokenLimit,
     TimeLimit,
     MaxIterations,
+    RepeatedFailure,
     User,
 }
 
@@ -69,6 +73,7 @@ impl StopReason {
             StopReason::TokenLimit => "token_limit",
             StopReason::TimeLimit => "time_limit",
             StopReason::MaxIterations => "max_iterations",
+            StopReason::RepeatedFailure => "repeated_failure",
             StopReason::User => "user",
         }
     }
@@ -90,6 +95,8 @@ pub struct Agent {
     pub handed_off: bool,
     pub status: Status,
     pub reason: Option<StopReason>,
+    /// The latest failed tool call's `(tool, error)` and how many calls in a row failed that way.
+    failing: Option<((String, String), u32)>,
     pub llm: LlmClient,
     skills: BTreeMap<String, Skill>,
     context: Arc<RwLock<ContextComposer>>,
@@ -388,6 +395,7 @@ impl Agent {
             handed_off: false,
             status: Status::Done,
             reason: None,
+            failing: None,
             llm,
             skills,
             context: p.context,
@@ -470,6 +478,13 @@ impl Agent {
             let ctx = self.context.read().unwrap();
             result = dedupe(&mut self.seen, &ctx, tc, result);
         }
+        self.failing = match (is_error, self.failing.take()) {
+            (true, Some((key, n))) if key == (tc.name().to_string(), result.clone()) => {
+                Some((key, n + 1))
+            }
+            (true, _) => Some(((tc.name().to_string(), result.clone()), 1)),
+            (false, _) => None,
+        };
         self.log_result(tc, result, is_error, start.elapsed());
     }
 
@@ -664,6 +679,12 @@ impl Agent {
             }
             if let Some(v) = &self.verdict {
                 return Ok(v.summary.clone());
+            }
+            if let Some(((name, error), n)) = &self.failing
+                && *n >= MAX_REPEATED_FAILURES
+            {
+                let msg = format!("`{name}` failed {n} times in a row: {error}");
+                return Ok(self.stop(StopReason::RepeatedFailure, msg));
             }
             state.iterations += 1;
             if state.iterations >= self.cfg.max_tool_iterations {

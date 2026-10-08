@@ -1,4 +1,4 @@
-//! Helpers shared by the `genji-eval` and `genji-drive` binaries.
+//! Helpers for the `genji-eval` binary.
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -17,13 +17,4 @@ pub fn copy_dir(from: &Path, to: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Like [`copy_dir`], but a missing source is not an error.
-pub fn copy_dir_if_exists(from: &Path, to: &Path) -> Result<()> {
-    if from.exists() {
-        copy_dir(from, to)
-    } else {
-        Ok(())
-    }
 }

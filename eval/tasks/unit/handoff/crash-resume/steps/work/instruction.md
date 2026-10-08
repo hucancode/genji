@@ -1,5 +1,5 @@
 +++
-kill_after_tool_calls = 4
+wrap = "python3 /opt/task/wrap.py"
 +++
 Write `/app/textstats.py`, a command-line tool: `python3 textstats.py FILE` prints one JSON object with
 

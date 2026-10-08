@@ -1,4 +1,4 @@
-"""genji-drive follows a finish handoff to the named agent, linked by parent."""
+"""A top-level finish handoff continues in the same process to the named agent, linked by parent."""
 import json
 from pathlib import Path
 

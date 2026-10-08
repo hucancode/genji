@@ -5,8 +5,6 @@ from pathlib import Path
 
 def check():
     events = [json.loads(l) for l in Path("/genji/trace/all.jsonl").read_text().splitlines()]
-    metrics = json.loads(Path("/genji/trace/metrics.json").read_text())
-    assert metrics["instances"] >= 2, "no second instance in the same step"
     assert any(e["type"] == "tool_call" and e["name"] == "hand_off" for e in events), "hand_off was not called"
     starts = [e for e in events if e["type"] == "instance_start"]
     assert len(starts) >= 2, f"{len(starts)} instance(s), expected a handoff to a second"

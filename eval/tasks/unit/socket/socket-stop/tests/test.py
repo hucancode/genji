@@ -5,10 +5,10 @@ from pathlib import Path
 
 def check():
     events = [json.loads(l) for l in Path("/genji/trace/all.jsonl").read_text().splitlines()]
-    metrics = json.loads(Path("/genji/trace/metrics.json").read_text())
+    code = int(Path("/genji/trace/exit_code").read_text())
     end = [e for e in events if e["type"] == "instance_end"][-1]
     assert end["reason"] == "user", f"stopped for {end['reason']!r}"
-    assert metrics["exit_code"] == 2, f"exit code {metrics['exit_code']}"
+    assert code == 2, f"exit code {code}"
 
 
 try:

@@ -27,11 +27,11 @@ cargo eval check --level unit      # nop scores 0 on every task; oracle scores 1
 - `catalog.toml` lists every task with its level, capability and difficulty, plus the `[benchmarks]` suites.
 - `dataset.toml` pins registry tasks by digest. Add one with `harbor add <org>/<name> --to eval`.
 - `tasks/unit/<feature>/<task>/` holds the hand-authored unit tasks. `tasks/capabilities/` holds hand-authored benchmark tasks.
-- `harbor/genji_agent.py` is the Harbor adapter. `src/drive.rs` (`genji-drive`) runs genji inside the container and leaves the trace and metrics there.
+- `harbor/genji_agent.py` is the Harbor adapter. It runs each step as one `genji` command inside the container and leaves the trace (`/genji/trace/all.jsonl`, `exit_code`) and metrics there. A task that must act on the live process (kill it, use its control socket) adds a `wrap` script.
 
 ## Unit tasks
 
-A unit task checks that isolated feature works, such as config, guardrails, skill loading, data-driven agents, handoff, subagent spawn, the control socket or follow-ups. It is trivial on purpose, so a failure points at the harness and not at the model. It must be quick: share the slim Dockerfile, need only a few tool calls, and set `[agent] timeout_sec <= 120` and `[verifier] timeout_sec <= 30` (a cargo test enforces both). Its verifier is `tests/test.py`: one short, self-contained, stdlib-only Python script about one aspect of the run, with plain `assert`s (`tests/test.sh` only starts it). It reads what `genji-drive` left in `/genji` (`trace/all.jsonl`, `trace/metrics.json`, `trace/socket.log`, `sessions/*.jsonl`) and the workspace, so a change to genji's event format breaks only the tasks that check that field, at a line you can see. Nothing is shared between tasks. Such a task has no oracle: no solution short of a genji run satisfies it, so `cargo eval check` proves only that `nop` scores 0 for it. A task with a `solution/` is also checked for oracle = 1.
+A unit task checks that isolated feature works, such as config, guardrails, skill loading, data-driven agents, handoff, subagent spawn, the control socket or follow-ups. It is trivial on purpose, so a failure points at the harness and not at the model. It must be quick: share the slim Dockerfile, need only a few tool calls, and set `[agent] timeout_sec <= 120` and `[verifier] timeout_sec <= 30` (a cargo test enforces both). Its verifier is `tests/test.py`: one short, self-contained, stdlib-only Python script about one aspect of the run, with plain `assert`s (`tests/test.sh` only starts it). It reads what the step left in `/genji` (`trace/all.jsonl`, `trace/exit_code`, `trace/socket.log`, `sessions/*.jsonl`) and the workspace, so a change to genji's event format breaks only the tasks that check that field, at a line you can see. Nothing is shared between tasks. Such a task has no oracle: no solution short of a genji run satisfies it, so `cargo eval check` proves only that `nop` scores 0 for it. A task with a `solution/` is also checked for oracle = 1.
 
 ## Benchmark suites
 
@@ -55,4 +55,4 @@ stale script fails instead of passing.
 
 A turn has `text` and/or `tool_calls`, optional `usage` and `delay` (seconds). One script covers
 every step, subagent, review pass and handoff of its task, in execution order. Every unit task
-needs a script (checked by `cargo test`). `python3 -m unittest eval/test_fake_llm.py` tests the server.
+needs a script (checked by `cargo test`).

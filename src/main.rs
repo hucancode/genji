@@ -7,7 +7,7 @@ mod tools;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -259,7 +259,19 @@ fn run_agent(o: Opts) -> Result<i32> {
     if let Some(p) = chosen_provider(o.provider.as_deref(), std::env::var("GENJI_PROVIDER").ok()) {
         cfg.provider = p;
     }
-    let mut provider = cfg.provider()?;
+    let base = cfg.provider()?;
+    // The provider as an instance of `def` sees it: its model, and the context window that
+    // model allows. Each instance of a chain gets its own, as a fresh process would.
+    let mut windows: HashMap<String, Option<i64>> = HashMap::new();
+    let mut provider_for = |def: &AgentDef| {
+        let mut p = base.clone();
+        let model = def.model.clone().unwrap_or_else(|| p.model.clone());
+        let served = *windows
+            .entry(model.clone())
+            .or_insert_with(|| llm::model_context_window(&base, &model));
+        p.context_window = effective_window(cfg.preferred_context_size, p.context_window, served);
+        p
+    };
     let words = o.positional.get(1..).unwrap_or_default();
     let mut task = read_task(o.instructions_file.as_deref(), words)?;
     let first_id = match (&resume, &o.instance_id) {
@@ -267,19 +279,12 @@ fn run_agent(o: Opts) -> Result<i32> {
         (None, Some(id)) => id.clone(),
         (None, None) => storage::util::new_id(),
     };
-    let model = def.model.clone().unwrap_or_else(|| provider.model.clone());
-    let window = effective_window(
-        cfg.preferred_context_size,
-        provider.context_window,
-        llm::model_context_window(&provider, &model),
-    );
-    provider.context_window = window;
     // Every run listens on a control socket for humans (unless disabled) and reads commands
     // from stdin for machines.
     let context = Arc::new(RwLock::new(ContextComposer::new(
         String::new(),
         Vec::new(),
-        provider.context_window,
+        provider_for(&def).context_window,
     )));
     if o.socket.is_some() && !cfg!(feature = "socket") {
         bail!("--socket needs a genji built with the `socket` feature");
@@ -313,7 +318,7 @@ fn run_agent(o: Opts) -> Result<i32> {
             workspace: ws.clone(),
             def: def.clone(),
             agents: agents.clone(),
-            provider: provider.clone(),
+            provider: provider_for(&def),
             instance_id: id.clone(),
             parent: parent.clone(),
             parent_agent: o.parent_agent.clone().filter(|_| o.subagent),

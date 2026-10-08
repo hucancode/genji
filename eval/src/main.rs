@@ -480,11 +480,11 @@ fn in_repo(script: &str) -> Result<()> {
         .env("PYTHONPATH", eval_dir().join("harbor")))
 }
 
-/// Builds static genji and genji-drive, which Harbor uploads into task containers.
+/// Builds the static genji binary, which Harbor uploads into task containers.
 fn build() -> Result<()> {
     in_repo(
         "RUSTFLAGS='-C target-feature=+crt-static' cargo build -q --release \
-         --target $(uname -m)-unknown-linux-gnu --workspace --bins",
+         --target $(uname -m)-unknown-linux-gnu --bin genji",
     )
 }
 
@@ -523,7 +523,12 @@ fn materialize(job: &str, tasks: &[Task]) -> String {
 fn harbor_run(o: &Opts, job: &str, agent: &str, tasks: &[Task], attempts: u32) -> Result<()> {
     in_repo(&format!("( {} )", materialize(job, tasks)))?;
     let mut args = vec![
-        format!("harbor run -y -q -p eval/.runs/{job} -o eval/jobs"),
+        // An absolute jobs directory: Harbor copies artifacts with `docker compose cp`, which
+        // runs from the task's directory and would resolve a relative one there.
+        format!(
+            "harbor run -y -q -p eval/.runs/{job} -o '{}'",
+            eval_dir().join("jobs").display()
+        ),
         format!(
             "--job-name {job} -a {agent} -k {attempts} -n {}",
             o.concurrency
@@ -687,7 +692,7 @@ struct Trial {
 }
 
 /// Every trial of a job, grouped by task name. A trial's tokens and time come from the
-/// metrics.json files genji-drive wrote for its steps.
+/// metrics.json files the adapter wrote for its steps.
 fn trials_by_task(job: &Path) -> Result<BTreeMap<String, Vec<Trial>>> {
     let mut out: BTreeMap<String, Vec<Trial>> = BTreeMap::new();
     let entries = fs::read_dir(job).with_context(|| format!("read {}", job.display()))?;

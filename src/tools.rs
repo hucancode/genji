@@ -71,7 +71,7 @@ fn write(agent: &mut Agent, args: &Value) -> Result<String> {
     Ok(format!(
         "wrote {} bytes to {}",
         a.content.len(),
-        agent.display_path(&path)
+        path.display()
     ))
 }
 
@@ -433,7 +433,11 @@ fn validate_finish(
     }
     let allowed = finish_statuses(def, parent.is_some());
     if !allowed.contains(&v.status) {
-        bail!("status must be one of: {}", allowed.join(", "));
+        bail!(
+            "status `{}` is not available to this agent; call finish with status {}",
+            v.status,
+            allowed.join(" or ")
+        );
     }
     if v.summary.trim().is_empty() {
         bail!("summary must not be empty");
@@ -489,7 +493,9 @@ fn finish(agent: &mut Agent, args: &Value) -> Result<String> {
         agent.parent_agent.as_deref(),
         args,
     )?;
-    claim_verdict(agent, v, false)
+    // A top-level handoff continues in this process; a subagent's reports back to its parent.
+    let handed_off = v.next.is_some() && agent.parent_agent.is_none();
+    claim_verdict(agent, v, handed_off)
 }
 
 #[derive(Deserialize)]
@@ -845,6 +851,21 @@ pub fn list() -> Vec<Value> {
         .collect()
 }
 
+/// What `finish` says about each status; an agent is only told about the ones it may use.
+fn finish_description(statuses: &[String]) -> String {
+    let mut text = String::from("End your run.");
+    for s in statuses {
+        text.push(' ');
+        text.push_str(match s.as_str() {
+            "done" => "done: the goal is achieved and verified.",
+            "handoff" => "handoff: your part is done and `next.agent` continues with `next.task` (self-contained: goal, what is done, what is left, where the state lives).",
+            "blocked" => "blocked: a human must step in.",
+            other => other,
+        });
+    }
+    text
+}
+
 /// Tool definitions sent to the model for this agent.
 pub fn specs(def: &AgentDef, subagent: bool) -> Vec<Value> {
     registry()
@@ -852,8 +873,14 @@ pub fn specs(def: &AgentDef, subagent: bool) -> Vec<Value> {
         .filter(|t| def.tools.iter().any(|n| n == t.0))
         .map(|Tool(name, description, parameters, _)| {
             let mut parameters = parameters.clone();
+            let mut description = description.to_string();
             if *name == "finish" {
-                parameters["properties"]["status"]["enum"] = json!(finish_statuses(def, subagent));
+                let statuses = finish_statuses(def, subagent);
+                description = finish_description(&statuses);
+                if !statuses.iter().any(|s| s == "handoff") {
+                    parameters["properties"].as_object_mut().map(|p| p.remove("next"));
+                }
+                parameters["properties"]["status"]["enum"] = json!(statuses);
             }
             json!({"type": "function", "function": {"name": name, "description": description, "parameters": parameters}})
         })
@@ -976,6 +1003,24 @@ mod tests {
             parse(json!("<parameter name=\"option\">x")).err().unwrap()
         );
         assert!(err.contains("JSON array of 2-6 strings"), "{err}");
+    }
+
+    #[test]
+    fn a_top_level_finish_handoff_continues_in_process_a_subagents_reports_back() {
+        let agents = defs(&[
+            ("lead", "---\ntools: finish\nfinish: handoff, blocked\n---\nl"),
+            ("next", "---\ntools: finish\nfinish: done\n---\nn"),
+        ]);
+        let handoff = json!({"status": "handoff", "summary": "s", "next": {"agent": "next", "task": "t"}});
+        let mut top = agent_for(agents["lead"].clone());
+        top.agents = agents.clone();
+        finish(&mut top, &handoff).unwrap();
+        assert!(top.handed_off);
+        let mut sub = agent_for(agents["lead"].clone());
+        sub.agents = agents;
+        sub.parent_agent = Some("next".into());
+        finish(&mut sub, &handoff).unwrap();
+        assert!(!sub.handed_off && sub.verdict.is_some());
     }
 
     #[test]
@@ -1208,6 +1253,29 @@ mod tests {
         );
         assert!(check(&agents["lead"]).is_ok());
         assert!(check(&defs(&[("x", "---\ntools: nope\n---\n")])["x"]).is_err());
+    }
+
+    #[test]
+    fn finish_describes_only_the_statuses_the_agent_may_use() {
+        let agents = defs(&[("only", "---\ntools: finish\nfinish: blocked\n---\no")]);
+        let finish = specs(&agents["only"], false)
+            .into_iter()
+            .find(|s| s["function"]["name"] == "finish")
+            .unwrap();
+        let text = finish["function"]["description"].as_str().unwrap();
+        assert!(text.contains("blocked") && !text.contains("done:") && !text.contains("handoff:"));
+        assert!(finish["function"]["parameters"]["properties"]["next"].is_null());
+        let e = validate_finish(
+            &agents["only"],
+            &agents,
+            None,
+            &json!({"status": "done", "summary": "s"}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "status `done` is not available to this agent; call finish with status blocked"
+        );
     }
 
     #[test]
