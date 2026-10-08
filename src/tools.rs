@@ -605,10 +605,17 @@ fn child_report(child: &str, agent: &str, events: &[Value], timed_out: bool, cap
         .map(|e| &e["result"])
         .filter(|r| matches!(r["status"].as_str(), Some("handoff" | "blocked")));
     let (status, report) = match result {
-        Some(r) if r["status"] == "handoff" => (
-            "handoff",
-            r["next"]["task"].as_str().unwrap_or_default().to_string(),
-        ),
+        Some(r) if r["status"] == "handoff" => {
+            // Findings may sit in `summary` as well as `next.task`; keep both.
+            let task = r["next"]["task"].as_str().unwrap_or_default();
+            let summary = r["summary"].as_str().unwrap_or_default().trim();
+            let report = if summary.is_empty() || task.contains(summary) {
+                task.to_string()
+            } else {
+                format!("{summary}\n\n{task}")
+            };
+            ("handoff", report)
+        }
         Some(r) => (
             "blocked",
             r["summary"].as_str().unwrap_or_default().to_string(),
@@ -1008,10 +1015,14 @@ mod tests {
     #[test]
     fn a_top_level_finish_handoff_continues_in_process_a_subagents_reports_back() {
         let agents = defs(&[
-            ("lead", "---\ntools: finish\nfinish: handoff, blocked\n---\nl"),
+            (
+                "lead",
+                "---\ntools: finish\nfinish: handoff, blocked\n---\nl",
+            ),
             ("next", "---\ntools: finish\nfinish: done\n---\nn"),
         ]);
-        let handoff = json!({"status": "handoff", "summary": "s", "next": {"agent": "next", "task": "t"}});
+        let handoff =
+            json!({"status": "handoff", "summary": "s", "next": {"agent": "next", "task": "t"}});
         let mut top = agent_for(agents["lead"].clone());
         top.agents = agents.clone();
         finish(&mut top, &handoff).unwrap();
@@ -1344,20 +1355,22 @@ mod tests {
             ))
             .unwrap()
         };
-        let v = report(
-            &end(
-                json!({"status": "handoff", "summary": "s", "next": {"agent": "plan", "task": "findings"}}),
-            ),
-            false,
-        );
+        let handoff = |summary: &str| {
+            end(
+                json!({"status": "handoff", "summary": summary, "next": {"agent": "plan", "task": "findings: a.rs"}}),
+            )
+        };
+        let v = report(&handoff("a.rs"), false);
         assert_eq!(
             (
                 v["status"].as_str(),
                 v["report"].as_str(),
                 v["run"].as_str()
             ),
-            (Some("handoff"), Some("findings"), Some("done"))
+            (Some("handoff"), Some("findings: a.rs"), Some("done"))
         );
+        let v = report(&handoff("x lives in b.rs"), false);
+        assert_eq!(v["report"], "x lives in b.rs\n\nfindings: a.rs");
         let no_verdict = format!(
             "{}\n{}",
             json!({"type": "assistant", "content": "I looked"}),

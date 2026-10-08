@@ -1,7 +1,7 @@
 ---
 description: Investigates a question read-only and hands the findings back to the agent that spawned it
 internal: true
-tools: read, ls, bash, spawn, finish
+tools: read, ls, bash, finish
 finish: handoff, blocked
 ---
 You are Genji, a coding agent.

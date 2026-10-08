@@ -58,7 +58,7 @@ Event types:
 | `compaction` | `summary`, `kept`, `removed`, `used` | history is summarized |
 | `status` | `status` | progress text |
 | `error` | `message` | budget, LLM, loop-limit, handoff-cap problems |
-| `instance_end` | `status` (done/failed/stopped), `reason`, `tokens_used`, `report`, `result` | the run ends; `reason` says why a `stopped` run stopped (`token_limit`, `time_limit`, `max_iterations`, `user`) and is `null` otherwise; `result` is the `finish` or `verdict` result `{status, summary, next}` (a review's `status` is `done`, `reject`, `handoff` or `blocked`) or `null` |
+| `instance_end` | `status` (done/failed/stopped), `reason`, `tokens_used`, `report`, `result` | the run ends; `reason` says why a `stopped` run stopped (`token_limit`, `time_limit`, `max_iterations`, `repeated_call`, `user`) and is `null` otherwise; `result` is the `finish` or `verdict` result `{status, summary, next}` (a review's `status` is `done`, `reject`, `handoff` or `blocked`) or `null` |
 
 `tool_call.id` pairs a request with its `tool_result`.
 

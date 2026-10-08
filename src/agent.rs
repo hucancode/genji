@@ -54,8 +54,9 @@ impl Status {
     }
 }
 
-/// Identical failures of one tool in a row after which the run gives up.
-const MAX_REPEATED_FAILURES: u32 = 5;
+/// Identical calls in a row after which the run gives up: the same failure of one tool, or the
+/// same call returning the same output.
+const MAX_REPEATED_CALLS: u32 = 5;
 
 /// Why a stopped run stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +64,7 @@ pub enum StopReason {
     TokenLimit,
     TimeLimit,
     MaxIterations,
-    RepeatedFailure,
+    RepeatedCall,
     User,
 }
 
@@ -73,7 +74,7 @@ impl StopReason {
             StopReason::TokenLimit => "token_limit",
             StopReason::TimeLimit => "time_limit",
             StopReason::MaxIterations => "max_iterations",
-            StopReason::RepeatedFailure => "repeated_failure",
+            StopReason::RepeatedCall => "repeated_call",
             StopReason::User => "user",
         }
     }
@@ -95,8 +96,8 @@ pub struct Agent {
     pub handed_off: bool,
     pub status: Status,
     pub reason: Option<StopReason>,
-    /// The latest failed tool call's `(tool, error)` and how many calls in a row failed that way.
-    failing: Option<((String, String), u32)>,
+    /// The latest tool call's repeat key, its description, and how many calls in a row shared it.
+    repeating: Option<(u64, String, u32)>,
     pub llm: LlmClient,
     skills: BTreeMap<String, Skill>,
     context: Arc<RwLock<ContextComposer>>,
@@ -269,6 +270,33 @@ fn dedupe(
     result
 }
 
+/// Counts consecutive identical calls: a failure repeats on the same error whatever the
+/// arguments; a success on the same arguments and output.
+fn track_repeat(
+    prev: Option<(u64, String, u32)>,
+    tc: &ToolCall,
+    result: &str,
+    is_error: bool,
+) -> Option<(u64, String, u32)> {
+    let key = if is_error {
+        hash_of(&format!("{}\0{result}", tc.name()))
+    } else {
+        hash_of(&format!("{}\0{}\0{result}", tc.name(), tc.args()))
+    };
+    match prev {
+        Some((k, what, n)) if k == key => Some((k, what, n + 1)),
+        _ if is_error => Some((key, format!("`{}` failed: {result}", tc.name()), 1)),
+        _ => Some((
+            key,
+            format!(
+                "`{}` returned the same output for the same arguments",
+                tc.name()
+            ),
+            1,
+        )),
+    }
+}
+
 fn hash_of(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -395,7 +423,7 @@ impl Agent {
             handed_off: false,
             status: Status::Done,
             reason: None,
-            failing: None,
+            repeating: None,
             llm,
             skills,
             context: p.context,
@@ -478,13 +506,7 @@ impl Agent {
             let ctx = self.context.read().unwrap();
             result = dedupe(&mut self.seen, &ctx, tc, result);
         }
-        self.failing = match (is_error, self.failing.take()) {
-            (true, Some((key, n))) if key == (tc.name().to_string(), result.clone()) => {
-                Some((key, n + 1))
-            }
-            (true, _) => Some(((tc.name().to_string(), result.clone()), 1)),
-            (false, _) => None,
-        };
+        self.repeating = track_repeat(self.repeating.take(), tc, &result, is_error);
         self.log_result(tc, result, is_error, start.elapsed());
     }
 
@@ -680,11 +702,11 @@ impl Agent {
             if let Some(v) = &self.verdict {
                 return Ok(v.summary.clone());
             }
-            if let Some(((name, error), n)) = &self.failing
-                && *n >= MAX_REPEATED_FAILURES
+            if let Some((_, what, n)) = &self.repeating
+                && *n >= MAX_REPEATED_CALLS
             {
-                let msg = format!("`{name}` failed {n} times in a row: {error}");
-                return Ok(self.stop(StopReason::RepeatedFailure, msg));
+                let msg = format!("{n} identical calls in a row: {what}");
+                return Ok(self.stop(StopReason::RepeatedCall, msg));
             }
             state.iterations += 1;
             if state.iterations >= self.cfg.max_tool_iterations {
@@ -862,6 +884,24 @@ mod tests {
         }
         assert!(ctx.prune(2, true));
         assert_eq!(run(&mut ctx, "c6", &big), big);
+    }
+
+    #[test]
+    fn repeats_count_same_failures_and_same_successes() {
+        let call = |args: &str| ToolCall::new("c", "bash", args.to_string());
+        let count = |calls: &[(&str, &str, bool)]| {
+            calls
+                .iter()
+                .fold(None, |prev, (args, out, err)| {
+                    track_repeat(prev, &call(args), out, *err)
+                })
+                .map(|(_, _, n)| n)
+        };
+        assert_eq!(count(&[("a", "x", false), ("a", "x", false)]), Some(2));
+        assert_eq!(count(&[("a", "x", false), ("a", "y", false)]), Some(1));
+        assert_eq!(count(&[("a", "x", false), ("b", "x", false)]), Some(1));
+        assert_eq!(count(&[("a", "ERR", true), ("b", "ERR", true)]), Some(2));
+        assert_eq!(count(&[("a", "ERR", true), ("a", "ERR", false)]), Some(1));
     }
 
     #[test]

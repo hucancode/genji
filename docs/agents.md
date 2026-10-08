@@ -42,7 +42,7 @@ The files `genji init` writes:
 |---|---|---|---|
 | `plan` | read write edit ls bash spawn ask finish | done, blocked; reviewed | breaks the request into requirements (or follows a requirements skill), settles decisions through `ask`, delegates fact-finding to `explore`, and writes a self-contained plan to `docs/notes/` (or tickets, under a ticket skill): steps with acceptance criteria, the tests that prove them, seed data, and a test and verification strategy; never writes code or tests, never hands off |
 | `build` | read write edit ls bash spawn finish | done, blocked; reviewed | implements and verifies; delegates exploration to `explore` via `spawn`; `finish done` submits the work to its review pass |
-| `explore` | read ls bash spawn finish | handoff, blocked | internal; investigates read-only, hands terse `path:line` findings back to the agent that spawned it |
+| `explore` | read ls bash finish | handoff, blocked | internal; investigates read-only, hands terse `path:line` findings back to the agent that spawned it |
 | `retro` | read write edit ls bash finish | done, blocked | improves agents and skills from recorded sessions |
 
 ## The `ask` tool
@@ -101,8 +101,8 @@ with a warning.
 
 1. **Work pass**: the agent's own run. It edits, asks the human, and receives the
    instructions sent over the control socket.
-2. **Review pass**: when the work pass calls `finish done` or runs out of tool
-   iterations, and its largest prompt reached `review_threshold` (default 40%) of the
+2. **Review pass**: when the work pass calls `finish done`, ends with a text reply
+   instead of `finish` (after one nudge), or runs out of tool iterations, and its largest prompt reached `review_threshold` (default 40%) of the
    effective context window (see [Configuration](configuration.md)), a fresh instance `<work id>-review-<n>` (agent `<name>:review`,
    `parent` = the work id) starts with an empty context. Its system prompt is the
    review prompt, with the same environment, project instructions and skills. Its tools are the

@@ -330,9 +330,12 @@ fn run_agent(o: Opts) -> Result<i32> {
         })?;
         a.run(task.as_deref())?;
         let end = Outcome::of(&a);
-        // Two passes: a top-level work pass that submits or runs out of tool iterations is
-        // judged by a review pass with a fresh context.
-        let submitted = (end.verdict.as_ref().is_some_and(|v| v.status == "done")
+        // Two passes: a top-level work pass that submits, ends in plain text without `finish`,
+        // or runs out of tool iterations is judged by a review pass with a fresh context.
+        let submitted = (end
+            .verdict
+            .as_ref()
+            .map_or(end.status == Status::Done, |v| v.status == "done")
             || end.out_of_iterations)
             && !o.subagent
             && context.read().unwrap().peaked_over(cfg.review_threshold);
