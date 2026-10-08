@@ -1,6 +1,5 @@
 +++
 agent = "stepper"
-before = "cp -r /opt/task-agents/. /genji/agents/"
 [config]
 max_tool_iterations = 2
 +++

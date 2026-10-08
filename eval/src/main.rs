@@ -8,7 +8,6 @@
 //! locally; `eval/remote.py` runs these commands on another host.
 
 use anyhow::{Context, Result, bail};
-use genji_eval::copy_dir;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -546,10 +545,9 @@ fn harbor_run(o: &Opts, job: &str, agent: &str, tasks: &[Task], attempts: u32) -
         ));
         if let Some(a) = &o.agents {
             // Kept with the job.
-            copy_dir(
-                Path::new(a),
-                &eval_dir().join("jobs").join(job).join("agents"),
-            )?;
+            let dir = eval_dir().join("jobs").join(job);
+            fs::create_dir_all(&dir)?;
+            sh(Command::new("cp").arg("-rT").arg(a).arg(dir.join("agents")))?;
             args.push(format!("--ak agents_dir=eval/jobs/{job}/agents"));
         }
     }
@@ -1228,7 +1226,6 @@ mod tests {
         assert!(!r.contains("sk-secret") && !r.contains("headers") && r.contains("\"m\""));
     }
 
-    /// Every task's tests/verify.py and solution/oracle.py are copies of the ones in eval/lib.
     /// A verifier that does not parse would only show up inside a task container.
     #[test]
     fn verifiers_are_valid_python() {

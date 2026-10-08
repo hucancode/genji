@@ -13,6 +13,9 @@ An instruction.md may start with TOML front matter between `+++` lines, stripped
     [config]              # merged over the genji config
     +++
 
+Agent definitions a task image puts in /opt/task-agents/ are added to genji's agents. genji's
+time limit is set just under the task's agent timeout, so it ends the run itself.
+
 Events go to /logs/agent/genji.jsonl and /genji/trace/all.jsonl, the exit code to
 /genji/trace/exit_code.
 """
@@ -45,6 +48,9 @@ _HOME = PurePosixPath("/genji")
 _BIN = PurePosixPath("/usr/local/bin/genji")
 _OUT = "/logs/agent"
 _FAKE_PORT = 18080
+_TASK_AGENTS = "/opt/task-agents"
+# Seconds genji stops before Harbor's agent timeout.
+_TIME_MARGIN = 15
 
 
 class GenjiOptions(InstalledAgentOptions):
@@ -125,7 +131,9 @@ class Genji(BaseInstalledAgent):
                 f"mv /tmp/genji-init/.genji/agents {agents} && rm -rf /tmp/genji-init",
             )
         await self.exec_as_root(
-            environment, command=f"chmod 0755 {_BIN} && chmod -R a+rwX {_HOME} && genji --version"
+            environment,
+            command=f"[ ! -d {_TASK_AGENTS} ] || cp -r {_TASK_AGENTS}/. {agents}; "
+            f"chmod 0755 {_BIN} && chmod -R a+rwX {_HOME} && genji --version",
         )
         if self.options.fake_dir:
             await self._start_fake(environment)
@@ -166,6 +174,17 @@ class Genji(BaseInstalledAgent):
                 return entry.get("config") or {}
         return {}
 
+    def _agent_timeout(self, environment: BaseEnvironment) -> float | None:
+        """The shortest agent timeout of the task and its steps, from its task.toml."""
+        path = Path(environment.environment_dir).parent / "task.toml"
+        if not path.is_file():
+            return None
+        task = tomllib.loads(path.read_text())
+        timeouts = [(task.get("agent") or {}).get("timeout_sec")]
+        timeouts += [(step.get("agent") or {}).get("timeout_sec") for step in task.get("steps") or []]
+        timeouts = [t for t in timeouts if t]
+        return min(timeouts) if timeouts else None
+
     async def _workdir(self, environment: BaseEnvironment) -> str:
         if environment.task_env_config.workdir:
             return environment.task_env_config.workdir
@@ -194,6 +213,9 @@ class Genji(BaseInstalledAgent):
             sessions_dir=str(_HOME / "sessions"),
             ask_timeout_secs=0,
         )
+        if timeout := self._agent_timeout(environment):
+            limit = max(10, int(timeout) - _TIME_MARGIN)
+            cfg["time_limit_secs"] = min(cfg.get("time_limit_secs") or limit, limit)
         await self._upload_config_text(
             environment,
             content=json.dumps(cfg, indent=2) + "\n",
@@ -223,15 +245,21 @@ class Genji(BaseInstalledAgent):
         started = time.monotonic()
         try:
             await self.exec_as_agent(environment, command=f"bash -c {shlex.quote(script)}", env=env)
-        except NonZeroAgentExitCodeError as exc:
-            self.logger.warning("genji exited non-zero: %s", exc)
+        except NonZeroAgentExitCodeError:
+            tail = await environment.exec(
+                command=f"cat {_HOME}/trace/exit_code 2>/dev/null || echo '?'; "
+                f"tail -n 20 {_OUT}/genji.stderr.log",
+                user="root",
+            )
+            code, _, stderr = (tail.stdout or "").partition("\n")
+            self.logger.warning("genji exited %s; stderr tail:\n%s", code.strip(), stderr.rstrip())
         finally:
             self._duration = time.monotonic() - started
             if directives.get("after"):
                 await self.exec_as_agent(environment, command=f"cd {workdir} && {directives['after']}")
             await self.exec_as_root(
                 environment,
-                command=f"cp -r {_HOME}/config.json {_HOME}/sessions {_HOME}/agents {_OUT}/ 2>/dev/null; true",
+                command=f"cp -r {_HOME}/config.json {_HOME}/sessions {_OUT}/ 2>/dev/null; true",
             )
 
     def _metrics(self) -> dict[str, Any]:
@@ -262,4 +290,3 @@ class Genji(BaseInstalledAgent):
         context.n_output_tokens = m["completion_tokens"] or None
         context.n_cache_tokens = m["cached_tokens"] or None
         context.metadata = {**(context.metadata or {}), "genji": m}
-        (self.logs_dir / "compaction.json").write_text(json.dumps({"compactionCount": m["compactions"]}) + "\n")

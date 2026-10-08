@@ -1,1 +1,1 @@
-Build a small command-line greeting app at `/app/greet.py`. It prints 'Good morning', 'Good afternoon' or 'Good evening' depending on the current time of day, and 'Hello' as the fallback.
+Build a small command-line greeting app at `/app/greet.py`. It prints 'Good morning' from 5:00 to 11:59, 'Good afternoon' from 12:00 to 17:59, 'Good evening' from 18:00 to 21:59, and 'Hello' at any other hour.
