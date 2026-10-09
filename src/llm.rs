@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{Api, Auth, Provider};
 use crate::storage::util::truncate;
@@ -153,59 +153,57 @@ pub struct LlmClient {
     pub model: String,
     provider: Provider,
     max_retries: u32,
+    timeout: Duration,
+    /// No request or retry wait runs past this instant.
+    deadline: Instant,
     agent: ureq::Agent,
 }
 
 impl LlmClient {
-    pub fn new(provider: Provider, model: String, max_retries: u32, timeout_secs: u64) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build();
+    pub fn new(
+        provider: Provider,
+        model: String,
+        max_retries: u32,
+        timeout: Duration,
+        deadline: Instant,
+    ) -> Self {
         Self {
             model,
             provider,
             max_retries,
-            agent,
+            timeout,
+            deadline,
+            agent: ureq::agent(),
         }
     }
 
     /// `hint` is sent as a trailing user message for this request only.
+    /// `require_tool` makes the model answer with a tool call.
     pub fn chat(
         &self,
         messages: &[ChatMessage],
         tools: &[Value],
         hint: Option<&str>,
+        require_tool: bool,
     ) -> Result<LlmResponse> {
-        let p = &self.provider;
-        let hint = hint.map(|h| ChatMessage::user(format!("[note] {h}")));
-        let body = if p.api == Api::Anthropic {
-            serde_json::to_vec(&anthropic_request(
-                &self.model,
-                messages,
-                hint,
-                tools,
-                p.max_output_tokens,
-            ))?
-        } else {
-            serde_json::to_vec(&Request {
-                model: &self.model,
-                messages: Messages(messages, hint),
-                stream: false,
-                tools,
-                tool_choice: (p.send_tool_choice && !tools.is_empty()).then_some("auto"),
-                max_tokens: BTreeMap::from([(p.max_tokens_field.as_str(), p.max_output_tokens)]),
-            })?
-        };
+        let body = self.body(messages, tools, hint, require_tool)?;
         if let Some(dir) = std::env::var_os("GENJI_DUMP_REQUESTS") {
             let path = crate::storage::util::tmp_file(dir.as_ref(), "request", "json");
             let _ = crate::storage::util::write_file(&path, &body);
         }
         let mut attempt = 0u32;
         loop {
-            match self.post_once(&body) {
+            let left = self.deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("time limit reached");
+            }
+            match self.post_once(&body, self.timeout.min(left)) {
                 Ok(resp) => return Ok(resp),
                 Err(f) if f.retry && attempt < self.max_retries => {
                     let wait = f.retry_after.unwrap_or_else(|| backoff(attempt));
+                    if wait >= self.deadline.saturating_duration_since(Instant::now()) {
+                        return Err(f.error);
+                    }
                     attempt += 1;
                     eprintln!(
                         "[llm] retry {attempt}/{} after error ({:#}), sleeping {wait:?}",
@@ -218,8 +216,40 @@ impl LlmClient {
         }
     }
 
+    fn body(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        hint: Option<&str>,
+        require_tool: bool,
+    ) -> Result<Vec<u8>> {
+        let p = &self.provider;
+        let hint = hint.map(|h| ChatMessage::user(format!("[note] {h}")));
+        Ok(if p.api == Api::Anthropic {
+            let mut req =
+                anthropic_request(&self.model, messages, hint, tools, p.max_output_tokens);
+            if require_tool && !tools.is_empty() {
+                req["tool_choice"] = serde_json::json!({"type": "any"});
+            }
+            serde_json::to_vec(&req)?
+        } else {
+            serde_json::to_vec(&Request {
+                model: &self.model,
+                messages: Messages(messages, hint),
+                stream: false,
+                tools,
+                tool_choice: (p.send_tool_choice && !tools.is_empty()).then_some(if require_tool {
+                    "required"
+                } else {
+                    "auto"
+                }),
+                max_tokens: BTreeMap::from([(p.max_tokens_field.as_str(), p.max_output_tokens)]),
+            })?
+        })
+    }
+
     /// One request; the failure says whether it is worth retrying.
-    fn post_once(&self, body: &[u8]) -> Result<LlmResponse, Failure> {
+    fn post_once(&self, body: &[u8], timeout: Duration) -> Result<LlmResponse, Failure> {
         let fail = |error, retry| Failure {
             error,
             retry,
@@ -240,6 +270,7 @@ impl LlmClient {
             p,
             self.agent
                 .post(&url)
+                .timeout(timeout)
                 .set("Content-Type", "application/json"),
         );
         match req.send_bytes(body) {
@@ -538,7 +569,7 @@ fn parse_anthropic(text: &str) -> Result<LlmResponse> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatMessage, Request, ToolCall};
+    use super::{Api, ChatMessage, Duration, Instant, Request, ToolCall, Value};
 
     #[test]
     fn parses_cached_tokens_and_truncation() {
@@ -663,5 +694,26 @@ mod tests {
         assert_eq!(with["tools"][0]["type"], "function");
         assert_eq!(with["tool_choice"], "auto");
         assert_eq!(with["messages"][1]["content"], "[note] x");
+    }
+
+    #[test]
+    fn a_required_tool_call_is_sent_and_the_deadline_holds() {
+        let tools = [serde_json::json!({"type": "function", "function": {"name": "finish"}})];
+        let msgs = [ChatMessage::user("hi")];
+        for (api, want) in [
+            (Api::Chat, serde_json::json!("required")),
+            (Api::Anthropic, serde_json::json!({"type": "any"})),
+        ] {
+            let p = crate::config::Provider {
+                api,
+                ..Default::default()
+            };
+            let c = super::LlmClient::new(p, "m".into(), 0, Duration::from_secs(1), Instant::now());
+            let body: Value =
+                serde_json::from_slice(&c.body(&msgs, &tools, None, true).unwrap()).unwrap();
+            assert_eq!(body["tool_choice"], want);
+            let e = c.chat(&msgs, &tools, None, false).unwrap_err();
+            assert_eq!(format!("{e:#}"), "time limit reached");
+        }
     }
 }

@@ -13,7 +13,7 @@ You receive the request, any follow-up requests, the user instructions and the d
 6. Small, local fixes (a wrong path, a missing seed note): make them yourself in the plan.
 
 # Verdict
-End with `verdict`:
+End by calling the `verdict` tool:
 - `done`: the plan stands alone and is ready to build; `notes` names the plan path.
 - `reject`: the planning pass must refine the plan. `notes`: the concrete gaps (section, what is missing or wrong).
 - `handoff`: the plan is correct and a separate part of the request still needs planning. `notes` must stand alone for a fresh instance: the goal, what is planned, what is left, where the plan lives.

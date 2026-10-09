@@ -75,9 +75,12 @@ report is delivered; an unfinished child is stopped and resumed with
 ## Retries and notes
 
 Transport errors, 408/409/429/5xx and unparseable responses are retried with
-backoff (`llm_max_retries`). A response cut off by the output limit is re-requested
+backoff (`llm_max_retries`). No request or retry wait outlasts `time_limit_secs`: a
+request still running at the limit is cut off and the run stops with reason
+`time_limit`. A response cut off by the output limit is re-requested
 up to 3 times with a one-request `[note]` appended after the context. A model that
-answers in plain text without `finish` gets one `[note] End by calling finish.`
+answers in plain text without `finish` gets one `[note] End by calling finish.`, and
+that request requires a tool call (`tool_choice` `required` when `send_tool_choice` is on, `any` for Anthropic).
 Notes are never stored.
 
 ## How tool results are truncated

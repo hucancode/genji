@@ -9,7 +9,7 @@
 | `sessions_dir` | `.genji/sessions` | Where session files live (`--sessions-dir` overrides) |
 | `agents_dir` | `.genji/agents` | Where agent definitions live (`--agents-dir` overrides) |
 | `skills_dir` | `.agents/skills` | Where skills live |
-| `time_limit_secs` | `1800` | Max wall-clock time per run |
+| `time_limit_secs` | `1800` | Max wall-clock time per run, including a model request in flight |
 | `preferred_context_size` | `0` | Project cap on the context window in tokens (0 = none). The effective window is the smallest of this, the provider's `context_window` and the model's size as the server reports it; compaction starts at 80% of it |
 | `compact_keep_recent` | `6` | Messages kept verbatim during compaction |
 | `review_threshold` | `0.4` | A work pass is judged by its review pass only when its largest prompt reached this fraction of the effective context window; smaller work finishes unreviewed (0 = always review, 1 = never review) |

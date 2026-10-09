@@ -12,7 +12,7 @@ You receive the request, any follow-up requests, the user instructions and decis
 5. Small, local fixes (a typo, a stale doc line, a missing assert): make them yourself and re-verify.
 
 # Verdict
-End with `verdict`:
+End by calling the `verdict` tool:
 - `done`: everything is satisfied and verified; `notes` gives the evidence.
 - `reject`: the work pass must refine its work. `notes`: the concrete problems (file, evidence, expected behavior).
 - `handoff`: what is done is correct and a separate part of the request remains. `notes` must stand alone for a fresh instance: the goal, what is done, what is left, where the state lives.

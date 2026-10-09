@@ -14,7 +14,7 @@ use crate::storage::util::{relative_path, resolve_path, truncate};
 use crate::tools::{self, Verdict};
 
 const MAX_TRUNCATIONS: u32 = 3;
-const LLM_TIMEOUT_SECS: u64 = 600;
+const LLM_TIMEOUT: Duration = Duration::from_secs(600);
 const STOPPED_BY_USER: &str = "(stopped by user via control socket)";
 const WRAP_UP_TURNS: usize = 5;
 /// Fraction of the context window at which old turns are compacted.
@@ -376,11 +376,13 @@ impl Agent {
                     .unwrap_or_else(|| p.provider.model.clone()),
             )
         };
+        let started = Instant::now();
         let llm = LlmClient::new(
             p.provider,
             start.model.clone(),
             p.cfg.llm_max_retries,
-            LLM_TIMEOUT_SECS,
+            LLM_TIMEOUT,
+            started + Duration::from_secs(p.cfg.time_limit_secs.max(1)),
         );
         let events =
             EventEmitter::open(&p.instance_id, &session, start.seq)?.with_tap(p.control.clone());
@@ -431,7 +433,7 @@ impl Agent {
             events,
             tokens_used: start.tokens_used,
             token_limit,
-            started: Instant::now(),
+            started,
             seen: HashMap::new(),
         };
         // `spawn`, `finish`, `hand_off` and `verdict` are safe to run again; any other call may have partly run.
@@ -628,8 +630,13 @@ impl Agent {
             }
             let result = {
                 let ctx = self.context.read().unwrap();
-                self.llm
-                    .chat(ctx.messages(), ctx.tools(), state.hint.take().as_deref())
+                // After a nudge the model must answer with a tool call.
+                self.llm.chat(
+                    ctx.messages(),
+                    ctx.tools(),
+                    state.hint.take().as_deref(),
+                    state.nudged,
+                )
             };
             state.last_call = Instant::now();
             let resp = match result {
@@ -640,6 +647,9 @@ impl Agent {
                         .error("context overflow; compacting and retrying");
                     self.maybe_compact(0.0, false)?;
                     continue;
+                }
+                Err(_) if let Some((reason, msg)) = self.budget_exceeded() => {
+                    return Ok(self.stop(reason, msg));
                 }
                 Err(e) => return Ok(self.fail(format!("LLM request failed: {e:#}"))),
             };
@@ -800,7 +810,7 @@ impl Agent {
                 "Summarize this conversation segment:\n\n{rendered}"
             )),
         ];
-        let resp = match self.llm.chat(&req, &[], None) {
+        let resp = match self.llm.chat(&req, &[], None, false) {
             Ok(r) => r,
             // Compaction is an optimisation when under the threshold; keep going without it.
             Err(e) if optional => {
