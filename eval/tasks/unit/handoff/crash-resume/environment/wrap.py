@@ -1,4 +1,4 @@
-"""Runs the genji command in argv and kills it right after its 4th tool call, as a crash."""
+"""Runs the genji command in argv and kills it right after its 2nd tool call, as a crash."""
 import json
 import subprocess
 import sys
@@ -14,7 +14,7 @@ for line in genji.stdout:
         continue
     if event.get("type") == "tool_call":
         calls += 1
-        if calls >= 4:
+        if calls >= 2:
             genji.kill()
             break
 sys.exit(genji.wait())

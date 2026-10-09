@@ -1,0 +1,49 @@
+[
+  {
+    "tool_calls": [
+      {
+        "name": "spawn",
+        "arguments": {
+          "agent": "explore",
+          "instructions": "List the files in /app"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "ls",
+        "arguments": {
+          "path": "/app"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "handoff",
+          "summary": "/app has README.md and main.py",
+          "next": {
+            "agent": "build",
+            "task": "/app has README.md and main.py"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "finish",
+        "arguments": {
+          "status": "done",
+          "summary": "explore reported: /app has README.md and main.py"
+        }
+      }
+    ]
+  }
+]

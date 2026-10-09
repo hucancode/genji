@@ -344,6 +344,11 @@ level = "unit"
 capability = "spawn"
 difficulty = "easy"  # explore subagent finds a definition
 
+[tasks."genji/spawn-choice"]
+level = "unit"
+capability = "spawn"
+difficulty = "easy"  # full toolset, yet the named agent is reached through spawn
+
 [tasks."genji/socket-instruction"]
 level = "unit"
 capability = "socket"

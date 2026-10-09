@@ -13,10 +13,9 @@
   {
     "tool_calls": [
       {
-        "name": "write",
+        "name": "bash",
         "arguments": {
-          "path": "/app/test_textstats.py",
-          "content": "import unittest\n\nfrom textstats import stats\n\n\nclass StatsTest(unittest.TestCase):\n    def test_counts(self):\n        got = stats(\"The cat, the DOG.\\nthe end!\\n\\nCat dog cat\\n\")\n        self.assertEqual(got, {\"lines\": 4, \"words\": 9, \"chars\": 40, \"top_word\": \"the\"})\n\n    def test_tie_goes_to_first(self):\n        self.assertEqual(stats(\"b a\")[\"top_word\"], \"b\")\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+          "command": "printf 'b a\\n' > /tmp/s.txt && python3 /app/textstats.py /tmp/s.txt"
         }
       }
     ]
@@ -26,27 +25,7 @@
       {
         "name": "bash",
         "arguments": {
-          "command": "cd /app && python3 -m unittest test_textstats"
-        }
-      }
-    ]
-  },
-  {
-    "tool_calls": [
-      {
-        "name": "bash",
-        "arguments": {
-          "command": "cd /app && python3 -m unittest test_textstats"
-        }
-      }
-    ]
-  },
-  {
-    "tool_calls": [
-      {
-        "name": "bash",
-        "arguments": {
-          "command": "cd /app && python3 -m unittest test_textstats"
+          "command": "printf 'b a\\n' > /tmp/s.txt && python3 /app/textstats.py /tmp/s.txt"
         }
       }
     ]
@@ -57,7 +36,7 @@
         "name": "finish",
         "arguments": {
           "status": "done",
-          "summary": "textstats.py and its tests are done"
+          "summary": "textstats.py is done and checked"
         }
       }
     ]
